@@ -1,0 +1,403 @@
+use super::{Cpu, PrivilegeMode};
+use super::csr;
+use super::decode::Instruction;
+use super::mmu::AccessType;
+use crate::memory::Bus;
+
+/// Execute a decoded instruction. Returns true to continue, false to halt.
+pub fn execute(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> bool {
+    let inst = Instruction::decode(raw);
+
+    match inst.opcode {
+        0x37 => op_lui(cpu, &inst, inst_len),
+        0x17 => op_auipc(cpu, &inst, inst_len),
+        0x6F => op_jal(cpu, &inst),
+        0x67 => op_jalr(cpu, &inst),
+        0x63 => op_branch(cpu, &inst, inst_len),
+        0x03 => op_load(cpu, bus, &inst, inst_len),
+        0x23 => op_store(cpu, bus, &inst, inst_len),
+        0x13 => op_imm(cpu, &inst, inst_len),
+        0x1B => op_imm32(cpu, &inst, inst_len),
+        0x33 => op_reg(cpu, &inst, inst_len),
+        0x3B => op_reg32(cpu, &inst, inst_len),
+        0x0F => { cpu.pc += inst_len; } // FENCE — nop
+        0x73 => return op_system(cpu, bus, &inst, inst_len),
+        0x2F => op_atomic(cpu, bus, &inst, inst_len),
+        _ => {
+            log::warn!("Illegal instruction: {:#010x} at PC={:#x}", raw, cpu.pc);
+            cpu.handle_exception(2, raw as u64, bus); // Illegal instruction
+        }
+    }
+    true
+}
+
+fn op_lui(cpu: &mut Cpu, inst: &Instruction, len: u64) {
+    cpu.regs[inst.rd] = inst.imm_u as u64;
+    cpu.pc += len;
+}
+
+fn op_auipc(cpu: &mut Cpu, inst: &Instruction, len: u64) {
+    cpu.regs[inst.rd] = cpu.pc.wrapping_add(inst.imm_u as u64);
+    cpu.pc += len;
+}
+
+fn op_jal(cpu: &mut Cpu, inst: &Instruction) {
+    cpu.regs[inst.rd] = cpu.pc + 4; // Always saves PC+4 for JAL
+    cpu.pc = cpu.pc.wrapping_add(inst.imm_j as u64);
+}
+
+fn op_jalr(cpu: &mut Cpu, inst: &Instruction) {
+    let target = (cpu.regs[inst.rs1].wrapping_add(inst.imm_i as u64)) & !1;
+    cpu.regs[inst.rd] = cpu.pc + 4;
+    cpu.pc = target;
+}
+
+fn op_branch(cpu: &mut Cpu, inst: &Instruction, len: u64) {
+    let rs1 = cpu.regs[inst.rs1];
+    let rs2 = cpu.regs[inst.rs2];
+    let taken = match inst.funct3 {
+        0 => rs1 == rs2,                           // BEQ
+        1 => rs1 != rs2,                           // BNE
+        4 => (rs1 as i64) < (rs2 as i64),          // BLT
+        5 => (rs1 as i64) >= (rs2 as i64),         // BGE
+        6 => rs1 < rs2,                            // BLTU
+        7 => rs1 >= rs2,                           // BGEU
+        _ => false,
+    };
+    if taken {
+        cpu.pc = cpu.pc.wrapping_add(inst.imm_b as u64);
+    } else {
+        cpu.pc += len;
+    }
+}
+
+fn op_load(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
+    let addr = cpu.regs[inst.rs1].wrapping_add(inst.imm_i as u64);
+    let phys = match cpu.mmu.translate(addr, AccessType::Read, cpu.mode, &cpu.csrs, bus) {
+        Ok(a) => a,
+        Err(e) => { cpu.handle_exception(e, addr, bus); return; }
+    };
+    let val = match inst.funct3 {
+        0 => bus.read8(phys) as i8 as i64 as u64,      // LB
+        1 => bus.read16(phys) as i16 as i64 as u64,     // LH
+        2 => bus.read32(phys) as i32 as i64 as u64,     // LW
+        3 => bus.read64(phys),                           // LD
+        4 => bus.read8(phys) as u64,                     // LBU
+        5 => bus.read16(phys) as u64,                    // LHU
+        6 => bus.read32(phys) as u64,                    // LWU
+        _ => 0,
+    };
+    cpu.regs[inst.rd] = val;
+    cpu.pc += len;
+}
+
+fn op_store(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
+    let addr = cpu.regs[inst.rs1].wrapping_add(inst.imm_s as u64);
+    let phys = match cpu.mmu.translate(addr, AccessType::Write, cpu.mode, &cpu.csrs, bus) {
+        Ok(a) => a,
+        Err(e) => { cpu.handle_exception(e, addr, bus); return; }
+    };
+    let val = cpu.regs[inst.rs2];
+    match inst.funct3 {
+        0 => bus.write8(phys, val as u8),
+        1 => bus.write16(phys, val as u16),
+        2 => bus.write32(phys, val as u32),
+        3 => bus.write64(phys, val),
+        _ => {}
+    }
+    cpu.pc += len;
+}
+
+fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
+    let rs1 = cpu.regs[inst.rs1];
+    let imm = inst.imm_i as u64;
+    let shamt = (imm & 0x3F) as u32;
+    let val = match inst.funct3 {
+        0 => rs1.wrapping_add(imm),                             // ADDI
+        1 => rs1 << shamt,                                      // SLLI
+        2 => ((rs1 as i64) < (imm as i64)) as u64,             // SLTI
+        3 => (rs1 < imm) as u64,                                // SLTIU
+        4 => rs1 ^ imm,                                         // XORI
+        5 => {
+            if (inst.raw >> 30) & 1 == 1 {
+                ((rs1 as i64) >> shamt) as u64                  // SRAI
+            } else {
+                rs1 >> shamt                                     // SRLI
+            }
+        }
+        6 => rs1 | imm,                                         // ORI
+        7 => rs1 & imm,                                         // ANDI
+        _ => 0,
+    };
+    cpu.regs[inst.rd] = val;
+    cpu.pc += len;
+}
+
+fn op_imm32(cpu: &mut Cpu, inst: &Instruction, len: u64) {
+    let rs1 = cpu.regs[inst.rs1] as u32;
+    let imm = inst.imm_i as u32;
+    let shamt = (imm & 0x1F) as u32;
+    let val = match inst.funct3 {
+        0 => rs1.wrapping_add(imm) as i32 as i64 as u64,       // ADDIW
+        1 => (rs1 << shamt) as i32 as i64 as u64,              // SLLIW
+        5 => {
+            if (inst.raw >> 30) & 1 == 1 {
+                ((rs1 as i32) >> shamt) as i64 as u64           // SRAIW
+            } else {
+                (rs1 >> shamt) as i32 as i64 as u64             // SRLIW
+            }
+        }
+        _ => 0,
+    };
+    cpu.regs[inst.rd] = val;
+    cpu.pc += len;
+}
+
+fn op_reg(cpu: &mut Cpu, inst: &Instruction, len: u64) {
+    let rs1 = cpu.regs[inst.rs1];
+    let rs2 = cpu.regs[inst.rs2];
+
+    let val = if inst.funct7 == 0x01 {
+        // RV64M
+        match inst.funct3 {
+            0 => rs1.wrapping_mul(rs2),                                          // MUL
+            1 => ((rs1 as i64 as i128).wrapping_mul(rs2 as i64 as i128) >> 64) as u64, // MULH
+            2 => ((rs1 as i64 as i128).wrapping_mul(rs2 as u128 as i128) >> 64) as u64, // MULHSU
+            3 => ((rs1 as u128).wrapping_mul(rs2 as u128) >> 64) as u64,        // MULHU
+            4 => {
+                if rs2 == 0 { u64::MAX }
+                else if rs1 as i64 == i64::MIN && rs2 as i64 == -1 { rs1 }
+                else { ((rs1 as i64).wrapping_div(rs2 as i64)) as u64 }          // DIV
+            }
+            5 => {
+                if rs2 == 0 { u64::MAX } else { rs1.wrapping_div(rs2) }          // DIVU
+            }
+            6 => {
+                if rs2 == 0 { rs1 }
+                else if rs1 as i64 == i64::MIN && rs2 as i64 == -1 { 0 }
+                else { ((rs1 as i64).wrapping_rem(rs2 as i64)) as u64 }          // REM
+            }
+            7 => {
+                if rs2 == 0 { rs1 } else { rs1.wrapping_rem(rs2) }               // REMU
+            }
+            _ => 0,
+        }
+    } else {
+        match (inst.funct3, inst.funct7) {
+            (0, 0x00) => rs1.wrapping_add(rs2),                    // ADD
+            (0, 0x20) => rs1.wrapping_sub(rs2),                    // SUB
+            (1, 0x00) => rs1 << (rs2 & 0x3F),                     // SLL
+            (2, 0x00) => ((rs1 as i64) < (rs2 as i64)) as u64,    // SLT
+            (3, 0x00) => (rs1 < rs2) as u64,                       // SLTU
+            (4, 0x00) => rs1 ^ rs2,                                 // XOR
+            (5, 0x00) => rs1 >> (rs2 & 0x3F),                     // SRL
+            (5, 0x20) => ((rs1 as i64) >> (rs2 & 0x3F)) as u64,   // SRA
+            (6, 0x00) => rs1 | rs2,                                 // OR
+            (7, 0x00) => rs1 & rs2,                                 // AND
+            _ => 0,
+        }
+    };
+    cpu.regs[inst.rd] = val;
+    cpu.pc += len;
+}
+
+fn op_reg32(cpu: &mut Cpu, inst: &Instruction, len: u64) {
+    let rs1 = cpu.regs[inst.rs1] as u32;
+    let rs2 = cpu.regs[inst.rs2] as u32;
+
+    let val = if inst.funct7 == 0x01 {
+        // RV64M — 32-bit variants
+        match inst.funct3 {
+            0 => rs1.wrapping_mul(rs2) as i32 as i64 as u64,     // MULW
+            4 => {
+                if rs2 == 0 { u32::MAX as i32 as i64 as u64 }
+                else if rs1 as i32 == i32::MIN && rs2 as i32 == -1 { rs1 as i32 as i64 as u64 }
+                else { ((rs1 as i32).wrapping_div(rs2 as i32)) as i64 as u64 }
+            }
+            5 => {
+                if rs2 == 0 { u32::MAX as i32 as i64 as u64 }
+                else { rs1.wrapping_div(rs2) as i32 as i64 as u64 }
+            }
+            6 => {
+                if rs2 == 0 { rs1 as i32 as i64 as u64 }
+                else if rs1 as i32 == i32::MIN && rs2 as i32 == -1 { 0 }
+                else { ((rs1 as i32).wrapping_rem(rs2 as i32)) as i64 as u64 }
+            }
+            7 => {
+                if rs2 == 0 { rs1 as i32 as i64 as u64 }
+                else { rs1.wrapping_rem(rs2) as i32 as i64 as u64 }
+            }
+            _ => 0,
+        }
+    } else {
+        match (inst.funct3, inst.funct7) {
+            (0, 0x00) => rs1.wrapping_add(rs2) as i32 as i64 as u64,    // ADDW
+            (0, 0x20) => rs1.wrapping_sub(rs2) as i32 as i64 as u64,    // SUBW
+            (1, 0x00) => (rs1 << (rs2 & 0x1F)) as i32 as i64 as u64,   // SLLW
+            (5, 0x00) => (rs1 >> (rs2 & 0x1F)) as i32 as i64 as u64,   // SRLW
+            (5, 0x20) => ((rs1 as i32) >> (rs2 & 0x1F)) as i64 as u64, // SRAW
+            _ => 0,
+        }
+    };
+    cpu.regs[inst.rd] = val;
+    cpu.pc += len;
+}
+
+fn op_atomic(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
+    let funct5 = inst.funct7 >> 2;
+    let addr = cpu.regs[inst.rs1];
+    let is_word = inst.funct3 == 2; // funct3=2 → 32-bit, funct3=3 → 64-bit
+
+    let phys = match cpu.mmu.translate(addr, AccessType::Write, cpu.mode, &cpu.csrs, bus) {
+        Ok(a) => a,
+        Err(e) => { cpu.handle_exception(e, addr, bus); return; }
+    };
+
+    match funct5 {
+        0x02 => { // LR
+            let val = if is_word {
+                bus.read32(phys) as i32 as i64 as u64
+            } else {
+                bus.read64(phys)
+            };
+            cpu.regs[inst.rd] = val;
+            cpu.reservation = Some(addr);
+        }
+        0x03 => { // SC
+            if cpu.reservation == Some(addr) {
+                let val = cpu.regs[inst.rs2];
+                if is_word {
+                    bus.write32(phys, val as u32);
+                } else {
+                    bus.write64(phys, val);
+                }
+                cpu.regs[inst.rd] = 0; // success
+            } else {
+                cpu.regs[inst.rd] = 1; // failure
+            }
+            cpu.reservation = None;
+        }
+        _ => {
+            // AMO instructions
+            let old = if is_word {
+                bus.read32(phys) as i32 as i64 as u64
+            } else {
+                bus.read64(phys)
+            };
+            let src = cpu.regs[inst.rs2];
+            let result = match funct5 {
+                0x01 => src,                                              // AMOSWAP
+                0x00 => old.wrapping_add(src),                           // AMOADD
+                0x04 => old ^ src,                                        // AMOXOR
+                0x0C => old & src,                                        // AMOAND
+                0x08 => old | src,                                        // AMOOR
+                0x10 => std::cmp::min(old as i64, src as i64) as u64,   // AMOMIN
+                0x14 => std::cmp::max(old as i64, src as i64) as u64,   // AMOMAX
+                0x18 => std::cmp::min(old, src),                         // AMOMINU
+                0x1C => std::cmp::max(old, src),                         // AMOMAXU
+                _ => old,
+            };
+            if is_word {
+                bus.write32(phys, result as u32);
+            } else {
+                bus.write64(phys, result);
+            }
+            cpu.regs[inst.rd] = old;
+        }
+    }
+    cpu.pc += len;
+}
+
+fn op_system(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) -> bool {
+    if inst.funct3 == 0 {
+        match inst.raw {
+            0x00000073 => { // ECALL
+                let cause = match cpu.mode {
+                    PrivilegeMode::User => 8,
+                    PrivilegeMode::Supervisor => 9,
+                    PrivilegeMode::Machine => 11,
+                };
+                cpu.handle_exception(cause, 0, bus);
+                return true;
+            }
+            0x00100073 => { // EBREAK
+                cpu.handle_exception(3, cpu.pc, bus);
+                return true;
+            }
+            0x10200073 => { // SRET
+                let sstatus = cpu.csrs.read(csr::SSTATUS);
+                let spp = (sstatus >> 8) & 1;
+                let spie = (sstatus >> 5) & 1;
+                let mut new_sstatus = sstatus;
+                new_sstatus = (new_sstatus & !(1 << 1)) | (spie << 1); // SIE = SPIE
+                new_sstatus |= 1 << 5; // SPIE = 1
+                new_sstatus &= !(1 << 8); // SPP = 0
+                cpu.csrs.write(csr::SSTATUS, new_sstatus);
+                cpu.pc = cpu.csrs.read(csr::SEPC);
+                cpu.mode = if spp == 1 { PrivilegeMode::Supervisor } else { PrivilegeMode::User };
+                return true;
+            }
+            0x30200073 => { // MRET
+                let mstatus = cpu.csrs.read(csr::MSTATUS);
+                let mpp = (mstatus >> 11) & 3;
+                let mpie = (mstatus >> 7) & 1;
+                let mut new_mstatus = mstatus;
+                new_mstatus = (new_mstatus & !(1 << 3)) | (mpie << 3); // MIE = MPIE
+                new_mstatus |= 1 << 7; // MPIE = 1
+                new_mstatus &= !(3 << 11); // MPP = 0
+                cpu.csrs.write(csr::MSTATUS, new_mstatus);
+                cpu.pc = cpu.csrs.read(csr::MEPC);
+                cpu.mode = PrivilegeMode::from_u64(mpp);
+                return true;
+            }
+            0x10500073 => { // WFI
+                cpu.wfi = true;
+                cpu.pc += len;
+                return true;
+            }
+            _ => {
+                // SFENCE.VMA and other privileged instructions
+                if inst.funct7 == 0x09 {
+                    // SFENCE.VMA — flush TLB (nop for us)
+                    cpu.pc += len;
+                    return true;
+                }
+                log::warn!("Unknown SYSTEM instruction: {:#010x} at PC={:#x}", inst.raw, cpu.pc);
+                cpu.handle_exception(2, inst.raw as u64, bus);
+                return true;
+            }
+        }
+    }
+
+    // CSR instructions
+    let csr_addr = (inst.raw >> 20) & 0xFFF;
+    let csr_addr = csr_addr as u16;
+    let old_val = cpu.csrs.read(csr_addr);
+
+    let write_val = match inst.funct3 {
+        1 => cpu.regs[inst.rs1],                                    // CSRRW
+        2 => old_val | cpu.regs[inst.rs1],                          // CSRRS
+        3 => old_val & !cpu.regs[inst.rs1],                         // CSRRC
+        5 => inst.rs1 as u64,                                        // CSRRWI
+        6 => old_val | (inst.rs1 as u64),                           // CSRRSI
+        7 => old_val & !(inst.rs1 as u64),                          // CSRRCI
+        _ => {
+            cpu.pc += len;
+            return true;
+        }
+    };
+
+    // For CSRRS/CSRRC with rs1=0, don't write
+    let should_write = match inst.funct3 {
+        2 | 3 => inst.rs1 != 0,
+        6 | 7 => inst.rs1 != 0,
+        _ => true,
+    };
+
+    if should_write {
+        cpu.csrs.write(csr_addr, write_val);
+    }
+    cpu.regs[inst.rd] = old_val;
+    cpu.pc += len;
+    true
+}

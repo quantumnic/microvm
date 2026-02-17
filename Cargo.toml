@@ -1,0 +1,21 @@
+[package]
+name = "microvm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nicola Spieser <redbasecap-buiss@users.noreply.github.com>"]
+description = "Lightweight RISC-V system emulator — Boot Linux in one command"
+license = "MIT"
+repository = "https://github.com/redbasecap-buiss/microvm"
+keywords = ["risc-v", "emulator", "linux", "kernel", "virtual-machine"]
+categories = ["emulators", "development-tools"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+byteorder = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
