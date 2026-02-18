@@ -30,9 +30,9 @@ impl Bus {
         }
     }
 
-    pub fn read8(&self, addr: u64) -> u8 {
+    pub fn read8(&mut self, addr: u64) -> u8 {
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            return self.uart.read(addr - UART_BASE) as u8;
+            return self.uart.read_mut(addr - UART_BASE) as u8;
         }
         if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
             return self.ram.read8(addr - DRAM_BASE);
@@ -46,13 +46,13 @@ impl Bus {
         0
     }
 
-    pub fn read16(&self, addr: u64) -> u16 {
+    pub fn read16(&mut self, addr: u64) -> u16 {
         let lo = self.read8(addr) as u16;
         let hi = self.read8(addr + 1) as u16;
         lo | (hi << 8)
     }
 
-    pub fn read32(&self, addr: u64) -> u32 {
+    pub fn read32(&mut self, addr: u64) -> u32 {
         if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
             return self.ram.read32(addr - DRAM_BASE);
         }
@@ -67,7 +67,7 @@ impl Bus {
         lo | (hi << 16)
     }
 
-    pub fn read64(&self, addr: u64) -> u64 {
+    pub fn read64(&mut self, addr: u64) -> u64 {
         if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
             return self.ram.read64(addr - DRAM_BASE);
         }

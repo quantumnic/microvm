@@ -25,7 +25,7 @@ impl Mmu {
         access: AccessType,
         mode: PrivilegeMode,
         csrs: &CsrFile,
-        bus: &Bus,
+        bus: &mut Bus,
     ) -> Result<u64, u64> {
         let satp = csrs.read(csr::SATP);
         let satp_mode = satp >> 60;

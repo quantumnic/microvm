@@ -43,7 +43,7 @@ impl Plic {
         false
     }
 
-    pub fn read(&self, offset: u64) -> u64 {
+    pub fn read(&mut self, offset: u64) -> u64 {
         match offset {
             // Priority registers: 0x000000 - 0x000FFF
             0x000000..=0x0000FF => {
@@ -61,12 +61,20 @@ impl Plic {
             0x002084 => self.enable[1] >> 32,
             // Threshold & claim context 0
             0x200000 => self.threshold[0] as u64,
-            0x200004 => self.claim(0) as u64,
+            0x200004 => self.claim_and_clear(0) as u64,
             // Threshold & claim context 1
             0x201000 => self.threshold[1] as u64,
-            0x201004 => self.claim(1) as u64,
+            0x201004 => self.claim_and_clear(1) as u64,
             _ => 0,
         }
+    }
+
+    fn claim_and_clear(&mut self, context: usize) -> u32 {
+        let irq = self.claim(context);
+        if irq > 0 {
+            self.pending &= !(1u64 << irq);
+        }
+        irq
     }
 
     fn claim(&self, context: usize) -> u32 {

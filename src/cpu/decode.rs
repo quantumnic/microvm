@@ -219,7 +219,7 @@ fn expand_c_alu(inst: u32) -> u32 {
         }
         1 => { // C.SRAI
             let shamt = (((inst >> 12) & 0x1) << 5) | ((inst >> 2) & 0x1F);
-            ((0x20 << 25) | (shamt << 20) | (rd << 15) | (5 << 12) | (rd << 7) | 0x13)
+            (0x20 << 25) | (shamt << 20) | (rd << 15) | (5 << 12) | (rd << 7) | 0x13
         }
         2 => { // C.ANDI
             let imm = (((inst >> 12) & 0x1) << 5) | ((inst >> 2) & 0x1F);

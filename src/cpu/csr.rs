@@ -75,8 +75,18 @@ impl CsrFile {
         csrs
     }
 
+    /// Set cycle/instret counters (called from CPU step)
+    pub fn update_counters(&mut self, cycle: u64) {
+        self.regs.insert(MCYCLE, cycle);
+        self.regs.insert(MINSTRET, cycle); // 1:1 for now
+    }
+
     pub fn read(&self, addr: u16) -> u64 {
         match addr {
+            // User-level counter CSRs (read-only shadows)
+            CYCLE => self.regs.get(&MCYCLE).copied().unwrap_or(0),
+            INSTRET => self.regs.get(&MINSTRET).copied().unwrap_or(0),
+            TIME => 0, // TIME is typically read from CLINT mtime, handled separately
             SSTATUS => self.regs.get(&MSTATUS).copied().unwrap_or(0) & SSTATUS_MASK,
             SIE => {
                 let mie = self.regs.get(&MIE).copied().unwrap_or(0);

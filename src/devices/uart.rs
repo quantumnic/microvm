@@ -1,5 +1,4 @@
-use std::io::{self, Read, Write};
-use std::sync::{Arc, Mutex};
+use std::io::{self, Write};
 use std::collections::VecDeque;
 
 /// 16550 UART emulation

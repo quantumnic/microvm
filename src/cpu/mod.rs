@@ -114,16 +114,17 @@ impl Cpu {
         // x0 is always zero
         self.regs[0] = 0;
         self.cycle += 1;
+        self.csrs.update_counters(self.cycle);
         cont
     }
 
-    fn check_pending_interrupts(&self, bus: &Bus) -> bool {
+    fn check_pending_interrupts(&self, _bus: &Bus) -> bool {
         let mip = self.csrs.read(csr::MIP);
         let mie = self.csrs.read(csr::MIE);
         (mip & mie) != 0
     }
 
-    fn check_and_handle_interrupt(&mut self, bus: &mut Bus) {
+    fn check_and_handle_interrupt(&mut self, _bus: &mut Bus) {
         let mip = self.csrs.read(csr::MIP);
         let mie = self.csrs.read(csr::MIE);
         let pending = mip & mie;
