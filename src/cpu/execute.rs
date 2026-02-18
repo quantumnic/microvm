@@ -427,12 +427,22 @@ fn op_system(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) -> bool
             _ => {
                 match inst.funct7 {
                     0x09 => {
-                        // SFENCE.VMA — flush TLB (nop for us, no TLB cache)
+                        // SFENCE.VMA — flush TLB
+                        if inst.rs1 == 0 {
+                            cpu.mmu.flush_tlb();
+                        } else {
+                            cpu.mmu.flush_tlb_vaddr(cpu.regs[inst.rs1]);
+                        }
                         cpu.pc += len;
                         return true;
                     }
                     0x0B => {
-                        // SINVAL.VMA — same as SFENCE.VMA for us (Svinval extension)
+                        // SINVAL.VMA — same as SFENCE.VMA (Svinval extension)
+                        if inst.rs1 == 0 {
+                            cpu.mmu.flush_tlb();
+                        } else {
+                            cpu.mmu.flush_tlb_vaddr(cpu.regs[inst.rs1]);
+                        }
                         cpu.pc += len;
                         return true;
                     }
@@ -507,6 +517,10 @@ fn op_system(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) -> bool
             return true;
         }
         cpu.csrs.write(csr_addr, write_val);
+        // Flush TLB when SATP changes (address space switch)
+        if csr_addr == csr::SATP {
+            cpu.mmu.flush_tlb();
+        }
     }
     cpu.regs[inst.rd] = old_val;
     cpu.pc += len;

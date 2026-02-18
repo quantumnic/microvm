@@ -18,8 +18,48 @@ const PTE_U: u64 = 1 << 4;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 
-/// Sv39/Sv48 MMU — multi-level page table translation with A/D bit management
-pub struct Mmu;
+/// TLB entry: cached virtual-to-physical page mapping
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    /// Virtual page number (vaddr >> 12)
+    vpn: u64,
+    /// Physical page number (paddr >> 12)
+    ppn: u64,
+    /// Page size shift (12 for 4K, 21 for 2M, 30 for 1G, 39 for 512G)
+    page_shift: u8,
+    /// PTE permission bits (R/W/X/U)
+    pte_flags: u64,
+    /// SATP value when this entry was created (for invalidation)
+    satp: u64,
+    /// Valid flag
+    valid: bool,
+}
+
+impl Default for TlbEntry {
+    fn default() -> Self {
+        Self {
+            vpn: 0,
+            ppn: 0,
+            page_shift: 12,
+            pte_flags: 0,
+            satp: 0,
+            valid: false,
+        }
+    }
+}
+
+/// Number of TLB entries (must be power of 2)
+const TLB_SIZE: usize = 256;
+
+/// Sv39/Sv48 MMU with TLB — multi-level page table translation with A/D bit management
+pub struct Mmu {
+    /// Direct-mapped TLB cache
+    tlb: Box<[TlbEntry; TLB_SIZE]>,
+    /// TLB hit counter (for diagnostics)
+    pub tlb_hits: u64,
+    /// TLB miss counter (for diagnostics)
+    pub tlb_misses: u64,
+}
 
 impl Default for Mmu {
     fn default() -> Self {
@@ -29,7 +69,100 @@ impl Default for Mmu {
 
 impl Mmu {
     pub fn new() -> Self {
-        Self
+        Self {
+            tlb: Box::new([TlbEntry::default(); TLB_SIZE]),
+            tlb_hits: 0,
+            tlb_misses: 0,
+        }
+    }
+
+    /// Flush the entire TLB (called on SFENCE.VMA, SINVAL.VMA, SATP writes)
+    pub fn flush_tlb(&mut self) {
+        for entry in self.tlb.iter_mut() {
+            entry.valid = false;
+        }
+    }
+
+    /// Flush TLB entries matching a specific virtual address
+    pub fn flush_tlb_vaddr(&mut self, vaddr: u64) {
+        let vpn = vaddr >> 12;
+        // Check all entries since superpages may match different indices
+        for entry in self.tlb.iter_mut() {
+            if entry.valid {
+                let mask = (1u64 << (entry.page_shift - 12)) - 1;
+                if (entry.vpn & !mask) == (vpn & !mask) {
+                    entry.valid = false;
+                }
+            }
+        }
+    }
+
+    /// TLB index from virtual page number
+    fn tlb_index(vpn: u64) -> usize {
+        (vpn as usize) & (TLB_SIZE - 1)
+    }
+
+    /// Look up address in TLB
+    fn tlb_lookup(
+        &self,
+        vaddr: u64,
+        access: AccessType,
+        mode: PrivilegeMode,
+        csrs: &CsrFile,
+    ) -> Option<u64> {
+        let vpn = vaddr >> 12;
+        let idx = Self::tlb_index(vpn);
+        let entry = &self.tlb[idx];
+
+        if !entry.valid {
+            return None;
+        }
+
+        // Check SATP matches
+        let satp = csrs.read(csr::SATP);
+        if entry.satp != satp {
+            return None;
+        }
+
+        // Check VPN matches (accounting for superpage size)
+        let page_shift = entry.page_shift as u64;
+        let vpn_mask = !((1u64 << (page_shift - 12)) - 1);
+        if (entry.vpn & vpn_mask) != (vpn & vpn_mask) {
+            return None;
+        }
+
+        // Check permissions
+        if self
+            .check_leaf_permissions(access, mode, entry.pte_flags, csrs)
+            .is_err()
+        {
+            return None;
+        }
+
+        // For writes, check that dirty bit was already set (we only cache entries with A set,
+        // and we need D for writes)
+        if matches!(access, AccessType::Write) && entry.pte_flags & PTE_D == 0 {
+            return None; // Force page walk to set D bit
+        }
+
+        // Construct physical address
+        let offset_mask = (1u64 << page_shift) - 1;
+        let phys = (entry.ppn << 12) | (vaddr & offset_mask);
+        Some(phys)
+    }
+
+    /// Insert an entry into the TLB
+    fn tlb_insert(&mut self, vaddr: u64, ppn: u64, page_shift: u8, pte_flags: u64, satp: u64) {
+        let vpn = vaddr >> 12;
+        let idx = Self::tlb_index(vpn);
+        self.tlb[idx] = TlbEntry {
+            vpn,
+            ppn,
+            page_shift,
+            pte_flags,
+            satp,
+            valid: true,
+        };
     }
 
     /// Translate virtual address to physical address.
@@ -37,7 +170,7 @@ impl Mmu {
     /// Supports Sv39 (3-level) and Sv48 (4-level) page table walks.
     /// Sets Accessed and Dirty bits on page table entries as required by the spec.
     pub fn translate(
-        &self,
+        &mut self,
         vaddr: u64,
         access: AccessType,
         mode: PrivilegeMode,
@@ -51,6 +184,13 @@ impl Mmu {
         if satp_mode == 0 || mode == PrivilegeMode::Machine {
             return Ok(vaddr);
         }
+
+        // TLB lookup
+        if let Some(phys) = self.tlb_lookup(vaddr, access, mode, csrs) {
+            self.tlb_hits += 1;
+            return Ok(phys);
+        }
+        self.tlb_misses += 1;
 
         let levels = match satp_mode {
             8 => 3,                // Sv39
@@ -116,6 +256,14 @@ impl Mmu {
 
             // Construct physical address
             let ppn_pte = (pte >> 10) & 0xFFF_FFFF_FFFF;
+            let page_shift = match level {
+                3 => 39u8,
+                2 => 30,
+                1 => 21,
+                0 => 12,
+                _ => unreachable!(),
+            };
+            let offset_mask = (1u64 << page_shift) - 1;
             let phys = match level {
                 3 => (ppn_pte & !0x7FFFFFF) << 12 | (vaddr & 0xFF_FFFF_FFFF), // 512 GiB
                 2 => (ppn_pte & !0x3FFFF) << 12 | (vaddr & 0x3FFFFFFF),       // 1 GiB
@@ -123,6 +271,11 @@ impl Mmu {
                 0 => (ppn_pte << 12) | page_offset,                           // 4 KiB
                 _ => unreachable!(),
             };
+
+            // Cache in TLB (with updated A/D bits)
+            let cached_flags = pte | PTE_A | if need_d { PTE_D } else { 0 };
+            let base_ppn = (phys & !offset_mask) >> 12;
+            self.tlb_insert(vaddr, base_ppn, page_shift, cached_flags, satp);
 
             return Ok(phys);
         }

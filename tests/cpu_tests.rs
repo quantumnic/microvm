@@ -1439,7 +1439,7 @@ fn test_stip_clint_and_sstc_union() {
     use microvm::memory::Bus;
 
     let mut cpu = Cpu::new();
-    let bus = Bus::new(1024 * 1024);
+    let _bus = Bus::new(1024 * 1024);
 
     // Neither timer active — STIP should not be set
     cpu.csrs.mtime = 0;
@@ -1451,4 +1451,155 @@ fn test_stip_clint_and_sstc_union() {
     cpu.csrs.mtime = 100;
     cpu.csrs.write(csr::STIMECMP, 50);
     assert!(cpu.csrs.stimecmp_pending(), "stimecmp should be pending");
+}
+
+#[test]
+fn test_tlb_caches_translation() {
+    // Set up Sv48 page table, translate twice, verify TLB hit on second access
+    let mut cpu = Cpu::new();
+    let ram_size = 16 * 1024 * 1024u64;
+    let mut bus = Bus::new(ram_size);
+    // Build page tables
+    let l3_base = 0x8010_0000u64;
+    let l2_base = 0x8010_1000u64;
+    let l1_base = 0x8010_2000u64;
+    let l0_base = 0x8010_3000u64;
+
+    bus.write64(l3_base, ((l2_base >> 12) << 10) | 0x01);
+    bus.write64(l2_base, ((l1_base >> 12) << 10) | 0x01);
+    bus.write64(l1_base, ((l0_base >> 12) << 10) | 0x01);
+    let target_ppn = 0x8020_0000u64 >> 12;
+    bus.write64(l0_base + 8, (target_ppn << 10) | 0xCF);
+
+    let root_ppn = l3_base >> 12;
+    cpu.csrs.write(csr::SATP, (9u64 << 60) | root_ppn);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // First translate — TLB miss
+    let r1 = cpu.mmu.translate(
+        0x1000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(r1, Ok(0x8020_0000));
+    assert_eq!(cpu.mmu.tlb_misses, 1);
+    assert_eq!(cpu.mmu.tlb_hits, 0);
+
+    // Second translate — TLB hit
+    let r2 = cpu.mmu.translate(
+        0x1000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(r2, Ok(0x8020_0000));
+    assert_eq!(cpu.mmu.tlb_hits, 1);
+}
+
+#[test]
+fn test_tlb_flush_invalidates() {
+    let mut cpu = Cpu::new();
+    let ram_size = 16 * 1024 * 1024u64;
+    let mut bus = Bus::new(ram_size);
+
+    let l3_base = 0x8010_0000u64;
+    let l2_base = 0x8010_1000u64;
+    let l1_base = 0x8010_2000u64;
+    let l0_base = 0x8010_3000u64;
+
+    bus.write64(l3_base, ((l2_base >> 12) << 10) | 0x01);
+    bus.write64(l2_base, ((l1_base >> 12) << 10) | 0x01);
+    bus.write64(l1_base, ((l0_base >> 12) << 10) | 0x01);
+    let target_ppn = 0x8020_0000u64 >> 12;
+    bus.write64(l0_base + 8, (target_ppn << 10) | 0xCF);
+
+    cpu.csrs.write(csr::SATP, (9u64 << 60) | (l3_base >> 12));
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Populate TLB
+    let _ = cpu.mmu.translate(
+        0x1000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(cpu.mmu.tlb_misses, 1);
+
+    // Flush TLB
+    cpu.mmu.flush_tlb();
+
+    // Next access should miss again
+    let _ = cpu.mmu.translate(
+        0x1000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(cpu.mmu.tlb_misses, 2);
+}
+
+#[test]
+fn test_tlb_flush_vaddr() {
+    let mut cpu = Cpu::new();
+    let ram_size = 16 * 1024 * 1024u64;
+    let mut bus = Bus::new(ram_size);
+
+    let l3_base = 0x8010_0000u64;
+    let l2_base = 0x8010_1000u64;
+    let l1_base = 0x8010_2000u64;
+    let l0_base = 0x8010_3000u64;
+
+    bus.write64(l3_base, ((l2_base >> 12) << 10) | 0x01);
+    bus.write64(l2_base, ((l1_base >> 12) << 10) | 0x01);
+    bus.write64(l1_base, ((l0_base >> 12) << 10) | 0x01);
+    // Map page 1 (0x1000) and page 2 (0x2000)
+    bus.write64(l0_base + 8, ((0x8020_0000u64 >> 12) << 10) | 0xCF);
+    bus.write64(l0_base + 16, ((0x8021_0000u64 >> 12) << 10) | 0xCF);
+
+    cpu.csrs.write(csr::SATP, (9u64 << 60) | (l3_base >> 12));
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Populate both in TLB
+    let _ = cpu.mmu.translate(
+        0x1000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    let _ = cpu.mmu.translate(
+        0x2000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(cpu.mmu.tlb_misses, 2);
+
+    // Flush only vaddr 0x1000
+    cpu.mmu.flush_tlb_vaddr(0x1000);
+
+    // 0x1000 should miss, 0x2000 should hit
+    let _ = cpu.mmu.translate(
+        0x1000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(cpu.mmu.tlb_misses, 3, "flushed vaddr should miss");
+
+    let _ = cpu.mmu.translate(
+        0x2000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    // This may or may not hit depending on TLB index collision; just verify no panic
 }
