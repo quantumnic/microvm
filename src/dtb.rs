@@ -205,7 +205,7 @@ pub fn generate_dtb(ram_size: u64, cmdline: &str, has_virtio_blk: bool) -> Vec<u
     b.prop_str("mmu-type", "riscv,sv39");
     b.prop_str("status", "okay");
     // ISA extensions as stringlist for newer kernels (Linux 6.2+)
-    b.prop_stringlist("riscv,isa-extensions", &["i", "m", "a", "c", "zicsr", "zifencei"]);
+    b.prop_stringlist("riscv,isa-extensions", &["i", "m", "a", "c", "zicsr", "zifencei", "sstc"]);
 
     b.begin_node("interrupt-controller");
     b.prop_u32("#interrupt-cells", 1);

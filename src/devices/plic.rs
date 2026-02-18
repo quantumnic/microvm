@@ -61,23 +61,18 @@ impl Plic {
             0x002084 => self.enable[1] >> 32,
             // Threshold & claim context 0
             0x200000 => self.threshold[0] as u64,
-            0x200004 => self.claim_and_clear(0) as u64,
+            0x200004 => self.claim(0) as u64,
             // Threshold & claim context 1
             0x201000 => self.threshold[1] as u64,
-            0x201004 => self.claim_and_clear(1) as u64,
+            0x201004 => self.claim(1) as u64,
             _ => 0,
         }
     }
 
-    fn claim_and_clear(&mut self, context: usize) -> u32 {
-        let irq = self.claim(context);
-        if irq > 0 {
-            self.pending &= !(1u64 << irq);
-        }
-        irq
-    }
-
-    fn claim(&self, context: usize) -> u32 {
+    /// Claim the highest-priority pending interrupt for a context.
+    /// Per PLIC spec: claim clears the pending bit, the interrupt is now "in service".
+    /// Complete (write to same register) signals that the handler is done.
+    fn claim(&mut self, context: usize) -> u32 {
         let enabled_pending = self.pending & self.enable[context];
         let mut best_irq = 0u32;
         let mut best_prio = 0u32;
@@ -87,7 +82,18 @@ impl Plic {
                 best_prio = self.priority[i];
             }
         }
+        if best_irq > 0 {
+            self.pending &= !(1u64 << best_irq);
+            self.claimed[context] = best_irq;
+        }
         best_irq
+    }
+
+    /// Complete an interrupt (write the IRQ id back to claim/complete register)
+    fn complete(&mut self, context: usize, irq: u32) {
+        if irq > 0 && irq < 64 && self.claimed[context] == irq {
+            self.claimed[context] = 0;
+        }
     }
 
     pub fn write(&mut self, offset: u64, val: u64) {
@@ -102,18 +108,13 @@ impl Plic {
             0x002084 => self.enable[1] = (self.enable[1] & 0xFFFFFFFF) | ((val & 0xFFFFFFFF) << 32),
             0x200000 => self.threshold[0] = val as u32,
             0x200004 => {
-                // Claim/complete context 0
-                let irq = val as u32;
-                if irq > 0 && irq < 64 {
-                    self.pending &= !(1 << irq);
-                }
+                // Complete context 0
+                self.complete(0, val as u32);
             }
             0x201000 => self.threshold[1] = val as u32,
             0x201004 => {
-                let irq = val as u32;
-                if irq > 0 && irq < 64 {
-                    self.pending &= !(1 << irq);
-                }
+                // Complete context 1
+                self.complete(1, val as u32);
             }
             _ => {}
         }

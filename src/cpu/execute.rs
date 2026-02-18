@@ -485,7 +485,7 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                 }
                 3 => { // sbi_probe_extension
                     let ext_id = a0;
-                    let available = matches!(ext_id, 0x00 | 0x01 | 0x02 | 0x10 | 0x54494D45 | 0x735049 | 0x48534D | 0x52464E43 | 0x53525354);
+                    let available = matches!(ext_id, 0x00 | 0x01 | 0x02 | 0x10 | 0x54494D45 | 0x735049 | 0x48534D | 0x52464E43 | 0x53525354 | 0x4442434E);
                     cpu.regs[10] = 0;
                     cpu.regs[11] = if available { 1 } else { 0 };
                     true
@@ -600,6 +600,61 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                 0 => { // system_reset
                     log::info!("SBI system reset requested (type={}, reason={})", a0, cpu.regs[11]);
                     std::process::exit(0);
+                }
+                _ => {
+                    cpu.regs[10] = (-2i64) as u64;
+                    cpu.regs[11] = 0;
+                    true
+                }
+            }
+        }
+        0x4442434E => {
+            // DBCN (Debug Console) extension
+            match fid {
+                0 => { // sbi_debug_console_write
+                    // a0 = num_bytes, a1 = base_addr_lo, a2 = base_addr_hi
+                    let num_bytes = a0 as usize;
+                    let base_addr = cpu.regs[11]; // a1
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout().lock();
+                    for i in 0..num_bytes {
+                        let phys = match cpu.mmu.translate(
+                            base_addr + i as u64,
+                            super::mmu::AccessType::Read,
+                            cpu.mode,
+                            &cpu.csrs,
+                            bus,
+                        ) {
+                            Ok(a) => a,
+                            Err(_) => {
+                                cpu.regs[10] = (-1i64) as u64; // SBI_ERR_INVALID_ADDRESS
+                                cpu.regs[11] = i as u64;
+                                return true;
+                            }
+                        };
+                        let byte = bus.read8(phys);
+                        let _ = stdout.write_all(&[byte]);
+                    }
+                    let _ = stdout.flush();
+                    cpu.regs[10] = 0; // SBI_SUCCESS
+                    cpu.regs[11] = num_bytes as u64;
+                    true
+                }
+                1 => { // sbi_debug_console_read
+                    // Not supported (no non-blocking read)
+                    cpu.regs[10] = 0;
+                    cpu.regs[11] = 0; // 0 bytes read
+                    true
+                }
+                2 => { // sbi_debug_console_write_byte
+                    let byte = a0 as u8;
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = stdout.write_all(&[byte]);
+                    let _ = stdout.flush();
+                    cpu.regs[10] = 0;
+                    cpu.regs[11] = 0;
+                    true
                 }
                 _ => {
                     cpu.regs[10] = (-2i64) as u64;

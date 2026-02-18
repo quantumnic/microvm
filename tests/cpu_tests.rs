@@ -477,10 +477,11 @@ fn test_boot_rom_generation() {
     // Should generate valid RISC-V instructions (firmware is now larger due to setup)
     assert!(boot.len() >= 40); // Many instructions for PMP, delegation, counteren, etc.
     assert_eq!(boot.len() % 4, 0); // All 4-byte aligned
-    // Last instruction should be MRET (0x30200073)
-    let len = boot.len();
-    let last = u32::from_le_bytes([boot[len-4], boot[len-3], boot[len-2], boot[len-1]]);
-    assert_eq!(last, 0x30200073, "Boot ROM should end with MRET");
+    // MRET (0x30200073) should be present in the boot code
+    let instrs: Vec<u32> = boot.chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert!(instrs.contains(&0x30200073), "Boot ROM should contain MRET");
 }
 
 // ============== SBI Call Tests ==============
@@ -1016,4 +1017,111 @@ fn test_senvcfg_csr() {
     let mut csrs = microvm::cpu::csr::CsrFile::new();
     csrs.write(csr::SENVCFG, 0x42);
     assert_eq!(csrs.read(csr::SENVCFG), 0x42);
+}
+
+// ============== Sstc Extension (stimecmp) ==============
+
+#[test]
+fn test_stimecmp_default() {
+    let csrs = microvm::cpu::csr::CsrFile::new();
+    // stimecmp defaults to u64::MAX (no interrupt)
+    assert_eq!(csrs.read(csr::STIMECMP), u64::MAX);
+    // No pending timer
+    assert!(!csrs.stimecmp_pending());
+}
+
+#[test]
+fn test_stimecmp_fires_when_mtime_exceeds() {
+    let mut csrs = microvm::cpu::csr::CsrFile::new();
+    csrs.write(csr::STIMECMP, 100);
+    csrs.mtime = 50;
+    assert!(!csrs.stimecmp_pending());
+    csrs.mtime = 100;
+    assert!(csrs.stimecmp_pending());
+    csrs.mtime = 200;
+    assert!(csrs.stimecmp_pending());
+}
+
+#[test]
+fn test_menvcfg_sstc_enabled() {
+    let csrs = microvm::cpu::csr::CsrFile::new();
+    // MENVCFG.STCE (bit 63) should be set
+    assert_ne!(csrs.read(csr::MENVCFG) & (1u64 << 63), 0);
+}
+
+#[test]
+fn test_mcountinhibit_csr() {
+    let mut csrs = microvm::cpu::csr::CsrFile::new();
+    // Default is 0 (no counters inhibited)
+    assert_eq!(csrs.read(csr::MCOUNTINHIBIT), 0);
+    csrs.write(csr::MCOUNTINHIBIT, 0x5);
+    assert_eq!(csrs.read(csr::MCOUNTINHIBIT), 0x5);
+}
+
+// ============== SBI DBCN Extension ==============
+
+#[test]
+fn test_sbi_probe_dbcn() {
+    // Test that DBCN (0x4442434E) is probed as available
+    // Set up S-mode CPU with ecall instruction
+    let mut bus = Bus::new(64 * 1024);
+    let program: &[u32] = &[0x00000073]; // ecall
+    let bytes: Vec<u8> = program.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    // sbi_probe_extension(0x4442434E): a7=0x10, a6=3, a0=0x4442434E
+    cpu.regs[17] = 0x10; // EID = base
+    cpu.regs[16] = 3;    // FID = probe_extension
+    cpu.regs[10] = 0x4442434E; // DBCN extension ID
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "SBI probe should succeed");
+    assert_eq!(cpu.regs[11], 1, "DBCN should be available");
+}
+
+// ============== PLIC Claim/Complete ==============
+
+#[test]
+fn test_plic_claim_complete() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    // Set up: enable IRQ 10 for context 1, set priority
+    plic.write(0x000028, 1); // priority[10] = 1
+    plic.write(0x002080, 0xFFFFFFFF); // enable all for context 1
+    plic.set_pending(10);
+    
+    // Should have interrupt
+    assert!(plic.has_interrupt(1));
+    
+    // Claim should return IRQ 10
+    let claimed = plic.read(0x201004);
+    assert_eq!(claimed, 10);
+    
+    // After claim, pending should be cleared — no more interrupt
+    assert!(!plic.has_interrupt(1));
+    
+    // Complete the interrupt
+    plic.write(0x201004, 10);
+}
+
+// ============== Boot ROM mtvec Setup ==============
+
+#[test]
+fn test_boot_rom_sets_mtvec() {
+    let code = microvm::memory::rom::BootRom::generate(0x80200000, 0x87F00000);
+    let instrs: Vec<u32> = code.chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // Should contain csrw mtvec (0x305xxxxx pattern)
+    assert!(instrs.iter().any(|&i| i == 0x30529073), "Boot ROM should set mtvec");
+}
+
+#[test]
+fn test_boot_rom_sets_menvcfg() {
+    let code = microvm::memory::rom::BootRom::generate(0x80200000, 0x87F00000);
+    let instrs: Vec<u32> = code.chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // Should contain csrw menvcfg (0x30A29073)
+    assert!(instrs.contains(&0x30A29073), "Boot ROM should set menvcfg for Sstc");
 }

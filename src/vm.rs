@@ -84,14 +84,24 @@ impl Vm {
             self.cpu.csrs.mtime = self.bus.clint.mtime();
 
             // Update timer interrupt
-            // When CLINT timer fires, set both MTIP and STIP (for delegation)
+            // When CLINT timer fires, set MTIP (bit 7)
             if self.bus.clint.timer_interrupt() {
                 let mip = self.cpu.csrs.read(csr::MIP);
-                // Set MTIP (bit 7) and STIP (bit 5) — SBI clears STIP on set_timer
-                self.cpu.csrs.write(csr::MIP, mip | (1 << 7) | (1 << 5));
+                self.cpu.csrs.write(csr::MIP, mip | (1 << 7));
             } else {
                 let mip = self.cpu.csrs.read(csr::MIP);
                 self.cpu.csrs.write(csr::MIP, mip & !(1 << 7));
+            }
+
+            // Sstc extension: stimecmp drives STIP directly
+            if self.cpu.csrs.stimecmp_pending() {
+                let mip = self.cpu.csrs.read(csr::MIP);
+                self.cpu.csrs.write(csr::MIP, mip | (1 << 5)); // STIP
+            } else {
+                // Only clear STIP if it was set by stimecmp (not by SBI set_timer)
+                // For simplicity, let stimecmp control STIP entirely when Sstc is used
+                let mip = self.cpu.csrs.read(csr::MIP);
+                self.cpu.csrs.write(csr::MIP, mip & !(1 << 5));
             }
 
             // Update software interrupt

@@ -50,6 +50,19 @@ impl BootRom {
         code.push(0x00700293); // addi t0, zero, 7
         code.push(0x10629073); // csrw scounteren, t0
 
+        // ===== Set mtvec to a simple trap handler (infinite loop) =====
+        // If any non-delegated exception reaches M-mode, loop forever
+        // The trap handler is placed right after mret; we'll point mtvec at a wfi+j loop
+        // For now, we'll set mtvec after all code is emitted (see below)
+
+        // ===== Enable Sstc in menvcfg (bit 63) =====
+        // li t0, 1 << 63; csrw menvcfg, t0
+        // Since bit 63 needs a full 64-bit load:
+        code.push(0x00100293); // addi t0, zero, 1
+        let shamt63 = 63u32;
+        code.push((shamt63 << 20) | (5 << 15) | (1 << 12) | (5 << 7) | 0x13); // slli t0, t0, 63
+        code.push(0x30A29073); // csrw menvcfg(0x30A), t0
+
         // ===== Set up mstatus for S-mode entry =====
         // We want: MPP=01 (S-mode), MPIE=1, SXL=2, UXL=2
         // Value: (2 << 34) | (2 << 32) | (1 << 11) | (1 << 7)
@@ -81,8 +94,22 @@ impl BootRom {
         code.push(0x00000513); // addi a0, zero, 0
         Self::emit_load_u64(&mut code, 11, dtb_addr); // a1 = x11
 
+        // ===== Set mtvec to M-mode trap handler at fixed offset 0x100 =====
+        let trap_addr = crate::memory::DRAM_BASE + 0x100;
+        Self::emit_load_u64(&mut code, 5, trap_addr); // t0
+        code.push(0x30529073); // csrw mtvec, t0
+
         // ===== MRET to S-mode =====
         code.push(0x30200073); // mret
+
+        // Pad to offset 0x100 (64 instructions) for trap handler placement
+        while code.len() < 64 {
+            code.push(0x00000013); // nop (addi x0, x0, 0)
+        }
+
+        // ===== M-mode trap handler at offset 0x100: simple WFI loop =====
+        code.push(0x10500073); // wfi
+        code.push(0xFFDFF06F); // j -4 (loop back to wfi)
 
         code.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
@@ -145,10 +172,11 @@ mod tests {
     #[test]
     fn test_boot_rom_contains_mret() {
         let code = BootRom::generate(0x80200000, 0x87FF0000);
-        // Last instruction should be MRET (0x30200073)
-        let len = code.len();
-        let last = u32::from_le_bytes([code[len-4], code[len-3], code[len-2], code[len-1]]);
-        assert_eq!(last, 0x30200073, "Boot ROM should end with MRET");
+        // MRET (0x30200073) should be present in the code
+        let instrs: Vec<u32> = code.chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(instrs.contains(&0x30200073), "Boot ROM should contain MRET");
     }
 
     #[test]

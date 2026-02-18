@@ -50,6 +50,12 @@ pub const FCSR: u16 = 0x003;
 pub const SENVCFG: u16 = 0x10A;
 pub const MENVCFG: u16 = 0x30A;
 
+// Machine counter-inhibit (Linux reads this)
+pub const MCOUNTINHIBIT: u16 = 0x320;
+
+// Sstc extension — supervisor timer compare
+pub const STIMECMP: u16 = 0x14D;
+
 // MSTATUS bit masks
 pub const MSTATUS_SIE: u64 = 1 << 1;
 pub const MSTATUS_MIE: u64 = 1 << 3;
@@ -102,6 +108,10 @@ impl CsrFile {
         csrs.regs.insert(MVENDORID, 0);
         csrs.regs.insert(MARCHID, 0);
         csrs.regs.insert(MIMPID, 0);
+        // Enable Sstc extension: MENVCFG.STCE (bit 63)
+        csrs.regs.insert(MENVCFG, 1u64 << 63);
+        // stimecmp defaults to max (no interrupt)
+        csrs.regs.insert(STIMECMP, u64::MAX);
         csrs
     }
 
@@ -134,12 +144,19 @@ impl CsrFile {
         }
     }
 
+    /// Check if stimecmp timer has fired (Sstc extension)
+    pub fn stimecmp_pending(&self) -> bool {
+        let stimecmp = self.regs.get(&STIMECMP).copied().unwrap_or(u64::MAX);
+        self.mtime >= stimecmp
+    }
+
     pub fn read(&self, addr: u16) -> u64 {
         match addr {
             // User-level counter CSRs (read-only shadows)
             CYCLE => self.regs.get(&MCYCLE).copied().unwrap_or(0),
             INSTRET => self.regs.get(&MINSTRET).copied().unwrap_or(0),
             TIME => self.mtime,
+            STIMECMP => self.regs.get(&STIMECMP).copied().unwrap_or(u64::MAX),
             SSTATUS => self.regs.get(&MSTATUS).copied().unwrap_or(0) & SSTATUS_MASK,
             SIE => {
                 let mie = self.regs.get(&MIE).copied().unwrap_or(0);
