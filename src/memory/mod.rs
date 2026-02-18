@@ -35,19 +35,19 @@ impl Bus {
     }
 
     pub fn read8(&mut self, addr: u64) -> u8 {
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
+        if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
             return self.uart.read_mut(addr - UART_BASE) as u8;
         }
-        if addr >= VIRTIO0_BASE && addr < VIRTIO0_BASE + VIRTIO0_SIZE {
+        if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
             return self.virtio_blk.read(addr - VIRTIO0_BASE) as u8;
         }
         if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
             return self.ram.read8(addr - DRAM_BASE);
         }
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
             return self.clint.read(addr - CLINT_BASE) as u8;
         }
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
+        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
             return self.plic.read(addr - PLIC_BASE) as u8;
         }
         0
@@ -60,16 +60,16 @@ impl Bus {
     }
 
     pub fn read32(&mut self, addr: u64) -> u32 {
-        if addr >= VIRTIO0_BASE && addr < VIRTIO0_BASE + VIRTIO0_SIZE {
+        if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
             return self.virtio_blk.read(addr - VIRTIO0_BASE) as u32;
         }
         if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
             return self.ram.read32(addr - DRAM_BASE);
         }
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
             return self.clint.read(addr - CLINT_BASE) as u32;
         }
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
+        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
             return self.plic.read(addr - PLIC_BASE) as u32;
         }
         let lo = self.read16(addr) as u32;
@@ -81,7 +81,7 @@ impl Bus {
         if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
             return self.ram.read64(addr - DRAM_BASE);
         }
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
             return self.clint.read(addr - CLINT_BASE);
         }
         let lo = self.read32(addr) as u64;
@@ -90,11 +90,11 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u64, val: u8) {
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
+        if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
             self.uart.write(addr - UART_BASE, val as u64);
             return;
         }
-        if addr >= VIRTIO0_BASE && addr < VIRTIO0_BASE + VIRTIO0_SIZE {
+        if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
             self.virtio_blk.write(addr - VIRTIO0_BASE, val as u64);
             return;
         }
@@ -102,11 +102,11 @@ impl Bus {
             self.ram.write8(addr - DRAM_BASE, val);
             return;
         }
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
             self.clint.write(addr - CLINT_BASE, val as u64);
             return;
         }
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
+        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
             self.plic.write(addr - PLIC_BASE, val as u64);
         }
     }
@@ -117,7 +117,7 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u64, val: u32) {
-        if addr >= VIRTIO0_BASE && addr < VIRTIO0_BASE + VIRTIO0_SIZE {
+        if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
             self.virtio_blk.write(addr - VIRTIO0_BASE, val as u64);
             return;
         }
@@ -125,11 +125,11 @@ impl Bus {
             self.ram.write32(addr - DRAM_BASE, val);
             return;
         }
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
             self.clint.write(addr - CLINT_BASE, val as u64);
             return;
         }
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
+        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
             self.plic.write(addr - PLIC_BASE, val as u64);
             return;
         }
@@ -142,7 +142,7 @@ impl Bus {
             self.ram.write64(addr - DRAM_BASE, val);
             return;
         }
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
             self.clint.write(addr - CLINT_BASE, val);
             return;
         }
@@ -156,6 +156,7 @@ impl Bus {
     }
 
     /// Get raw RAM slice for VirtIO DMA access
+    #[allow(dead_code)]
     pub fn ram_slice_mut(&mut self) -> &mut [u8] {
         self.ram.as_mut_slice()
     }

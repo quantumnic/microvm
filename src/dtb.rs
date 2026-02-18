@@ -41,6 +41,7 @@ impl DtbBuilder {
         self.write_u32(val);
     }
 
+    #[allow(dead_code)]
     fn prop_u64(&mut self, name: &str, val: u64) {
         let name_off = self.add_string(name);
         self.write_u32(FDT_PROP);
@@ -61,6 +62,7 @@ impl DtbBuilder {
         self.align4();
     }
 
+    #[allow(dead_code)]
     fn prop_bytes(&mut self, name: &str, data: &[u8]) {
         let name_off = self.add_string(name);
         self.write_u32(FDT_PROP);
@@ -111,7 +113,7 @@ impl DtbBuilder {
     }
 
     fn align4(&mut self) {
-        while self.struct_buf.len() % 4 != 0 {
+        while !self.struct_buf.len().is_multiple_of(4) {
             self.struct_buf.push(0);
         }
     }

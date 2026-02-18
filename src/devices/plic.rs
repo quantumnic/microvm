@@ -13,6 +13,12 @@ pub struct Plic {
     claimed: [u32; 2],
 }
 
+impl Default for Plic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Plic {
     pub fn new() -> Self {
         Self {

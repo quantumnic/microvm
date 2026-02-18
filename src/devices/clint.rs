@@ -12,6 +12,12 @@ pub struct Clint {
     frequency: u64,
 }
 
+impl Default for Clint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Clint {
     pub fn new() -> Self {
         Self {

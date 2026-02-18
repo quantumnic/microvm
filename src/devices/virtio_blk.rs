@@ -35,9 +35,12 @@ const CONFIG_BASE: u64 = 0x100;
 const CONFIG_CAPACITY_HI: u64 = 0x104;
 
 // VirtIO device status bits
+#[allow(dead_code)]
 const STATUS_ACKNOWLEDGE: u32 = 1;
+#[allow(dead_code)]
 const STATUS_DRIVER: u32 = 2;
 const STATUS_DRIVER_OK: u32 = 4;
+#[allow(dead_code)]
 const STATUS_FEATURES_OK: u32 = 8;
 
 // VirtIO block request types
@@ -46,6 +49,7 @@ const VIRTIO_BLK_T_OUT: u32 = 1;
 
 // Virtqueue descriptor flags
 const VRING_DESC_F_NEXT: u16 = 1;
+#[allow(dead_code)]
 const VRING_DESC_F_WRITE: u16 = 2;
 
 const QUEUE_SIZE: u32 = 128;
@@ -104,6 +108,12 @@ pub struct VirtioBlk {
     irq_pending: bool,
 }
 
+impl Default for VirtioBlk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VirtioBlk {
     pub fn new() -> Self {
         Self {
@@ -141,6 +151,7 @@ impl VirtioBlk {
     }
 
     /// Clear interrupt
+    #[allow(dead_code)]
     pub fn clear_interrupt(&mut self) {
         self.irq_pending = false;
     }

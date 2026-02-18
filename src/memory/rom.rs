@@ -13,6 +13,7 @@ pub struct BootRom;
 impl BootRom {
     /// Generate boot firmware code.
     /// The firmware runs at DRAM_BASE in M-mode and drops to S-mode at kernel_entry.
+    #[allow(clippy::vec_init_then_push)]
     pub fn generate(kernel_entry: u64, dtb_addr: u64) -> Vec<u8> {
         let mut code: Vec<u32> = Vec::new();
 
@@ -129,13 +130,13 @@ impl BootRom {
             let hi = ((addr.wrapping_add(0x800) >> 12) & 0xFFFFF) as u32;
             let lo = (addr & 0xFFF) as u32;
             code.push((hi << 12) | (rd << 7) | 0x37); // lui rd, hi
-            code.push((lo << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x13); // addi rd, rd, lo
+            code.push(((lo << 20) | (rd << 15)) | (rd << 7) | 0x13); // addi rd, rd, lo
         } else if addr <= 0xFFFFFFFF {
             // 32-bit address with bit 31 set — lui sign-extends, need cleanup
             let hi = ((addr.wrapping_add(0x800) >> 12) & 0xFFFFF) as u32;
             let lo = (addr & 0xFFF) as u32;
             code.push((hi << 12) | (rd << 7) | 0x37); // lui rd, hi
-            code.push((lo << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x13); // addi rd, rd, lo
+            code.push(((lo << 20) | (rd << 15)) | (rd << 7) | 0x13); // addi rd, rd, lo
                                                                                // Zero-extend: slli rd, rd, 32 then srli rd, rd, 32
             let shamt32 = 32u32;
             code.push((shamt32 << 20) | (rd << 15) | (1 << 12) | (rd << 7) | 0x13); // slli rd, rd, 32
@@ -146,7 +147,7 @@ impl BootRom {
             let hi = ((addr.wrapping_add(0x800) >> 12) & 0xFFFFF) as u32;
             let lo = (addr & 0xFFF) as u32;
             code.push((hi << 12) | (rd << 7) | 0x37);
-            code.push((lo << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x13);
+            code.push(((lo << 20) | (rd << 15)) | (rd << 7) | 0x13);
         }
     }
 }

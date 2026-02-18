@@ -9,13 +9,17 @@ pub const MIDELEG: u16 = 0x303;
 pub const MIE: u16 = 0x304;
 pub const MTVEC: u16 = 0x305;
 pub const MCOUNTEREN: u16 = 0x306;
+#[allow(dead_code)]
 pub const MSCRATCH: u16 = 0x340;
 pub const MEPC: u16 = 0x341;
 pub const MCAUSE: u16 = 0x342;
 pub const MTVAL: u16 = 0x343;
 pub const MIP: u16 = 0x344;
+#[allow(dead_code)]
 pub const PMPCFG0: u16 = 0x3A0;
+#[allow(dead_code)]
 pub const PMPCFG2: u16 = 0x3A2;
+#[allow(dead_code)]
 pub const PMPADDR0: u16 = 0x3B0;
 pub const MHARTID: u16 = 0xF14;
 pub const MCYCLE: u16 = 0xB00;
@@ -29,6 +33,7 @@ pub const SSTATUS: u16 = 0x100;
 pub const SIE: u16 = 0x104;
 pub const STVEC: u16 = 0x105;
 pub const SCOUNTEREN: u16 = 0x106;
+#[allow(dead_code)]
 pub const SSCRATCH: u16 = 0x140;
 pub const SEPC: u16 = 0x141;
 pub const SCAUSE: u16 = 0x142;
@@ -58,13 +63,17 @@ pub const STIMECMP: u16 = 0x14D;
 
 // MSTATUS bit masks
 pub const MSTATUS_SIE: u64 = 1 << 1;
+#[allow(dead_code)]
 pub const MSTATUS_MIE: u64 = 1 << 3;
 pub const MSTATUS_SPIE: u64 = 1 << 5;
+#[allow(dead_code)]
 pub const MSTATUS_MPIE: u64 = 1 << 7;
 pub const MSTATUS_SPP: u64 = 1 << 8;
+#[allow(dead_code)]
 pub const MSTATUS_MPP: u64 = 3 << 11;
 pub const MSTATUS_SUM: u64 = 1 << 18;
 pub const MSTATUS_MXR: u64 = 1 << 19;
+#[allow(dead_code)]
 pub const MSTATUS_FS: u64 = 3 << 13; // Floating-point status field
 
 // SSTATUS mask — bits visible to S-mode
@@ -96,6 +105,12 @@ impl CsrFile {
     /// Check if a CSR is read-only (bits [11:10] == 0b11).
     pub fn is_read_only(&self, csr_addr: u16) -> bool {
         (csr_addr >> 10) & 3 == 3
+    }
+}
+
+impl Default for CsrFile {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

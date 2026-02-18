@@ -168,11 +168,10 @@ fn poll_stdin(uart: &mut crate::devices::uart::Uart) {
             revents: 0,
         };
         let ret = libc::poll(&mut fds, 1, 0);
-        if ret > 0 && fds.revents & libc::POLLIN != 0 {
-            if std::io::stdin().read(&mut buf).unwrap_or(0) == 1 {
+        if ret > 0 && fds.revents & libc::POLLIN != 0
+            && std::io::stdin().read(&mut buf).unwrap_or(0) == 1 {
                 uart.push_byte(buf[0]);
             }
-        }
     }
 }
 

@@ -134,7 +134,7 @@ fn expand_c_addi4spn(inst: u32) -> u32 {
     }
     let rd = c_rd_prime(inst);
     // ADDI rd', x2, nzuimm
-    (nzuimm << 20) | (2 << 15) | (0 << 12) | (rd << 7) | 0x13
+    ((nzuimm << 20) | (2 << 15)) | (rd << 7) | 0x13
 }
 
 fn expand_c_lw(inst: u32) -> u32 {
@@ -173,21 +173,21 @@ fn expand_c_addi(inst: u32) -> u32 {
     let rd = (inst >> 7) & 0x1F;
     let imm = (((inst >> 12) & 0x1) << 5) | ((inst >> 2) & 0x1F);
     let imm = ((imm as i32) << 26 >> 26) as u32;
-    ((imm & 0xFFF) << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x13
+    (((imm & 0xFFF) << 20) | (rd << 15)) | (rd << 7) | 0x13
 }
 
 fn expand_c_addiw(inst: u32) -> u32 {
     let rd = (inst >> 7) & 0x1F;
     let imm = (((inst >> 12) & 0x1) << 5) | ((inst >> 2) & 0x1F);
     let imm = ((imm as i32) << 26 >> 26) as u32;
-    ((imm & 0xFFF) << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x1B
+    (((imm & 0xFFF) << 20) | (rd << 15)) | (rd << 7) | 0x1B
 }
 
 fn expand_c_li(inst: u32) -> u32 {
     let rd = (inst >> 7) & 0x1F;
     let imm = (((inst >> 12) & 0x1) << 5) | ((inst >> 2) & 0x1F);
     let imm = ((imm as i32) << 26 >> 26) as u32;
-    ((imm & 0xFFF) << 20) | (0 << 15) | (0 << 12) | (rd << 7) | 0x13
+    ((imm & 0xFFF) << 20) | (rd << 7) | 0x13
 }
 
 fn expand_c_addi16sp(inst: u32) -> u32 {
@@ -197,7 +197,7 @@ fn expand_c_addi16sp(inst: u32) -> u32 {
         | (((inst >> 3) & 0x3) << 7)
         | (((inst >> 2) & 0x1) << 5);
     let imm = ((imm as i32) << 22 >> 22) as u32;
-    ((imm & 0xFFF) << 20) | (2 << 15) | (0 << 12) | (2 << 7) | 0x13
+    (((imm & 0xFFF) << 20) | (2 << 15)) | (2 << 7) | 0x13
 }
 
 fn expand_c_lui(inst: u32) -> u32 {
@@ -233,12 +233,12 @@ fn expand_c_alu(inst: u32) -> u32 {
             let funct1 = (inst >> 12) & 0x1;
             let funct2b = (inst >> 5) & 0x3;
             match (funct1, funct2b) {
-                (0, 0) => (0x20 << 25) | (rs2 << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x33, // C.SUB
+                (0, 0) => ((0x20 << 25) | (rs2 << 20) | (rd << 15)) | (rd << 7) | 0x33, // C.SUB
                 (0, 1) => (rs2 << 20) | (rd << 15) | (4 << 12) | (rd << 7) | 0x33, // C.XOR
                 (0, 2) => (rs2 << 20) | (rd << 15) | (6 << 12) | (rd << 7) | 0x33, // C.OR
                 (0, 3) => (rs2 << 20) | (rd << 15) | (7 << 12) | (rd << 7) | 0x33, // C.AND
-                (1, 0) => (0x20 << 25) | (rs2 << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x3B, // C.SUBW
-                (1, 1) => (rs2 << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x3B, // C.ADDW
+                (1, 0) => ((0x20 << 25) | (rs2 << 20) | (rd << 15)) | (rd << 7) | 0x3B, // C.SUBW
+                (1, 1) => ((rs2 << 20) | (rd << 15)) | (rd << 7) | 0x3B, // C.ADDW
                 _ => 0,
             }
         }
@@ -261,7 +261,7 @@ fn expand_c_j(inst: u32) -> u32 {
     let b10_1 = (imm >> 1) & 0x3FF;
     let b11 = (imm >> 11) & 1;
     let b19_12 = (imm >> 12) & 0xFF;
-    (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) | (0 << 7) | 0x6F
+    ((b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12)) | 0x6F
 }
 
 fn expand_c_beqz(inst: u32) -> u32 {
@@ -276,11 +276,9 @@ fn expand_c_beqz(inst: u32) -> u32 {
     let b11 = (imm >> 11) & 1;
     let b10_5 = (imm >> 5) & 0x3F;
     let b4_1 = (imm >> 1) & 0xF;
-    (b12 << 31)
-        | (b10_5 << 25)
-        | (0 << 20)
-        | (rs1 << 15)
-        | (0 << 12)
+    (((b12 << 31)
+        | (b10_5 << 25))
+        | (rs1 << 15))
         | (b4_1 << 8)
         | (b11 << 7)
         | 0x63
@@ -298,9 +296,8 @@ fn expand_c_bnez(inst: u32) -> u32 {
     let b11 = (imm >> 11) & 1;
     let b10_5 = (imm >> 5) & 0x3F;
     let b4_1 = (imm >> 1) & 0xF;
-    (b12 << 31)
-        | (b10_5 << 25)
-        | (0 << 20)
+    ((b12 << 31)
+        | (b10_5 << 25))
         | (rs1 << 15)
         | (1 << 12)
         | (b4_1 << 8)
@@ -335,24 +332,22 @@ fn expand_c_jr_mv_add(inst: u32) -> u32 {
     if bit12 == 0 {
         if rs2 == 0 {
             // C.JR: JALR x0, rs1, 0
-            (rd << 15) | (0 << 12) | (0 << 7) | 0x67
+            (rd << 15) | 0x67
         } else {
             // C.MV: ADD rd, x0, rs2
-            (rs2 << 20) | (0 << 15) | (0 << 12) | (rd << 7) | 0x33
+            (rs2 << 20) | (rd << 7) | 0x33
+        }
+    } else if rs2 == 0 {
+        if rd == 0 {
+            // C.EBREAK
+            0x00100073
+        } else {
+            // C.JALR: JALR x1, rs1, 0
+            (rd << 15) | (1 << 7) | 0x67
         }
     } else {
-        if rs2 == 0 {
-            if rd == 0 {
-                // C.EBREAK
-                0x00100073
-            } else {
-                // C.JALR: JALR x1, rs1, 0
-                (rd << 15) | (0 << 12) | (1 << 7) | 0x67
-            }
-        } else {
-            // C.ADD: ADD rd, rd, rs2
-            (rs2 << 20) | (rd << 15) | (0 << 12) | (rd << 7) | 0x33
-        }
+        // C.ADD: ADD rd, rd, rs2
+        ((rs2 << 20) | (rd << 15)) | (rd << 7) | 0x33
     }
 }
 

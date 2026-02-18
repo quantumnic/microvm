@@ -31,6 +31,12 @@ const LSR_TEMT: u8 = 1 << 6; // Transmitter Empty
 const IER_RDA: u8 = 1 << 0; // Received Data Available
 const IER_THRE: u8 = 1 << 1; // Transmitter Holding Register Empty
 
+impl Default for Uart {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Uart {
     pub fn new() -> Self {
         Self {
@@ -46,11 +52,6 @@ impl Uart {
         }
     }
 
-    /// Check stdin for new data (non-blocking)
-    fn poll_input(&mut self) {
-        // In a real implementation, this would use non-blocking I/O
-        // For now, we rely on the VM loop to feed data
-    }
 
     /// Feed a byte into the receive buffer (from external source)
     pub fn push_byte(&mut self, b: u8) {
@@ -117,15 +118,13 @@ impl Uart {
             0 => {
                 if dlab == 1 {
                     self.dll as u64
-                } else {
-                    if let Some(b) = self.rx_buf.pop_front() {
-                        if self.rx_buf.is_empty() {
-                            self.lsr &= !LSR_DR;
-                        }
-                        b as u64
-                    } else {
-                        0
+                } else if let Some(b) = self.rx_buf.pop_front() {
+                    if self.rx_buf.is_empty() {
+                        self.lsr &= !LSR_DR;
                     }
+                    b as u64
+                } else {
+                    0
                 }
             }
             _ => self.read(offset),

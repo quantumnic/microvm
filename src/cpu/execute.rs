@@ -150,7 +150,7 @@ fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
 fn op_imm32(cpu: &mut Cpu, inst: &Instruction, len: u64) {
     let rs1 = cpu.regs[inst.rs1] as u32;
     let imm = inst.imm_i as u32;
-    let shamt = (imm & 0x1F) as u32;
+    let shamt = imm & 0x1F ;
     let val = match inst.funct3 {
         0 => rs1.wrapping_add(imm) as i32 as i64 as u64, // ADDIW
         1 => (rs1 << shamt) as i32 as i64 as u64,        // SLLIW
@@ -470,12 +470,11 @@ fn op_system(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) -> bool
     }
 
     // Check counter CSR access permissions
-    if matches!(csr_addr, csr::CYCLE | csr::TIME | csr::INSTRET) {
-        if !cpu.csrs.counter_accessible(csr_addr, cpu.mode) {
+    if matches!(csr_addr, csr::CYCLE | csr::TIME | csr::INSTRET)
+        && !cpu.csrs.counter_accessible(csr_addr, cpu.mode) {
             cpu.handle_exception(2, inst.raw as u64, bus); // Illegal instruction
             return true;
         }
-    }
 
     let old_val = cpu.csrs.read(csr_addr);
 
@@ -555,7 +554,7 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
         0x08 => {
             // sbi_shutdown (legacy)
             log::info!("SBI shutdown requested");
-            return false; // Let it trap, will cause halt
+            false// Let it trap, will cause halt
         }
 
         // SBI v0.2+ extensions
@@ -566,7 +565,7 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                     // sbi_get_spec_version
                     cpu.regs[10] = 0; // success
                                       // SBI spec v2.0: encoding is (major << 24) | minor
-                    cpu.regs[11] = (2u64 << 24) | 0;
+                    cpu.regs[11] = 2u64 << 24 ;
                     true
                 }
                 1 => {

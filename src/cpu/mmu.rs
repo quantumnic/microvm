@@ -21,6 +21,12 @@ const PTE_D: u64 = 1 << 7;
 /// Sv39 MMU — 3-level page table translation with A/D bit management
 pub struct Mmu;
 
+impl Default for Mmu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Mmu {
     pub fn new() -> Self {
         Self
