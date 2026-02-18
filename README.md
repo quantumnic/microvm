@@ -17,6 +17,9 @@ Boot your own kernel in one command. No QEMU flags, no complexity.
 
 [![CI](https://github.com/redbasecap-buiss/microvm/actions/workflows/ci.yml/badge.svg)](https://github.com/redbasecap-buiss/microvm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2021-orange.svg?logo=rust)](https://www.rust-lang.org/)
+[![ISA](https://img.shields.io/badge/RISC--V-RV64GC-green.svg)](https://riscv.org/)
+[![crates.io](https://img.shields.io/badge/crates.io-v0.1.0-blue.svg)](https://crates.io/crates/microvm)
 
 ---
 
