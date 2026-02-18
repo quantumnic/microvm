@@ -1,28 +1,96 @@
-/// Boot ROM — generates a minimal trampoline to jump to kernel entry
+/// Boot ROM — generates M-mode firmware that sets up the system and drops to S-mode
+///
+/// This acts as a minimal OpenSBI replacement:
+/// 1. Set up PMP to allow full access
+/// 2. Set up medeleg/mideleg for interrupt/exception delegation
+/// 3. Set up mcounteren/scounteren to allow counter access
+/// 4. Set up mtvec for SBI trap handler
+/// 5. Prepare S-mode entry: set mstatus.MPP=S, mepc=kernel_entry
+/// 6. Set a0=hartid, a1=dtb_addr
+/// 7. MRET to S-mode
 pub struct BootRom;
 
 impl BootRom {
-    /// Generate boot code that:
-    /// 1. Sets a0 = hartid (0)
-    /// 2. Sets a1 = DTB address
-    /// 3. Jumps to kernel entry point
-    ///
-    /// Note: On RV64, `lui` sign-extends from 32 bits, so addresses >= 0x80000000
-    /// would become 0xFFFFFFFF_80000000. We use slli+srli to zero-extend.
+    /// Generate boot firmware code.
+    /// The firmware runs at DRAM_BASE in M-mode and drops to S-mode at kernel_entry.
     pub fn generate(kernel_entry: u64, dtb_addr: u64) -> Vec<u8> {
         let mut code: Vec<u32> = Vec::new();
 
-        // li a0, 0 (hartid)
-        code.push(0x00000513); // addi a0, zero, 0
+        // ===== PMP: allow all access (TOR, full RWX on entry 0) =====
+        // pmpaddr0 = 0xFFFFFFFFFFFFFFFF (cover all addresses)
+        // We need to set it to (1<<54)-1 for RV64 TOR mode (covers 56-bit physical space)
+        // li t0, -1
+        code.push(0xFFF00293); // addi t0, zero, -1
+        // csrw pmpaddr0, t0
+        code.push(0x3B029073); // csrw 0x3B0, t0
+        // li t0, 0x1F (TOR=0b01_000, RWX=0b111 → 0x0F; actually: A=TOR(01), match all, RWX)
+        // pmpcfg0[7:0] = L=0, reserved=0, A=TOR(01), X=1, W=1, R=1 = 0b00_01_1_1_1_1 = 0x0F
+        code.push(0x00F00293); // addi t0, zero, 0x0F
+        // csrw pmpcfg0, t0
+        code.push(0x3A029073); // csrw 0x3A0, t0
 
-        // Load DTB address into a1 (zero-extended 64-bit)
+        // ===== Delegate exceptions and interrupts to S-mode =====
+        // medeleg: delegate most exceptions to S-mode
+        // Bits: 0(misalign fetch), 1(fetch access), 2(illegal), 3(breakpoint),
+        //       4(misalign load), 5(load access), 6(misalign store), 7(store access),
+        //       8(ecall-U), 12(inst page fault), 13(load page fault), 15(store page fault)
+        // = 0xB1FF (all except ecall-S(9), ecall-M(11))
+        Self::emit_load_imm(&mut code, 5, 0xB1FF); // t0
+        code.push(0x30229073); // csrw medeleg, t0
+
+        // mideleg: delegate S-mode interrupts (SSIP=1, STIP=5, SEIP=9)
+        Self::emit_load_imm(&mut code, 5, (1 << 1) | (1 << 5) | (1 << 9)); // 0x222
+        code.push(0x30329073); // csrw mideleg, t0
+
+        // ===== Enable counter access from S-mode and U-mode =====
+        // mcounteren: allow CY, TM, IR (bits 0,1,2)
+        code.push(0x00700293); // addi t0, zero, 7
+        code.push(0x30629073); // csrw mcounteren, t0
+        // scounteren: same
+        code.push(0x00700293); // addi t0, zero, 7
+        code.push(0x10629073); // csrw scounteren, t0
+
+        // ===== Set up mstatus for S-mode entry =====
+        // We want: MPP=01 (S-mode), MPIE=1, SXL=2, UXL=2
+        // Value: (2 << 34) | (2 << 32) | (1 << 11) | (1 << 7)
+        // = 0x0000000A00000880
+        // Simpler: use csrr+csrc+csrs approach with small immediates
+        // First, clear MPP bits using CSRC with immediate (bits 12:11)
+        // csrc mstatus, 0x18  — clears bits 4:3... no, CSRCI uses rs1 field as zimm
+        // Better: write the exact value we want
+        // mstatus = SXL(2)=bits[35:34] | UXL(2)=bits[33:32] | MPP(S)=bit[11] | MPIE=bit[7]
+        // = 0xA00000880
+        // Use csrr, then mask with CSR instructions
+        code.push(0x300022F3); // csrr t0, mstatus
+        // CSRC mstatus, 0x18 — clear bits 4:3 (not what we want)
+        // Actually we need to clear bits 12:11. Use register approach:
+        // li t1, (3 << 11) = 0x1800
+        Self::emit_load_imm(&mut code, 6, 3 << 11); // t1 = 0x1800
+        // csrc mstatus, t1  (clear MPP bits)
+        code.push(0x30033073); // csrrc x0, mstatus, t1
+        // li t1, (1 << 11) | (1 << 7) = 0x880
+        Self::emit_load_imm(&mut code, 6, (1 << 11) | (1 << 7)); // t1 = 0x880
+        // csrs mstatus, t1  (set MPP=S, MPIE=1)
+        code.push(0x30032073); // csrrs x0, mstatus, t1
+
+        // ===== Set mepc = kernel_entry =====
+        Self::emit_load_u64(&mut code, 5, kernel_entry); // t0
+        code.push(0x34129073); // csrw mepc, t0
+
+        // ===== Set up arguments: a0 = hartid (0), a1 = dtb_addr =====
+        code.push(0x00000513); // addi a0, zero, 0
         Self::emit_load_u64(&mut code, 11, dtb_addr); // a1 = x11
 
-        // Load kernel entry into t0 and jump
-        Self::emit_load_u64(&mut code, 5, kernel_entry); // t0 = x5
-        code.push(0x00028067); // jalr zero, t0, 0 (jr t0)
+        // ===== MRET to S-mode =====
+        code.push(0x30200073); // mret
 
         code.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Emit instructions to load a small immediate into register `rd`.
+    fn emit_load_imm(code: &mut Vec<u32>, rd: u32, val: u64) {
+        // Use the same logic as emit_load_u64 for consistency
+        Self::emit_load_u64(code, rd, val);
     }
 
     /// Emit instructions to load a 64-bit address into register `rd`.
@@ -47,7 +115,6 @@ impl BootRom {
             code.push((shamt32 << 20) | (rd << 15) | (5 << 12) | (rd << 7) | 0x13); // srli rd, rd, 32
         } else {
             // Full 64-bit: build upper 32 bits first, then shift and OR lower
-            // For now, microvm only uses 32-bit physical addresses
             let hi = ((addr.wrapping_add(0x800) >> 12) & 0xFFFFF) as u32;
             let lo = (addr & 0xFFF) as u32;
             code.push((hi << 12) | (rd << 7) | 0x37);
@@ -64,16 +131,35 @@ mod tests {
     fn test_boot_rom_generates_code() {
         let code = BootRom::generate(0x80200000, 0x87FF0000);
         assert!(!code.is_empty());
-        // Should be valid little-endian RISC-V instructions
         assert_eq!(code.len() % 4, 0);
     }
 
     #[test]
     fn test_boot_rom_address_in_high_range() {
-        // Addresses >= 0x80000000 should still produce valid code
         let code = BootRom::generate(0x80200000, 0x87F00000);
-        // The code should be longer due to slli/srli fixup
-        // 1 (li a0) + 4 (dtb load with fixup) + 4 (kernel load with fixup) + 1 (jr) = 10 instructions
-        assert_eq!(code.len(), 10 * 4);
+        // Should produce valid code (exact size may vary due to firmware setup)
+        assert!(code.len() >= 10 * 4);
+        assert_eq!(code.len() % 4, 0);
+    }
+
+    #[test]
+    fn test_boot_rom_contains_mret() {
+        let code = BootRom::generate(0x80200000, 0x87FF0000);
+        // Last instruction should be MRET (0x30200073)
+        let len = code.len();
+        let last = u32::from_le_bytes([code[len-4], code[len-3], code[len-2], code[len-1]]);
+        assert_eq!(last, 0x30200073, "Boot ROM should end with MRET");
+    }
+
+    #[test]
+    fn test_boot_rom_sets_pmp() {
+        let code = BootRom::generate(0x80200000, 0x87FF0000);
+        // Check that PMP setup instructions are present
+        // csrw pmpaddr0 (0x3B0) should be in the code
+        let instrs: Vec<u32> = code.chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(instrs.contains(&0x3B029073), "Should contain csrw pmpaddr0");
+        assert!(instrs.contains(&0x3A029073), "Should contain csrw pmpcfg0");
     }
 }

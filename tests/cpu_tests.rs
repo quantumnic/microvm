@@ -474,11 +474,13 @@ fn test_dtb_generation() {
 #[test]
 fn test_boot_rom_generation() {
     let boot = microvm::memory::rom::BootRom::generate(0x80200000, 0x87F00000);
-    // Should generate valid RISC-V instructions
-    assert!(boot.len() >= 24); // At least 6 instructions × 4 bytes
-    // First instruction should be addi a0, zero, 0 = 0x00000513
-    let first = u32::from_le_bytes([boot[0], boot[1], boot[2], boot[3]]);
-    assert_eq!(first, 0x00000513);
+    // Should generate valid RISC-V instructions (firmware is now larger due to setup)
+    assert!(boot.len() >= 40); // Many instructions for PMP, delegation, counteren, etc.
+    assert_eq!(boot.len() % 4, 0); // All 4-byte aligned
+    // Last instruction should be MRET (0x30200073)
+    let len = boot.len();
+    let last = u32::from_le_bytes([boot[len-4], boot[len-3], boot[len-2], boot[len-1]]);
+    assert_eq!(last, 0x30200073, "Boot ROM should end with MRET");
 }
 
 // ============== SBI Call Tests ==============
@@ -638,7 +640,7 @@ fn test_sret() {
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.csrs.write(csr::SEPC, 0x80001000);
     // SPP=0 (return to U-mode), SPIE=1
-    cpu.csrs.write(csr::SSTATUS, (1 << 5)); // SPIE=1
+    cpu.csrs.write(csr::SSTATUS, 1 << 5); // SPIE=1
     let sret = 0x10200073u32;
     bus.load_binary(&sret.to_le_bytes(), 0);
     cpu.step(&mut bus);
@@ -677,4 +679,198 @@ fn test_interrupt_delegation_to_smode() {
     assert_eq!(cpu.csrs.read(csr::SEPC), 0x80000000);
     // After executing the nop at trap handler, PC should be past it
     assert_eq!(cpu.pc, 0x80002004);
+}
+
+// ============== MMU A/D Bit Tests ==============
+
+#[test]
+fn test_mmu_ad_bits_set_on_read() {
+    // Set up Sv39 page table with valid PTE but A=0, D=0
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+
+    // Page table at offset 0x10000 from DRAM_BASE
+    let pt_base = 0x10000u64;
+    let pt_phys = DRAM_BASE + pt_base;
+
+    // Map virtual address 0x0000_0000 to physical DRAM_BASE+0x20000
+    // Level 2 PTE at pt_base (vpn[2]=0): pointer to level 1
+    let l1_base = pt_base + 0x1000;
+    let l1_ppn = (DRAM_BASE + l1_base) >> 12;
+    let l2_pte = (l1_ppn << 10) | 0x01; // V=1, pointer
+    bus.write64(pt_phys, l2_pte);
+
+    // Level 1 PTE at l1_base (vpn[1]=0): pointer to level 0
+    let l0_base = pt_base + 0x2000;
+    let l0_ppn = (DRAM_BASE + l0_base) >> 12;
+    let l1_pte = (l0_ppn << 10) | 0x01; // V=1, pointer
+    bus.write64(DRAM_BASE + l1_base, l1_pte);
+
+    // Level 0 PTE at l0_base (vpn[0]=0): leaf, RWX, A=0, D=0
+    let data_base = 0x20000u64;
+    let data_ppn = (DRAM_BASE + data_base) >> 12;
+    let l0_pte = (data_ppn << 10) | 0x0F; // V=1, R=1, W=1, X=1, A=0, D=0
+    bus.write64(DRAM_BASE + l0_base, l0_pte);
+
+    // Write test data
+    bus.write64(DRAM_BASE + data_base, 0xDEADBEEF);
+
+    // Enable Sv39
+    let satp = (8u64 << 60) | ((DRAM_BASE + pt_base) >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Do a read translation
+    let result = cpu.mmu.translate(0x0, microvm::cpu::mmu::AccessType::Read,
+        cpu.mode, &cpu.csrs, &mut bus);
+    assert!(result.is_ok());
+
+    // Check that A bit was set
+    let pte_after = bus.read64(DRAM_BASE + l0_base);
+    assert_ne!(pte_after & (1 << 6), 0, "A bit should be set after read");
+    assert_eq!(pte_after & (1 << 7), 0, "D bit should NOT be set after read");
+}
+
+#[test]
+fn test_mmu_ad_bits_set_on_write() {
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+
+    let pt_base = 0x10000u64;
+    let pt_phys = DRAM_BASE + pt_base;
+
+    // Set up a 2MiB megapage mapping (level 1 leaf)
+    // Level 2 PTE: pointer to level 1
+    let l1_base = pt_base + 0x1000;
+    let l1_ppn = (DRAM_BASE + l1_base) >> 12;
+    let l2_pte = (l1_ppn << 10) | 0x01;
+    bus.write64(pt_phys, l2_pte);
+
+    // Level 1 PTE: leaf megapage, RWX, A=0, D=0
+    // Maps to physical address DRAM_BASE (ppn must be aligned to 2MiB = 512 pages)
+    let mega_ppn = DRAM_BASE >> 12;
+    let l1_pte = (mega_ppn << 10) | 0x0F; // V=1, R=1, W=1, X=1
+    bus.write64(DRAM_BASE + l1_base, l1_pte);
+
+    let satp = (8u64 << 60) | ((DRAM_BASE + pt_base) >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Do a write translation
+    let result = cpu.mmu.translate(0x1000, microvm::cpu::mmu::AccessType::Write,
+        cpu.mode, &cpu.csrs, &mut bus);
+    assert!(result.is_ok());
+
+    // Check that both A and D bits were set
+    let pte_after = bus.read64(DRAM_BASE + l1_base);
+    assert_ne!(pte_after & (1 << 6), 0, "A bit should be set after write");
+    assert_ne!(pte_after & (1 << 7), 0, "D bit should be set after write");
+}
+
+// ============== Counter Access Control Tests ==============
+
+#[test]
+fn test_counter_access_denied_without_counteren() {
+    // S-mode trying to read TIME without mcounteren set should trap
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // mcounteren = 0 (no counter access)
+    cpu.csrs.write(csr::MCOUNTEREN, 0);
+
+    // Set up trap handler
+    cpu.csrs.write(csr::MTVEC, DRAM_BASE + 0x100);
+
+    // CSRR a0, time (0xC01)
+    let csrr_time = 0xC0102573u32; // csrrs a0, time, zero
+    bus.load_binary(&csrr_time.to_le_bytes(), 0);
+    // NOP at trap handler
+    let nop = 0x00000013u32;
+    bus.load_binary(&nop.to_le_bytes(), 0x100);
+
+    cpu.step(&mut bus);
+
+    // Should have trapped with illegal instruction
+    let mcause = cpu.csrs.read(csr::MCAUSE);
+    assert_eq!(mcause, 2, "Should trap with illegal instruction when counter access denied");
+}
+
+#[test]
+fn test_counter_access_allowed_with_counteren() {
+    // S-mode reading TIME with mcounteren set should work
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // mcounteren = 7 (CY, TM, IR)
+    cpu.csrs.write(csr::MCOUNTEREN, 7);
+
+    // CSRR a0, time
+    let csrr_time = 0xC0102573u32;
+    bus.load_binary(&csrr_time.to_le_bytes(), 0);
+
+    cpu.step(&mut bus);
+
+    // Should NOT trap, PC should advance
+    assert_eq!(cpu.pc, DRAM_BASE + 4, "Should advance past csrr time");
+}
+
+// ============== Firmware Boot Path Test ==============
+
+#[test]
+fn test_firmware_boot_drops_to_smode() {
+    // Test that the boot ROM firmware properly sets up and drops to S-mode
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+
+    let kernel_entry = DRAM_BASE + 0x200000; // 0x80200000
+    let dtb_addr = DRAM_BASE + 0x3F000;
+
+    // Generate and load boot ROM
+    let boot_code = microvm::memory::rom::BootRom::generate(kernel_entry, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    // Put a NOP at kernel entry
+    let nop = 0x00000013u32;
+    bus.load_binary(&nop.to_le_bytes(), 0x200000);
+
+    cpu.reset(DRAM_BASE);
+
+    // Run enough steps to execute the firmware
+    for _ in 0..100 {
+        cpu.step(&mut bus);
+        if cpu.pc == kernel_entry || cpu.pc == kernel_entry + 4 {
+            break;
+        }
+    }
+
+    // Verify we reached S-mode at kernel entry
+    assert_eq!(cpu.mode, microvm::cpu::PrivilegeMode::Supervisor,
+        "Should be in S-mode after MRET");
+
+    // Verify a0 = 0 (hartid)
+    assert_eq!(cpu.regs[10], 0, "a0 should be hartid=0");
+
+    // Verify a1 = dtb_addr
+    assert_eq!(cpu.regs[11], dtb_addr, "a1 should be DTB address");
+
+    // Verify PMP was configured (pmpaddr0 should be non-zero)
+    let pmpaddr0 = cpu.csrs.read(0x3B0);
+    assert_ne!(pmpaddr0, 0, "PMP should be configured");
+
+    // Verify delegation was set up
+    let medeleg = cpu.csrs.read(csr::MEDELEG);
+    assert_ne!(medeleg, 0, "medeleg should be configured");
+
+    let mideleg = cpu.csrs.read(csr::MIDELEG);
+    assert_ne!(mideleg, 0, "mideleg should be configured");
+
+    // Verify counter access enabled
+    let mcounteren = cpu.csrs.read(csr::MCOUNTEREN);
+    assert_eq!(mcounteren & 7, 7, "mcounteren should enable CY, TM, IR");
 }

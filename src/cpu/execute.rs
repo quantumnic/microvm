@@ -379,6 +379,15 @@ fn op_system(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) -> bool
     // CSR instructions
     let csr_addr = (inst.raw >> 20) & 0xFFF;
     let csr_addr = csr_addr as u16;
+
+    // Check counter CSR access permissions
+    if matches!(csr_addr, csr::CYCLE | csr::TIME | csr::INSTRET) {
+        if !cpu.csrs.counter_accessible(csr_addr, cpu.mode) {
+            cpu.handle_exception(2, inst.raw as u64, bus); // Illegal instruction
+            return true;
+        }
+    }
+
     let old_val = cpu.csrs.read(csr_addr);
 
     let write_val = match inst.funct3 {

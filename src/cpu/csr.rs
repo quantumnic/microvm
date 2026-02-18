@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use super::PrivilegeMode;
 
 // Machine-level CSRs
 pub const MSTATUS: u16 = 0x300;
@@ -98,6 +99,29 @@ impl CsrFile {
     pub fn update_counters(&mut self, cycle: u64) {
         self.regs.insert(MCYCLE, cycle);
         self.regs.insert(MINSTRET, cycle); // 1:1 for now
+    }
+
+    /// Check if a counter CSR is accessible from the given privilege mode.
+    /// Returns true if accessible.
+    pub fn counter_accessible(&self, csr_addr: u16, mode: PrivilegeMode) -> bool {
+        let bit = match csr_addr {
+            CYCLE | MCYCLE => 0,
+            TIME => 1,
+            INSTRET | MINSTRET => 2,
+            _ => return true,
+        };
+        match mode {
+            PrivilegeMode::Machine => true,
+            PrivilegeMode::Supervisor => {
+                let mcounteren = self.regs.get(&MCOUNTEREN).copied().unwrap_or(0);
+                (mcounteren >> bit) & 1 != 0
+            }
+            PrivilegeMode::User => {
+                let mcounteren = self.regs.get(&MCOUNTEREN).copied().unwrap_or(0);
+                let scounteren = self.regs.get(&SCOUNTEREN).copied().unwrap_or(0);
+                ((mcounteren >> bit) & 1 != 0) && ((scounteren >> bit) & 1 != 0)
+            }
+        }
     }
 
     pub fn read(&self, addr: u16) -> u64 {

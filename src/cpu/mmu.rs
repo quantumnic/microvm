@@ -9,7 +9,16 @@ pub enum AccessType {
     Execute,
 }
 
-/// Sv39 MMU — 3-level page table translation
+// PTE bits
+const PTE_V: u64 = 1 << 0;
+const PTE_R: u64 = 1 << 1;
+const PTE_W: u64 = 1 << 2;
+const PTE_X: u64 = 1 << 3;
+const PTE_U: u64 = 1 << 4;
+const PTE_A: u64 = 1 << 6;
+const PTE_D: u64 = 1 << 7;
+
+/// Sv39 MMU — 3-level page table translation with A/D bit management
 pub struct Mmu;
 
 impl Mmu {
@@ -19,6 +28,7 @@ impl Mmu {
 
     /// Translate virtual address to physical address.
     /// Returns Ok(physical_addr) or Err(exception_cause).
+    /// Sets Accessed and Dirty bits on page table entries as required by the spec.
     pub fn translate(
         &self,
         vaddr: u64,
@@ -54,15 +64,13 @@ impl Mmu {
             let pte_addr = a + vpn[level] * 8;
             let pte = bus.read64(pte_addr);
 
-            let v = pte & 1;
-            if v == 0 {
+            if pte & PTE_V == 0 {
                 return Err(self.page_fault(access));
             }
 
-            let r = (pte >> 1) & 1;
-            let w = (pte >> 2) & 1;
-            let x = (pte >> 3) & 1;
-            let u = (pte >> 4) & 1;
+            let r = pte & PTE_R;
+            let w = pte & PTE_W;
+            let x = pte & PTE_X;
 
             if r == 0 && w == 0 && x == 0 {
                 // Pointer to next level
@@ -70,13 +78,12 @@ impl Mmu {
                 continue;
             }
 
-            // Leaf PTE found
-            // Check permissions
+            // Leaf PTE found — check permissions
             match access {
                 AccessType::Read => {
                     let mstatus = csrs.read(csr::MSTATUS);
                     let mxr = (mstatus >> 19) & 1;
-                    if r == 0 && !(mxr == 1 && x == 1) {
+                    if r == 0 && !(mxr == 1 && x != 0) {
                         return Err(self.page_fault(access));
                     }
                 }
@@ -93,6 +100,7 @@ impl Mmu {
             }
 
             // Check U-bit
+            let u = pte & PTE_U;
             match mode {
                 PrivilegeMode::User => {
                     if u == 0 {
@@ -100,7 +108,7 @@ impl Mmu {
                     }
                 }
                 PrivilegeMode::Supervisor => {
-                    if u == 1 {
+                    if u != 0 {
                         let mstatus = csrs.read(csr::MSTATUS);
                         let sum = (mstatus >> 18) & 1;
                         if sum == 0 {
@@ -109,6 +117,25 @@ impl Mmu {
                     }
                 }
                 _ => {}
+            }
+
+            // Superpage alignment check
+            if level == 2 && ((pte >> 10) & 0x3FFFF) != 0 {
+                return Err(self.page_fault(access)); // misaligned gigapage
+            }
+            if level == 1 && ((pte >> 10) & 0x1FF) != 0 {
+                return Err(self.page_fault(access)); // misaligned megapage
+            }
+
+            // Update A/D bits (hardware-managed, as Linux expects)
+            let need_a = pte & PTE_A == 0;
+            let need_d = matches!(access, AccessType::Write) && pte & PTE_D == 0;
+            if need_a || need_d {
+                let mut new_pte = pte | PTE_A;
+                if need_d {
+                    new_pte |= PTE_D;
+                }
+                bus.write64(pte_addr, new_pte);
             }
 
             // Construct physical address
