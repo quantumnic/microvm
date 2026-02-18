@@ -1260,11 +1260,15 @@ fn test_satp_mode_validation() {
     csrs.write(csr::SATP, sv39);
     assert_eq!(csrs.read(csr::SATP), sv39);
 
-    // Mode 9 (Sv48, unsupported) should be ignored
+    // Mode 9 (Sv48) should be accepted
     let sv48 = 9u64 << 60 | 0x99999;
     csrs.write(csr::SATP, sv48);
-    // Should still have the old Sv39 value
-    assert_eq!(csrs.read(csr::SATP), sv39);
+    assert_eq!(csrs.read(csr::SATP), sv48);
+
+    // Mode 10 (unsupported) should be ignored — still has Sv48 value
+    let bad_mode = 10u64 << 60 | 0xAAAAA;
+    csrs.write(csr::SATP, bad_mode);
+    assert_eq!(csrs.read(csr::SATP), sv48);
 }
 
 #[test]
@@ -1285,5 +1289,105 @@ fn test_dtb_contains_zicntr() {
     assert!(
         dtb_str.contains("zicntr"),
         "DTB should advertise zicntr extension"
+    );
+}
+
+#[test]
+fn test_sv48_page_walk() {
+    // Set up a simple Sv48 identity mapping: 4-level walk
+    let mut cpu = Cpu::new();
+    let ram_size = 16 * 1024 * 1024u64;
+    let mut bus = Bus::new(ram_size);
+
+    // Build a 4-level page table at physical 0x8010_0000
+    let dram_base = 0x8000_0000u64;
+    let l3_base = 0x8010_0000u64; // Level 3 (root)
+    let l2_base = 0x8010_1000u64; // Level 2
+    let l1_base = 0x8010_2000u64; // Level 1
+    let l0_base = 0x8010_3000u64; // Level 0
+
+    // Map virtual address 0x0000_0000_0000_1000 → physical 0x8020_0000
+    // VPN[3]=0, VPN[2]=0, VPN[1]=0, VPN[0]=1
+
+    // L3[0] → L2 (pointer PTE)
+    let l2_ppn = l2_base >> 12;
+    bus.write64(l3_base, (l2_ppn << 10) | 0x01); // V=1, no RWX (pointer)
+
+    // L2[0] → L1 (pointer PTE)
+    let l1_ppn = l1_base >> 12;
+    bus.write64(l2_base, (l1_ppn << 10) | 0x01); // V=1, pointer
+
+    // L1[0] → L0 (pointer PTE)
+    let l0_ppn = l0_base >> 12;
+    bus.write64(l1_base, (l0_ppn << 10) | 0x01); // V=1, pointer
+
+    // L0[1] → leaf at 0x8020_0000 (RWX)
+    let target_ppn = 0x8020_0000u64 >> 12;
+    bus.write64(l0_base + 8, (target_ppn << 10) | 0xCF); // V=1, R=1, W=1, X=1, A=1, D=1
+
+    // Set SATP to Sv48 mode (9) with root page table
+    let root_ppn = (l3_base - dram_base + dram_base) >> 12;
+    let satp = (9u64 << 60) | root_ppn;
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Translate vaddr 0x1000 → should get 0x8020_0000
+    let result = cpu.mmu.translate(
+        0x1000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(result, Ok(0x8020_0000));
+}
+
+#[test]
+fn test_uart_iir_fifo_bits() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    // Enable FIFOs
+    uart.write(2, 0x01); // FCR: enable FIFO
+                         // Read IIR — should have FIFO bits set (0xC0) and no interrupt (0x01)
+    let iir = uart.read(2);
+    assert_eq!(iir & 0xC0, 0xC0, "IIR should show FIFOs enabled");
+    assert_eq!(iir & 0x0F, 0x01, "IIR should show no interrupt pending");
+}
+
+#[test]
+fn test_uart_msr_cts_dsr() {
+    let uart = microvm::devices::uart::Uart::new();
+    // MSR at offset 6 should report CTS and DSR
+    let msr = uart.read(6);
+    assert_eq!(msr & 0x30, 0x30, "MSR should report CTS and DSR asserted");
+}
+
+#[test]
+fn test_hsm_hart_suspend() {
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new(4 * 1024 * 1024);
+
+    // Set up S-mode ecall for HSM hart_suspend
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x48534D; // a7 = HSM extension
+    cpu.regs[16] = 3; // a6 = hart_suspend
+
+    // Build ecall instruction at DRAM_BASE
+    let dram_base = 0x8000_0000u64;
+    bus.write32(dram_base, 0x00000073); // ECALL
+    cpu.pc = dram_base;
+
+    cpu.step(&mut bus);
+
+    assert!(cpu.wfi, "hart_suspend should set WFI");
+    assert_eq!(cpu.regs[10], 0, "Should return SBI_SUCCESS");
+}
+
+#[test]
+fn test_dtb_sv48_mmu_type() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false);
+    let dtb_str = String::from_utf8_lossy(&dtb);
+    assert!(
+        dtb_str.contains("riscv,sv48"),
+        "DTB should advertise Sv48 MMU type"
     );
 }

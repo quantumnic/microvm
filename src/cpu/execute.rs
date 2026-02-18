@@ -667,8 +667,14 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             // HSM (Hart State Management) extension
             match fid {
                 0 => {
-                    // hart_start — not supported (single hart)
-                    cpu.regs[10] = (-2i64) as u64;
+                    // hart_start — single hart, already started
+                    cpu.regs[10] = (-1i64) as u64; // SBI_ERR_ALREADY_AVAILABLE
+                    cpu.regs[11] = 0;
+                    true
+                }
+                1 => {
+                    // hart_stop — single hart, cannot stop
+                    cpu.regs[10] = 0; // SBI_SUCCESS (pretend we stopped)
                     cpu.regs[11] = 0;
                     true
                 }
@@ -676,6 +682,13 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                     // hart_get_status
                     cpu.regs[10] = 0; // success
                     cpu.regs[11] = 0; // STARTED
+                    true
+                }
+                3 => {
+                    // hart_suspend
+                    cpu.wfi = true; // Act like WFI
+                    cpu.regs[10] = 0;
+                    cpu.regs[11] = 0;
                     true
                 }
                 _ => {

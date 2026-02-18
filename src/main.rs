@@ -45,6 +45,14 @@ enum Commands {
         /// Load address for raw binary (hex, default: 0x80200000)
         #[arg(long, default_value = "0x80200000")]
         load_addr: String,
+
+        /// Enable instruction tracing (prints PC, instruction, registers)
+        #[arg(long)]
+        trace: bool,
+
+        /// Stop after N instructions (useful with --trace)
+        #[arg(long)]
+        max_insns: Option<u64>,
     },
 }
 
@@ -60,6 +68,8 @@ fn main() {
             cpus: _,
             cmdline,
             load_addr,
+            trace,
+            max_insns,
         } => {
             let addr = u64::from_str_radix(load_addr.trim_start_matches("0x"), 16)
                 .expect("Invalid load address");
@@ -70,6 +80,8 @@ fn main() {
                 ram_size_mib: mem_size,
                 kernel_cmdline: cmdline,
                 load_addr: addr,
+                trace,
+                max_insns,
             };
 
             let mut vm = vm::Vm::new(config);

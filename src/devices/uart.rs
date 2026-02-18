@@ -93,19 +93,25 @@ impl Uart {
             }
             2 => {
                 // IIR — Interrupt Identification Register
+                // Bits 7:6 = FIFO status (0xC0 when FIFOs enabled)
+                let fifo_bits: u8 = if self.fcr & 1 != 0 { 0xC0 } else { 0 };
                 // Priority: RLS > RDA > THRE > Modem
                 if self.lsr & LSR_DR != 0 && self.ier & IER_RDA != 0 {
-                    0x04 // RDA interrupt pending (priority 2)
+                    (fifo_bits | 0x04) as u64 // RDA interrupt pending
                 } else if self.lsr & LSR_THRE != 0 && self.ier & IER_THRE != 0 {
-                    0x02 // THRE interrupt pending (priority 3)
+                    (fifo_bits | 0x02) as u64 // THRE interrupt pending
                 } else {
-                    0x01 // No interrupt pending
+                    (fifo_bits | 0x01) as u64 // No interrupt pending
                 }
             }
             3 => self.lcr as u64,
             4 => self.mcr as u64,
             5 => self.lsr as u64,
-            6 => 0, // MSR
+            6 => {
+                // MSR — Modem Status Register
+                // Report CTS and DSR asserted (Linux checks these)
+                0x30 // CTS=1, DSR=1
+            }
             7 => self.scr as u64,
             _ => 0,
         }

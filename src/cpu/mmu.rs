@@ -18,7 +18,7 @@ const PTE_U: u64 = 1 << 4;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 
-/// Sv39 MMU — 3-level page table translation with A/D bit management
+/// Sv39/Sv48 MMU — multi-level page table translation with A/D bit management
 pub struct Mmu;
 
 impl Default for Mmu {
@@ -34,6 +34,7 @@ impl Mmu {
 
     /// Translate virtual address to physical address.
     /// Returns Ok(physical_addr) or Err(exception_cause).
+    /// Supports Sv39 (3-level) and Sv48 (4-level) page table walks.
     /// Sets Accessed and Dirty bits on page table entries as required by the spec.
     pub fn translate(
         &self,
@@ -51,22 +52,26 @@ impl Mmu {
             return Ok(vaddr);
         }
 
-        // Sv39
-        if satp_mode != 8 {
-            return Ok(vaddr); // Only Sv39 supported
-        }
+        let levels = match satp_mode {
+            8 => 3,                // Sv39
+            9 => 4,                // Sv48
+            _ => return Ok(vaddr), // Unsupported mode, treat as bare
+        };
 
         let ppn = satp & 0xFFF_FFFF_FFFF; // 44 bits
-        let vpn = [
+        let page_offset = vaddr & 0xFFF;
+
+        // Extract VPN fields (each 9 bits)
+        let vpn: [u64; 4] = [
             (vaddr >> 12) & 0x1FF,
             (vaddr >> 21) & 0x1FF,
             (vaddr >> 30) & 0x1FF,
+            (vaddr >> 39) & 0x1FF,
         ];
-        let page_offset = vaddr & 0xFFF;
 
         let mut a = ppn << 12;
 
-        for level in (0..3).rev() {
+        for level in (0..levels).rev() {
             let pte_addr = a + vpn[level] * 8;
             let pte = bus.read64(pte_addr);
 
@@ -85,52 +90,17 @@ impl Mmu {
             }
 
             // Leaf PTE found — check permissions
-            match access {
-                AccessType::Read => {
-                    let mstatus = csrs.read(csr::MSTATUS);
-                    let mxr = (mstatus >> 19) & 1;
-                    if r == 0 && !(mxr == 1 && x != 0) {
-                        return Err(self.page_fault(access));
-                    }
-                }
-                AccessType::Write => {
-                    if w == 0 {
-                        return Err(self.page_fault(access));
-                    }
-                }
-                AccessType::Execute => {
-                    if x == 0 {
-                        return Err(self.page_fault(access));
-                    }
-                }
-            }
+            self.check_leaf_permissions(access, mode, pte, csrs)?;
 
-            // Check U-bit
-            let u = pte & PTE_U;
-            match mode {
-                PrivilegeMode::User => {
-                    if u == 0 {
-                        return Err(self.page_fault(access));
-                    }
-                }
-                PrivilegeMode::Supervisor => {
-                    if u != 0 {
-                        let mstatus = csrs.read(csr::MSTATUS);
-                        let sum = (mstatus >> 18) & 1;
-                        if sum == 0 {
-                            return Err(self.page_fault(access));
-                        }
-                    }
-                }
-                _ => {}
-            }
-
-            // Superpage alignment check
-            if level == 2 && ((pte >> 10) & 0x3FFFF) != 0 {
-                return Err(self.page_fault(access)); // misaligned gigapage
-            }
-            if level == 1 && ((pte >> 10) & 0x1FF) != 0 {
-                return Err(self.page_fault(access)); // misaligned megapage
+            // Superpage alignment check: lower PPN bits must be zero
+            let misaligned = match level {
+                3 => ((pte >> 10) & 0x7FFFFFF) != 0, // 512 GiB (Sv48 level 3)
+                2 => ((pte >> 10) & 0x3FFFF) != 0,   // 1 GiB
+                1 => ((pte >> 10) & 0x1FF) != 0,     // 2 MiB
+                _ => false,
+            };
+            if misaligned {
+                return Err(self.page_fault(access));
             }
 
             // Update A/D bits (hardware-managed, as Linux expects)
@@ -147,18 +117,10 @@ impl Mmu {
             // Construct physical address
             let ppn_pte = (pte >> 10) & 0xFFF_FFFF_FFFF;
             let phys = match level {
-                2 => {
-                    // 1 GiB superpage
-                    (ppn_pte & !0x3FFFF) << 12 | (vaddr & 0x3FFFFFFF)
-                }
-                1 => {
-                    // 2 MiB superpage
-                    (ppn_pte & !0x1FF) << 12 | (vaddr & 0x1FFFFF)
-                }
-                0 => {
-                    // 4 KiB page
-                    (ppn_pte << 12) | page_offset
-                }
+                3 => (ppn_pte & !0x7FFFFFF) << 12 | (vaddr & 0xFF_FFFF_FFFF), // 512 GiB
+                2 => (ppn_pte & !0x3FFFF) << 12 | (vaddr & 0x3FFFFFFF),       // 1 GiB
+                1 => (ppn_pte & !0x1FF) << 12 | (vaddr & 0x1FFFFF),           // 2 MiB
+                0 => (ppn_pte << 12) | page_offset,                           // 4 KiB
                 _ => unreachable!(),
             };
 
@@ -166,6 +128,61 @@ impl Mmu {
         }
 
         Err(self.page_fault(access))
+    }
+
+    /// Check leaf PTE permissions for given access type and privilege mode.
+    fn check_leaf_permissions(
+        &self,
+        access: AccessType,
+        mode: PrivilegeMode,
+        pte: u64,
+        csrs: &CsrFile,
+    ) -> Result<(), u64> {
+        let r = pte & PTE_R;
+        let w = pte & PTE_W;
+        let x = pte & PTE_X;
+        let u = pte & PTE_U;
+
+        match access {
+            AccessType::Read => {
+                let mstatus = csrs.read(csr::MSTATUS);
+                let mxr = (mstatus >> 19) & 1;
+                if r == 0 && !(mxr == 1 && x != 0) {
+                    return Err(self.page_fault(access));
+                }
+            }
+            AccessType::Write => {
+                if w == 0 {
+                    return Err(self.page_fault(access));
+                }
+            }
+            AccessType::Execute => {
+                if x == 0 {
+                    return Err(self.page_fault(access));
+                }
+            }
+        }
+
+        // Check U-bit
+        match mode {
+            PrivilegeMode::User => {
+                if u == 0 {
+                    return Err(self.page_fault(access));
+                }
+            }
+            PrivilegeMode::Supervisor => {
+                if u != 0 {
+                    let mstatus = csrs.read(csr::MSTATUS);
+                    let sum = (mstatus >> 18) & 1;
+                    if sum == 0 {
+                        return Err(self.page_fault(access));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     fn page_fault(&self, access: AccessType) -> u64 {

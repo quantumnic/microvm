@@ -251,9 +251,9 @@ impl CsrFile {
             // PMP address registers
             0x3B0..=0x3BF => self.pmpaddr[(addr - 0x3B0) as usize] = val,
             SATP => {
-                // Only accept mode 0 (Bare) and 8 (Sv39); ignore writes with unsupported modes
+                // Accept mode 0 (Bare), 8 (Sv39), 9 (Sv48); ignore unsupported modes
                 let mode = val >> 60;
-                if mode == 0 || mode == 8 {
+                if mode == 0 || mode == 8 || mode == 9 {
                     self.regs.insert(SATP, val);
                 }
                 // Writes with unsupported modes are silently ignored (spec allows this)

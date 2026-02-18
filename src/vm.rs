@@ -12,6 +12,8 @@ pub struct VmConfig {
     pub ram_size_mib: u64,
     pub kernel_cmdline: String,
     pub load_addr: u64,
+    pub trace: bool,
+    pub max_insns: Option<u64>,
 }
 
 pub struct Vm {
@@ -78,11 +80,20 @@ impl Vm {
         // Set up terminal for raw mode
         let _raw_guard = setup_terminal();
 
+        let trace = self.config.trace;
+        let max_insns = self.config.max_insns;
+
         log::info!("Starting emulation...");
 
         // Main execution loop
         let mut insn_count: u64 = 0;
         loop {
+            if let Some(max) = max_insns {
+                if insn_count >= max {
+                    log::info!("Reached max instruction count ({})", max);
+                    break;
+                }
+            }
             // Update mtime in CSR file for TIME CSR reads
             self.cpu.csrs.mtime = self.bus.clint.mtime();
 
@@ -133,6 +144,19 @@ impl Vm {
             } else {
                 let mip = self.cpu.csrs.read(csr::MIP);
                 self.cpu.csrs.write(csr::MIP, mip & !(1 << 9));
+            }
+
+            if trace {
+                eprintln!(
+                    "[{:>10}] PC={:#010x} mode={:?} a0={:#x} a1={:#x} a7={:#x} sp={:#x}",
+                    insn_count,
+                    self.cpu.pc,
+                    self.cpu.mode,
+                    self.cpu.regs[10],
+                    self.cpu.regs[11],
+                    self.cpu.regs[17],
+                    self.cpu.regs[2],
+                );
             }
 
             if !self.cpu.step(&mut self.bus) {

@@ -211,7 +211,7 @@ pub fn generate_dtb(ram_size: u64, cmdline: &str, has_virtio_blk: bool) -> Vec<u
     b.prop_str("compatible", "riscv");
     b.prop_str("riscv,isa", "rv64imacsu_zicsr_zifencei_sstc");
     b.prop_str("riscv,isa-base", "rv64i");
-    b.prop_str("mmu-type", "riscv,sv39");
+    b.prop_str("mmu-type", "riscv,sv48");
     b.prop_str("status", "okay");
     // ISA extensions as stringlist for newer kernels (Linux 6.2+)
     b.prop_stringlist(
