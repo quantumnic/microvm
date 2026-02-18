@@ -58,6 +58,10 @@ pub const MENVCFG: u16 = 0x30A;
 // Machine counter-inhibit (Linux reads this)
 pub const MCOUNTINHIBIT: u16 = 0x320;
 
+// Machine configuration pointer (Linux 6.x probes this)
+#[allow(dead_code)]
+pub const MCONFIGPTR: u16 = 0xF15;
+
 // Sstc extension — supervisor timer compare
 pub const STIMECMP: u16 = 0x14D;
 
@@ -77,8 +81,10 @@ pub const MSTATUS_MXR: u64 = 1 << 19;
 pub const MSTATUS_FS: u64 = 3 << 13; // Floating-point status field
 
 // SSTATUS mask — bits visible to S-mode
+// Note: FS (bits 14:13) is excluded because MISA has no F/D extensions.
+// When no FPU is present, FS must be hardwired to 0 (Off) per RISC-V spec.
+// Including FS here would make Linux think FPU exists and crash on FP instructions.
 const SSTATUS_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR
-    | (3 << 13) // FS
     | (3 << 32) // UXL
     | (1 << 63); // SD
 
@@ -237,10 +243,10 @@ impl CsrFile {
                 self.regs.insert(MIP, (mip & !writable) | (val & writable));
             }
             MSTATUS => {
-                // Preserve read-only fields SXL/UXL
+                // Preserve read-only fields: SXL, UXL, and FS (hardwired 0, no FPU)
                 let old = self.regs.get(&MSTATUS).copied().unwrap_or(0);
-                let sxl_uxl_mask = (3u64 << 32) | (3u64 << 34);
-                let new_val = (val & !sxl_uxl_mask) | (old & sxl_uxl_mask);
+                let readonly_mask = (3u64 << 32) | (3u64 << 34) | MSTATUS_FS;
+                let new_val = (val & !readonly_mask) | (old & readonly_mask);
                 self.regs.insert(MSTATUS, new_val);
             }
             // PMP config registers

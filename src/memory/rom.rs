@@ -108,9 +108,12 @@ impl BootRom {
             code.push(0x00000013); // nop (addi x0, x0, 0)
         }
 
-        // ===== M-mode trap handler at offset 0x100: simple WFI loop =====
-        code.push(0x10500073); // wfi
-        code.push(0xFFDFF06F); // j -4 (loop back to wfi)
+        // ===== M-mode trap handler at offset 0x100 =====
+        // Handles traps that reach M-mode (non-delegated).
+        // Most traps should never reach here since the emulator intercepts SBI calls
+        // and timer conversion is done in the VM loop. This is a safety net.
+        // Simple approach: just MRET back (for interrupts the VM loop will handle it)
+        code.push(0x30200073); // mret
 
         code.iter().flat_map(|w| w.to_le_bytes()).collect()
     }

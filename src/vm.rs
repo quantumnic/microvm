@@ -98,14 +98,15 @@ impl Vm {
             self.cpu.csrs.mtime = self.bus.clint.mtime();
 
             // Update timer interrupt
-            // When CLINT timer fires, set MTIP (bit 7)
+            // When CLINT timer fires, emulate M-mode firmware behavior:
+            // Convert MTIP to STIP so S-mode kernel receives it via delegation.
+            // Real hardware sets MTIP (bit 7) which M-mode firmware converts to STIP (bit 5).
+            // Since we handle SBI in the emulator, we do this conversion directly.
             if self.bus.clint.timer_interrupt() {
                 let mip = self.cpu.csrs.read(csr::MIP);
-                self.cpu.csrs.write(csr::MIP, mip | (1 << 7));
-            } else {
-                let mip = self.cpu.csrs.read(csr::MIP);
-                self.cpu.csrs.write(csr::MIP, mip & !(1 << 7));
+                self.cpu.csrs.write(csr::MIP, mip | (1 << 5)); // Set STIP
             }
+            // Note: STIP is cleared by SBI set_timer, not here (avoids clearing Sstc's STIP)
 
             // Sstc extension: stimecmp drives STIP directly
             if self.cpu.csrs.stimecmp_pending() {

@@ -894,21 +894,7 @@ fn test_firmware_boot_drops_to_smode() {
 #[test]
 fn test_sbi_rfence_remote_fence_i() {
     // Set up S-mode ECALL with a7=0x52464E43 (RFENCE), a6=0 (remote_fence_i)
-    let program = &[
-        // Set a7 = 0x52464E43 (RFENCE EID)
-        // lui a7, 0x52465 → upper 20 bits
-        0x524658B7u32, // lui a7, 0x52465
-                       // addi a7, a7, 0x43 (but we need 0x52464F43... let me recalc)
-                       // 0x52464E43: upper20 = 0x52465 (with rounding for addi sign), lo12 = 0xE43
-                       // Actually: 0x52465000 - 0x52464E43 = 0x1BD → not right
-                       // 0x52464E43 = 0x52465 << 12 | 0xFFFFFFFFFFFFE43  hmm
-                       // Let's do: lui = (0x52464E43 + 0x800) >> 12 = 0x52465, lo = 0xE43 - 0x1000 = -0x1BD? No.
-                       // 0x52464E43: hi = 0x52464E43 >> 12 = 0x52464E, lo = 0x443
-                       // But LUI loads upper 20 bits: lui = 0x52465, addi = 0xFFFFFE43 sign-ext = -0x1BD
-                       // 0x52465000 + (-0x1BD) = 0x52464E43. Yes!
-    ];
-    // This is complex to set up in raw instructions. Let me use a simpler approach
-    // with the helper. Set registers directly before stepping.
+    // Set registers directly before stepping.
     let mut bus = Bus::new(64 * 1024);
     // ECALL instruction
     let ecall: u32 = 0x00000073;
@@ -1010,7 +996,7 @@ fn test_uart_thre_interrupt() {
 fn test_dtb_contains_isa_extensions() {
     let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false);
     // Check that the DTB contains the riscv,isa-extensions property
-    let dtb_str = String::from_utf8_lossy(&dtb);
+    let _dtb_str = String::from_utf8_lossy(&dtb);
     assert!(
         dtb.windows(b"riscv,isa-extensions".len())
             .any(|w| w == b"riscv,isa-extensions"),
@@ -1212,7 +1198,7 @@ fn test_smode_cannot_access_mmode_csr() {
     // 2. In S-mode: try csrr t0, mstatus → illegal instruction trap
     // 3. Trap handler sets x31=scause (should be 2 = illegal instruction)
 
-    let code = vec![
+    let _code = vec![
         // Inst 0: Set stvec to trap handler at DRAM_BASE+0x30 (inst 12)
         0x00000297u32, // auipc t0, 0 → t0 = DRAM_BASE
         0x03028293,    // addi t0, t0, 48 → t0 = DRAM_BASE+48
@@ -1380,6 +1366,29 @@ fn test_hsm_hart_suspend() {
 
     assert!(cpu.wfi, "hart_suspend should set WFI");
     assert_eq!(cpu.regs[10], 0, "Should return SBI_SUCCESS");
+}
+
+#[test]
+fn test_mstatus_fs_hardwired_zero() {
+    // When no FPU is present (MISA has no F/D), MSTATUS.FS must be hardwired to 0
+    let mut cpu = Cpu::new();
+    let mstatus = cpu.csrs.read(csr::MSTATUS);
+    let fs = (mstatus >> 13) & 3;
+    assert_eq!(fs, 0, "FS should be 0 (Off) with no FPU");
+
+    // Try to set FS=1 (Initial) via MSTATUS write
+    cpu.csrs.write(csr::MSTATUS, mstatus | (1 << 13));
+    let fs_after = (cpu.csrs.read(csr::MSTATUS) >> 13) & 3;
+    assert_eq!(fs_after, 0, "FS should remain 0 after write attempt");
+
+    // Also try via SSTATUS write
+    let sstatus = cpu.csrs.read(csr::SSTATUS);
+    cpu.csrs.write(csr::SSTATUS, sstatus | (3 << 13));
+    let fs_via_sstatus = (cpu.csrs.read(csr::SSTATUS) >> 13) & 3;
+    assert_eq!(
+        fs_via_sstatus, 0,
+        "FS should remain 0 via SSTATUS write too"
+    );
 }
 
 #[test]

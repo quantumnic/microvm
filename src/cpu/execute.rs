@@ -21,8 +21,9 @@ pub fn execute(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> bool {
         0x33 => op_reg(cpu, &inst, inst_len),
         0x3B => op_reg32(cpu, &inst, inst_len),
         0x0F => {
+            // FENCE (funct3=0) and FENCE.I (funct3=1) — both NOPs in single-hart emulator
             cpu.pc += inst_len;
-        } // FENCE — nop
+        }
         0x73 => return op_system(cpu, bus, &inst, inst_len),
         0x2F => op_atomic(cpu, bus, &inst, inst_len),
         _ => {
