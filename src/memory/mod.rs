@@ -2,8 +2,8 @@ pub mod ram;
 pub mod rom;
 
 use crate::devices::{
-    clint::Clint, plic::Plic, uart::Uart, virtio_blk::VirtioBlk, virtio_console::VirtioConsole,
-    virtio_net::VirtioNet, virtio_rng::VirtioRng,
+    clint::Clint, plic::Plic, rtc::GoldfishRtc, uart::Uart, virtio_blk::VirtioBlk,
+    virtio_console::VirtioConsole, virtio_net::VirtioNet, virtio_rng::VirtioRng,
 };
 
 // Memory map
@@ -17,6 +17,8 @@ pub const VIRTIO2_BASE: u64 = 0x1000_3000; // VirtIO RNG
 pub const VIRTIO2_SIZE: u64 = 0x1000;
 pub const VIRTIO3_BASE: u64 = 0x1000_4000; // VirtIO Net
 pub const VIRTIO3_SIZE: u64 = 0x1000;
+pub const RTC_BASE: u64 = 0x1000_5000; // Goldfish RTC
+pub const RTC_SIZE: u64 = 0x1000;
 pub const CLINT_BASE: u64 = 0x0200_0000;
 pub const CLINT_SIZE: u64 = 0x10000;
 pub const PLIC_BASE: u64 = 0x0C00_0000;
@@ -33,6 +35,7 @@ pub struct Bus {
     pub virtio_console: VirtioConsole,
     pub virtio_rng: VirtioRng,
     pub virtio_net: VirtioNet,
+    pub rtc: GoldfishRtc,
 }
 
 impl Bus {
@@ -46,13 +49,14 @@ impl Bus {
             virtio_console: VirtioConsole::new(),
             virtio_rng: VirtioRng::new(),
             virtio_net: VirtioNet::new(),
+            rtc: GoldfishRtc::new(),
         }
     }
 
     /// Route a physical address to the correct MMIO device or RAM.
     /// Returns (device_id, offset) where device_id:
     ///   0=RAM, 1=UART, 2=VirtIO blk, 3=CLINT, 4=PLIC,
-    ///   5=VirtIO console, 6=VirtIO RNG, 7=VirtIO Net, 0xFF=unmapped
+    ///   5=VirtIO console, 6=VirtIO RNG, 7=VirtIO Net, 8=RTC, 0xFF=unmapped
     #[inline(always)]
     fn route(&self, addr: u64) -> (u8, u64) {
         if addr >= DRAM_BASE {
@@ -76,6 +80,9 @@ impl Bus {
         if (VIRTIO3_BASE..VIRTIO3_BASE + VIRTIO3_SIZE).contains(&addr) {
             return (7, addr - VIRTIO3_BASE);
         }
+        if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
+            return (8, addr - RTC_BASE);
+        }
         if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
             return (3, addr - CLINT_BASE);
         }
@@ -95,6 +102,7 @@ impl Bus {
             (5, off) => self.virtio_console.read(off) as u8,
             (6, off) => self.virtio_rng.read(off) as u8,
             (7, off) => self.virtio_net.read(off) as u8,
+            (8, off) => self.rtc.read(off) as u8,
             _ => 0,
         }
     }
@@ -124,6 +132,7 @@ impl Bus {
             (5, off) => self.virtio_console.read(off) as u32,
             (6, off) => self.virtio_rng.read(off),
             (7, off) => self.virtio_net.read(off),
+            (8, off) => self.rtc.read(off),
             _ => 0,
         }
     }
@@ -150,6 +159,7 @@ impl Bus {
             (5, off) => self.virtio_console.write(off, val as u64),
             (6, off) => self.virtio_rng.write(off, val as u64),
             (7, off) => self.virtio_net.write(off, val as u64),
+            (8, off) => self.rtc.write(off, val as u64),
             _ => {}
         }
     }
@@ -177,6 +187,7 @@ impl Bus {
             (5, off) => self.virtio_console.write(off, val as u64),
             (6, off) => self.virtio_rng.write(off, val as u64),
             (7, off) => self.virtio_net.write(off, val as u64),
+            (8, off) => self.rtc.write(off, val as u64),
             _ => {}
         }
     }

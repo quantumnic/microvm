@@ -389,6 +389,20 @@ pub fn generate_dtb(
     b.prop_u32("interrupt-parent", 2);
     b.end_node();
 
+    // Goldfish RTC (real-time clock)
+    b.begin_node(&format!("rtc@{:x}", memory::RTC_BASE));
+    b.prop_str("compatible", "google,goldfish-rtc");
+    b.prop_u32_array(
+        "reg",
+        &[
+            (memory::RTC_BASE >> 32) as u32,
+            memory::RTC_BASE as u32,
+            0,
+            memory::RTC_SIZE as u32,
+        ],
+    );
+    b.end_node();
+
     b.end_node(); // soc
     b.end_node(); // root
 

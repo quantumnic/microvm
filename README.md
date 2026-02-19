@@ -167,6 +167,11 @@ x86 has 40 years of backwards compatibility baggage. ARM requires licenses. RISC
 | `0x0200_0000` | 64 KiB | CLINT |
 | `0x0C00_0000` | 4 MiB | PLIC |
 | `0x1000_0000` | 256 B | UART |
+| `0x1000_1000` | 4 KiB | VirtIO Block |
+| `0x1000_2000` | 4 KiB | VirtIO Console |
+| `0x1000_3000` | 4 KiB | VirtIO RNG |
+| `0x1000_4000` | 4 KiB | VirtIO Net |
+| `0x1000_5000` | 4 KiB | Goldfish RTC |
 | `0x8000_0000` | configurable | DRAM |
 
 ---
