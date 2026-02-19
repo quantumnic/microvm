@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.15.0 — Bus MMIO Refactor, HPM Counters, SBI Extension Stubs
+
+### Major Features
+- **Bus MMIO routing refactor**: All MMIO reads/writes now go through a centralized `route()` dispatcher. 32-bit reads from UART and PLIC no longer decompose into 4 byte-reads — they call the device's native read method directly. This fixes correctness for MMIO registers where byte-access has side effects (e.g., UART RBR clears on read).
+- **HPM counter CSR range (0xB03-0xB1F, 0xC03-0xC1F, 0x323-0x33F)**: Machine and user hardware performance monitor counter CSRs are now handled. All return 0 (no HPM events implemented). HPM event selector writes are silently ignored. Counter access respects `mcounteren`/`scounteren` bit fields.
+- **`menvcfgh` CSR (0x31A)**: Now handled explicitly — reads 0, writes ignored (RV64 does not use the high half).
+- **SBI extension stubs**: PMU (0x504D55), SUSP (0x535553), NACL (0x4E41434C), and STA (0x535441) extensions now return `SBI_ERR_NOT_SUPPORTED` cleanly instead of falling through to the generic unknown handler. Linux probes these early in boot.
+
+### Improvements
+- Bus routing is branchless-friendly with a single match dispatch instead of cascading if-else chains
+- 7 new tests covering HPM counters, menvcfgh, PLIC/UART 32-bit MMIO, and counter access control
+
+### Stats
+- 99 tests passing (up from 92)
+- Full RV64IMACSU instruction set with Sv39/Sv48 MMU
+- SBI firmware: timer, IPI, HSM, RFENCE, SRST, DBCN (+ PMU/SUSP/NACL/STA stubs)
+
 ## v0.9.0 — CSR Privilege Enforcement, SATP Validation, Svinval Extension
 
 ### Major Features

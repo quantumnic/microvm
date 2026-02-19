@@ -58,6 +58,13 @@ pub const MENVCFG: u16 = 0x30A;
 // Machine counter-inhibit (Linux reads this)
 pub const MCOUNTINHIBIT: u16 = 0x320;
 
+// Machine hardware performance counters (0xB03-0xB1F) — all zero (no HPM events)
+// User-level HPM counters (0xC03-0xC1F) — shadows of above
+// Machine HPM event selectors (0x323-0x33F)
+
+// Machine environment config high (RV64: reads as 0)
+pub const MENVCFGH: u16 = 0x31A;
+
 // Machine configuration pointer (Linux 6.x probes this)
 #[allow(dead_code)]
 pub const MCONFIGPTR: u16 = 0xF15;
@@ -165,6 +172,9 @@ impl CsrFile {
             CYCLE | MCYCLE => 0,
             TIME => 1,
             INSTRET | MINSTRET => 2,
+            // HPM counters: user 0xC03-0xC1F, machine 0xB03-0xB1F
+            0xC03..=0xC1F => (csr_addr - 0xC00) as u32,
+            0xB03..=0xB1F => (csr_addr - 0xB00) as u32,
             _ => return true,
         };
         match mode {
@@ -217,7 +227,14 @@ impl CsrFile {
             // Environment config CSRs
             SENVCFG => self.regs.get(&SENVCFG).copied().unwrap_or(0),
             MENVCFG => self.regs.get(&MENVCFG).copied().unwrap_or(0),
+            MENVCFGH => 0, // RV64: high half is 0
             MCOUNTINHIBIT => self.regs.get(&MCOUNTINHIBIT).copied().unwrap_or(0),
+            // Machine HPM counters (mhpmcounter3-31) — all zero
+            0xB03..=0xB1F => 0,
+            // Machine HPM event selectors (mhpmevent3-31) — all zero
+            0x323..=0x33F => 0,
+            // User HPM counters (hpmcounter3-31) — shadows, all zero
+            0xC03..=0xC1F => 0,
             _ => self.regs.get(&addr).copied().unwrap_or(0),
         }
     }
@@ -256,6 +273,9 @@ impl CsrFile {
             0x3A3 => {}
             // PMP address registers
             0x3B0..=0x3BF => self.pmpaddr[(addr - 0x3B0) as usize] = val,
+            // HPM counters and event selectors — writable but no effect
+            0xB03..=0xB1F | 0x323..=0x33F => {}
+            MENVCFGH => {} // RV64: writes ignored
             SATP => {
                 // Accept mode 0 (Bare), 8 (Sv39), 9 (Sv48); ignore unsupported modes
                 let mode = val >> 60;

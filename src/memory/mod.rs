@@ -34,120 +34,125 @@ impl Bus {
         }
     }
 
-    pub fn read8(&mut self, addr: u64) -> u8 {
+    /// Route a physical address to the correct MMIO device or RAM.
+    /// Returns (device_id, offset) where device_id:
+    ///   0=RAM, 1=UART, 2=VirtIO, 3=CLINT, 4=PLIC, 0xFF=unmapped
+    #[inline(always)]
+    fn route(&self, addr: u64) -> (u8, u64) {
+        if addr >= DRAM_BASE {
+            let offset = addr - DRAM_BASE;
+            if offset < self.ram.size() {
+                return (0, offset);
+            }
+        }
         if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
-            return self.uart.read_mut(addr - UART_BASE) as u8;
+            return (1, addr - UART_BASE);
         }
         if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
-            return self.virtio_blk.read(addr - VIRTIO0_BASE) as u8;
-        }
-        if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
-            return self.ram.read8(addr - DRAM_BASE);
+            return (2, addr - VIRTIO0_BASE);
         }
         if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
-            return self.clint.read(addr - CLINT_BASE) as u8;
+            return (3, addr - CLINT_BASE);
         }
         if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
-            return self.plic.read(addr - PLIC_BASE) as u8;
+            return (4, addr - PLIC_BASE);
         }
-        0
+        (0xFF, 0)
+    }
+
+    pub fn read8(&mut self, addr: u64) -> u8 {
+        match self.route(addr) {
+            (0, off) => self.ram.read8(off),
+            (1, off) => self.uart.read_mut(off) as u8,
+            (2, off) => self.virtio_blk.read(off) as u8,
+            (3, off) => self.clint.read(off) as u8,
+            (4, off) => self.plic.read(off) as u8,
+            _ => 0,
+        }
     }
 
     pub fn read16(&mut self, addr: u64) -> u16 {
-        let lo = self.read8(addr) as u16;
-        let hi = self.read8(addr + 1) as u16;
-        lo | (hi << 8)
+        match self.route(addr) {
+            (0, off) => {
+                let lo = self.ram.read8(off) as u16;
+                let hi = self.ram.read8(off + 1) as u16;
+                lo | (hi << 8)
+            }
+            _ => {
+                let lo = self.read8(addr) as u16;
+                let hi = self.read8(addr + 1) as u16;
+                lo | (hi << 8)
+            }
+        }
     }
 
     pub fn read32(&mut self, addr: u64) -> u32 {
-        if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
-            return self.virtio_blk.read(addr - VIRTIO0_BASE) as u32;
+        match self.route(addr) {
+            (0, off) => self.ram.read32(off),
+            (1, off) => self.uart.read_mut(off) as u32,
+            (2, off) => self.virtio_blk.read(off) as u32,
+            (3, off) => self.clint.read(off) as u32,
+            (4, off) => self.plic.read(off) as u32,
+            _ => 0,
         }
-        if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
-            return self.ram.read32(addr - DRAM_BASE);
-        }
-        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
-            return self.clint.read(addr - CLINT_BASE) as u32;
-        }
-        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
-            return self.plic.read(addr - PLIC_BASE) as u32;
-        }
-        let lo = self.read16(addr) as u32;
-        let hi = self.read16(addr + 2) as u32;
-        lo | (hi << 16)
     }
 
     pub fn read64(&mut self, addr: u64) -> u64 {
-        if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
-            return self.ram.read64(addr - DRAM_BASE);
+        match self.route(addr) {
+            (0, off) => self.ram.read64(off),
+            (3, off) => self.clint.read(off),
+            _ => {
+                let lo = self.read32(addr) as u64;
+                let hi = self.read32(addr + 4) as u64;
+                lo | (hi << 32)
+            }
         }
-        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
-            return self.clint.read(addr - CLINT_BASE);
-        }
-        let lo = self.read32(addr) as u64;
-        let hi = self.read32(addr + 4) as u64;
-        lo | (hi << 32)
     }
 
     pub fn write8(&mut self, addr: u64, val: u8) {
-        if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) {
-            self.uart.write(addr - UART_BASE, val as u64);
-            return;
-        }
-        if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
-            self.virtio_blk.write(addr - VIRTIO0_BASE, val as u64);
-            return;
-        }
-        if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
-            self.ram.write8(addr - DRAM_BASE, val);
-            return;
-        }
-        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
-            self.clint.write(addr - CLINT_BASE, val as u64);
-            return;
-        }
-        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
-            self.plic.write(addr - PLIC_BASE, val as u64);
+        match self.route(addr) {
+            (0, off) => self.ram.write8(off, val),
+            (1, off) => self.uart.write(off, val as u64),
+            (2, off) => self.virtio_blk.write(off, val as u64),
+            (3, off) => self.clint.write(off, val as u64),
+            (4, off) => self.plic.write(off, val as u64),
+            _ => {}
         }
     }
 
     pub fn write16(&mut self, addr: u64, val: u16) {
-        self.write8(addr, val as u8);
-        self.write8(addr + 1, (val >> 8) as u8);
+        match self.route(addr) {
+            (0, off) => {
+                self.ram.write8(off, val as u8);
+                self.ram.write8(off + 1, (val >> 8) as u8);
+            }
+            _ => {
+                self.write8(addr, val as u8);
+                self.write8(addr + 1, (val >> 8) as u8);
+            }
+        }
     }
 
     pub fn write32(&mut self, addr: u64, val: u32) {
-        if (VIRTIO0_BASE..VIRTIO0_BASE + VIRTIO0_SIZE).contains(&addr) {
-            self.virtio_blk.write(addr - VIRTIO0_BASE, val as u64);
-            return;
+        match self.route(addr) {
+            (0, off) => self.ram.write32(off, val),
+            (1, off) => self.uart.write(off, val as u64),
+            (2, off) => self.virtio_blk.write(off, val as u64),
+            (3, off) => self.clint.write(off, val as u64),
+            (4, off) => self.plic.write(off, val as u64),
+            _ => {}
         }
-        if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
-            self.ram.write32(addr - DRAM_BASE, val);
-            return;
-        }
-        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
-            self.clint.write(addr - CLINT_BASE, val as u64);
-            return;
-        }
-        if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) {
-            self.plic.write(addr - PLIC_BASE, val as u64);
-            return;
-        }
-        self.write16(addr, val as u16);
-        self.write16(addr + 2, (val >> 16) as u16);
     }
 
     pub fn write64(&mut self, addr: u64, val: u64) {
-        if addr >= DRAM_BASE && addr < DRAM_BASE + self.ram.size() {
-            self.ram.write64(addr - DRAM_BASE, val);
-            return;
+        match self.route(addr) {
+            (0, off) => self.ram.write64(off, val),
+            (3, off) => self.clint.write(off, val),
+            _ => {
+                self.write32(addr, val as u32);
+                self.write32(addr + 4, (val >> 32) as u32);
+            }
         }
-        if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) {
-            self.clint.write(addr - CLINT_BASE, val);
-            return;
-        }
-        self.write32(addr, val as u32);
-        self.write32(addr + 4, (val >> 32) as u32);
     }
 
     /// Load binary data into RAM at given offset from DRAM_BASE

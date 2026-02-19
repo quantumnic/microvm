@@ -819,6 +819,31 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                 }
             }
         }
+        0x504D55 => {
+            // PMU (Performance Monitoring Unit) extension
+            // Linux probes this early; return SBI_ERR_NOT_SUPPORTED for all functions
+            cpu.regs[10] = (-2i64) as u64;
+            cpu.regs[11] = 0;
+            true
+        }
+        0x535553 => {
+            // SUSP (System Suspend) extension
+            cpu.regs[10] = (-2i64) as u64;
+            cpu.regs[11] = 0;
+            true
+        }
+        0x4E41434C => {
+            // NACL (Nested Acceleration) extension
+            cpu.regs[10] = (-2i64) as u64;
+            cpu.regs[11] = 0;
+            true
+        }
+        0x535441 => {
+            // STA (Steal-time Accounting) extension
+            cpu.regs[10] = (-2i64) as u64;
+            cpu.regs[11] = 0;
+            true
+        }
         _ => {
             // Unknown extension — return not supported
             cpu.regs[10] = (-2i64) as u64;
