@@ -324,6 +324,22 @@ pub fn generate_dtb(
         b.end_node();
     }
 
+    // VirtIO MMIO Console Device (always present — provides hvc0)
+    b.begin_node(&format!("virtio_mmio@{:x}", memory::VIRTIO1_BASE));
+    b.prop_str("compatible", "virtio,mmio");
+    b.prop_u32_array(
+        "reg",
+        &[
+            (memory::VIRTIO1_BASE >> 32) as u32,
+            memory::VIRTIO1_BASE as u32,
+            0,
+            memory::VIRTIO1_SIZE as u32,
+        ],
+    );
+    b.prop_u32_array("interrupts", &[9]);
+    b.prop_u32("interrupt-parent", 2);
+    b.end_node();
+
     b.end_node(); // soc
     b.end_node(); // root
 
