@@ -479,6 +479,21 @@ fn op_reg(cpu: &mut Cpu, inst: &Instruction, len: u64) {
             (1, 0x05) => clmul(rs1, rs2),  // CLMUL
             (3, 0x05) => clmulh(rs1, rs2), // CLMULH
             (2, 0x05) => clmulr(rs1, rs2), // CLMULR
+            // Zicond: conditional operations
+            (5, 0x07) => {
+                if rs2 == 0 {
+                    0
+                } else {
+                    rs1
+                } // CZERO.EQZ
+            }
+            (7, 0x07) => {
+                if rs2 != 0 {
+                    0
+                } else {
+                    rs1
+                } // CZERO.NEZ
+            }
             _ => 0,
         }
     };

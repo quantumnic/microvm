@@ -2324,3 +2324,35 @@ fn test_fence_i_nop() {
     let (cpu, _) = run_program(&[fence_i], 1);
     assert_eq!(cpu.pc, DRAM_BASE + 4);
 }
+
+#[test]
+fn test_zicond_czero_eqz() {
+    // CZERO.EQZ rd, rs1, rs2: rd = (rs2 == 0) ? 0 : rs1
+    // Encoding: funct7=0x07, funct3=5, opcode=0x33
+    // rd=3, rs1=1, rs2=2
+    let czero_eqz = (0x07 << 25) | (2 << 20) | (1 << 15) | (5 << 12) | (3 << 7) | 0x33;
+
+    // Case 1: rs2 != 0 → rd = rs1
+    let (cpu, _) = run_program_with_regs(&[czero_eqz], 1, &[(1, 42), (2, 1)]);
+    assert_eq!(cpu.regs[3], 42, "CZERO.EQZ with rs2!=0 should return rs1");
+
+    // Case 2: rs2 == 0 → rd = 0
+    let (cpu, _) = run_program_with_regs(&[czero_eqz], 1, &[(1, 42), (2, 0)]);
+    assert_eq!(cpu.regs[3], 0, "CZERO.EQZ with rs2==0 should return 0");
+}
+
+#[test]
+fn test_zicond_czero_nez() {
+    // CZERO.NEZ rd, rs1, rs2: rd = (rs2 != 0) ? 0 : rs1
+    // Encoding: funct7=0x07, funct3=7, opcode=0x33
+    // rd=3, rs1=1, rs2=2
+    let czero_nez = (0x07 << 25) | (2 << 20) | (1 << 15) | (7 << 12) | (3 << 7) | 0x33;
+
+    // Case 1: rs2 != 0 → rd = 0
+    let (cpu, _) = run_program_with_regs(&[czero_nez], 1, &[(1, 99), (2, 5)]);
+    assert_eq!(cpu.regs[3], 0, "CZERO.NEZ with rs2!=0 should return 0");
+
+    // Case 2: rs2 == 0 → rd = rs1
+    let (cpu, _) = run_program_with_regs(&[czero_nez], 1, &[(1, 99), (2, 0)]);
+    assert_eq!(cpu.regs[3], 99, "CZERO.NEZ with rs2==0 should return rs1");
+}
