@@ -2356,3 +2356,27 @@ fn test_zicond_czero_nez() {
     let (cpu, _) = run_program_with_regs(&[czero_nez], 1, &[(1, 99), (2, 0)]);
     assert_eq!(cpu.regs[3], 99, "CZERO.NEZ with rs2==0 should return rs1");
 }
+
+#[test]
+fn test_zawrs_wrs_nto() {
+    // WRS.NTO: 0x01800073 — wait on reservation set (no timeout), NOP in emulator
+    let wrs_nto = 0x01800073u32;
+    let (cpu, _) = run_program(&[wrs_nto], 1);
+    assert_eq!(cpu.pc, DRAM_BASE + 4, "WRS.NTO should advance PC by 4");
+}
+
+#[test]
+fn test_zawrs_wrs_sto() {
+    // WRS.STO: 0x01D00073 — wait on reservation set (short timeout), NOP in emulator
+    let wrs_sto = 0x01D00073u32;
+    let (cpu, _) = run_program(&[wrs_sto], 1);
+    assert_eq!(cpu.pc, DRAM_BASE + 4, "WRS.STO should advance PC by 4");
+}
+
+#[test]
+fn test_zihintpause() {
+    // PAUSE: encoded as FENCE with fm=0, pred=W(0001), succ=0 → 0x0100000F
+    let pause = 0x0100000Fu32;
+    let (cpu, _) = run_program(&[pause], 1);
+    assert_eq!(cpu.pc, DRAM_BASE + 4, "PAUSE should advance PC by 4");
+}

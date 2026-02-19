@@ -712,6 +712,18 @@ fn op_system(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) -> bool
                 cpu.pc += len;
                 return true;
             }
+            0x01800073 => {
+                // WRS.NTO (Zawrs) — wait on reservation set, non-timeout
+                // Hint: wait until reservation set is invalidated. NOP in emulator.
+                cpu.pc += len;
+                return true;
+            }
+            0x01D00073 => {
+                // WRS.STO (Zawrs) — wait on reservation set, short timeout
+                // Hint: wait with bounded time. NOP in emulator.
+                cpu.pc += len;
+                return true;
+            }
             _ => {
                 match inst.funct7 {
                     0x09 => {
