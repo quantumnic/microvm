@@ -4,6 +4,39 @@ use super::mmu::AccessType;
 use super::{Cpu, PrivilegeMode};
 use crate::memory::Bus;
 
+/// Carry-less multiply (lower 64 bits) — Zbc extension
+fn clmul(a: u64, b: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..64 {
+        if (b >> i) & 1 != 0 {
+            result ^= a << i;
+        }
+    }
+    result
+}
+
+/// Carry-less multiply high (upper 64 bits) — Zbc extension
+fn clmulh(a: u64, b: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 1..64 {
+        if (b >> i) & 1 != 0 {
+            result ^= a >> (64 - i);
+        }
+    }
+    result
+}
+
+/// Carry-less multiply reversed — Zbc extension
+fn clmulr(a: u64, b: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..64 {
+        if (b >> i) & 1 != 0 {
+            result ^= a >> (63 - i);
+        }
+    }
+    result
+}
+
 /// Execute a decoded instruction. Returns true to continue, false to halt.
 pub fn execute(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> bool {
     let inst = Instruction::decode(raw);
@@ -222,14 +255,20 @@ fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
     let val = match inst.funct3 {
         0 => rs1.wrapping_add(imm), // ADDI
         1 => {
-            // SLLI and Zbb count instructions
+            // SLLI, Zbb count instructions, Zbs immediate instructions
+            let top6 = (inst.raw >> 26) & 0x3F;
             match (funct7, inst.rs2) {
                 (0x30, 0x00) => rs1.leading_zeros() as u64,        // CLZ
                 (0x30, 0x01) => rs1.trailing_zeros() as u64,       // CTZ
                 (0x30, 0x02) => rs1.count_ones() as u64,           // CPOP
                 (0x30, 0x04) => (rs1 as u8 as i8) as i64 as u64,   // SEXT.B
                 (0x30, 0x05) => (rs1 as u16 as i16) as i64 as u64, // SEXT.H
-                _ => rs1 << shamt,                                 // SLLI
+                _ => match top6 {
+                    0x09 => rs1 & !(1u64 << shamt), // BCLRI (Zbs)
+                    0x05 => rs1 | (1u64 << shamt),  // BSETI (Zbs)
+                    0x0D => rs1 ^ (1u64 << shamt),  // BINVI (Zbs)
+                    _ => rs1 << shamt,              // SLLI
+                },
             }
         }
         2 => ((rs1 as i64) < (imm as i64)) as u64, // SLTI
@@ -239,6 +278,7 @@ fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
             let top7 = (inst.raw >> 25) & 0x7F;
             match top7 {
                 0x20 => ((rs1 as i64) >> shamt) as u64,    // SRAI
+                0x24 => (rs1 >> shamt) & 1,                // BEXTI (Zbs)
                 0x30 => rs1.rotate_right(shamt),           // RORI (Zbb)
                 0x34 if shamt == 0x18 => rs1.swap_bytes(), // REV8 (Zbb): funct12=0x6B8, shamt=0x18 doesn't match...
                 _ => {
@@ -380,6 +420,15 @@ fn op_reg(cpu: &mut Cpu, inst: &Instruction, len: u64) {
             (7, 0x05) => std::cmp::max(rs1, rs2), // MAXU
             (1, 0x30) => rs1.rotate_left((rs2 & 0x3F) as u32), // ROL
             (5, 0x30) => rs1.rotate_right((rs2 & 0x3F) as u32), // ROR
+            // Zbs: single-bit manipulation
+            (1, 0x24) => rs1 & !(1u64 << (rs2 & 0x3F)), // BCLR
+            (1, 0x14) => rs1 | (1u64 << (rs2 & 0x3F)),  // BSET
+            (1, 0x34) => rs1 ^ (1u64 << (rs2 & 0x3F)),  // BINV
+            (5, 0x24) => (rs1 >> (rs2 & 0x3F)) & 1,     // BEXT
+            // Zbc: carry-less multiplication
+            (1, 0x05) => clmul(rs1, rs2),  // CLMUL
+            (3, 0x05) => clmulh(rs1, rs2), // CLMULH
+            (2, 0x05) => clmulr(rs1, rs2), // CLMULR
             _ => 0,
         }
     };

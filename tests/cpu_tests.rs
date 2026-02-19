@@ -2138,3 +2138,126 @@ fn test_zbb_rori() {
     let (cpu, _) = run_program_with_regs(&[inst], 1, &[(1, 0x0000_0000_0000_0018)]);
     assert_eq!(cpu.regs[2], 0x8000_0000_0000_0001, "RORI by 4");
 }
+
+// === Zbs (Single-Bit Manipulation) Tests ===
+
+#[test]
+fn test_zbs_bset_bclr() {
+    // BSET x3, x1, x2: set bit rs2 in rs1
+    // funct7=0x14, funct3=1, opcode=0x33
+    let bset = (0x14 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33;
+    let (cpu, _) = run_program_with_regs(&[bset], 1, &[(1, 0), (2, 5)]);
+    assert_eq!(cpu.regs[3], 1 << 5, "BSET bit 5 on zero");
+
+    // BCLR x3, x1, x2: clear bit rs2 in rs1
+    // funct7=0x24, funct3=1, opcode=0x33
+    let bclr = (0x24 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33;
+    let (cpu, _) = run_program_with_regs(&[bclr], 1, &[(1, 0xFF), (2, 3)]);
+    assert_eq!(cpu.regs[3], 0xF7, "BCLR bit 3 from 0xFF");
+}
+
+#[test]
+fn test_zbs_binv_bext() {
+    // BINV x3, x1, x2: invert bit rs2 in rs1
+    // funct7=0x34, funct3=1, opcode=0x33
+    let binv = (0x34 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33;
+    let (cpu, _) = run_program_with_regs(&[binv], 1, &[(1, 0x00), (2, 7)]);
+    assert_eq!(cpu.regs[3], 0x80, "BINV bit 7 on zero → set");
+
+    let (cpu, _) = run_program_with_regs(&[binv], 1, &[(1, 0x80), (2, 7)]);
+    assert_eq!(cpu.regs[3], 0x00, "BINV bit 7 on 0x80 → clear");
+
+    // BEXT x3, x1, x2: extract bit rs2 from rs1
+    // funct7=0x24, funct3=5, opcode=0x33
+    let bext = (0x24 << 25) | (2 << 20) | (1 << 15) | (5 << 12) | (3 << 7) | 0x33;
+    let (cpu, _) = run_program_with_regs(&[bext], 1, &[(1, 0xA5), (2, 5)]);
+    assert_eq!(cpu.regs[3], 1, "BEXT bit 5 from 0xA5 → 1");
+
+    let (cpu, _) = run_program_with_regs(&[bext], 1, &[(1, 0xA5), (2, 6)]);
+    assert_eq!(cpu.regs[3], 0, "BEXT bit 6 from 0xA5 → 0");
+}
+
+#[test]
+fn test_zbs_bseti_bclri() {
+    // BSETI x2, x1, 10: set bit 10 (immediate)
+    // top6=0x05, shamt=10, funct3=1, opcode=0x13
+    let bseti = (0x05 << 26) | (10 << 20) | (1 << 15) | (1 << 12) | (2 << 7) | 0x13;
+    let (cpu, _) = run_program_with_regs(&[bseti], 1, &[(1, 0)]);
+    assert_eq!(cpu.regs[2], 1 << 10, "BSETI bit 10");
+
+    // BCLRI x2, x1, 10: clear bit 10 (immediate)
+    // top6=0x09, shamt=10, funct3=1, opcode=0x13
+    let bclri = (0x09 << 26) | (10 << 20) | (1 << 15) | (1 << 12) | (2 << 7) | 0x13;
+    let (cpu, _) = run_program_with_regs(&[bclri], 1, &[(1, 0xFFFF)]);
+    assert_eq!(cpu.regs[2], 0xFFFF & !(1 << 10), "BCLRI bit 10");
+}
+
+#[test]
+fn test_zbs_binvi_bexti() {
+    // BINVI x2, x1, 63: invert bit 63 (immediate)
+    // top6=0x0D, shamt=63, funct3=1, opcode=0x13
+    let binvi = (0x0D << 26) | (63 << 20) | (1 << 15) | (1 << 12) | (2 << 7) | 0x13;
+    let (cpu, _) = run_program_with_regs(&[binvi], 1, &[(1, 0)]);
+    assert_eq!(cpu.regs[2], 1u64 << 63, "BINVI bit 63 on zero");
+
+    // BEXTI x2, x1, 7: extract bit 7 (immediate)
+    // funct7=0x24, shamt=7, funct3=5, opcode=0x13
+    let bexti = (0x24 << 25) | (7 << 20) | (1 << 15) | (5 << 12) | (2 << 7) | 0x13;
+    let (cpu, _) = run_program_with_regs(&[bexti], 1, &[(1, 0x80)]);
+    assert_eq!(cpu.regs[2], 1, "BEXTI bit 7 from 0x80 → 1");
+
+    let (cpu, _) = run_program_with_regs(&[bexti], 1, &[(1, 0x7F)]);
+    assert_eq!(cpu.regs[2], 0, "BEXTI bit 7 from 0x7F → 0");
+}
+
+// === Zbc (Carry-less Multiplication) Tests ===
+
+#[test]
+fn test_zbc_clmul() {
+    // CLMUL x3, x1, x2: carry-less multiply (low)
+    // funct7=0x05, funct3=1, opcode=0x33
+    let clmul = (0x05 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33;
+
+    // Simple case: clmul(3, 3) = polynomial x * x = x^2, i.e. 0b11 * 0b11 = 0b101 = 5
+    let (cpu, _) = run_program_with_regs(&[clmul], 1, &[(1, 3), (2, 3)]);
+    assert_eq!(cpu.regs[3], 5, "CLMUL(3,3) = 5");
+
+    // clmul(0xFF, 0xFF) — each bit of b shifts a, XOR accumulate
+    let (cpu, _) = run_program_with_regs(&[clmul], 1, &[(1, 0xFF), (2, 0xFF)]);
+    // Polynomial (x^7+...+1)^2 = known value
+    assert_eq!(cpu.regs[3], 0x5555, "CLMUL(0xFF,0xFF) = 0x5555");
+}
+
+#[test]
+fn test_zbc_clmulh() {
+    // CLMULH x3, x1, x2: carry-less multiply high
+    // funct7=0x05, funct3=3, opcode=0x33
+    let clmulh = (0x05 << 25) | (2 << 20) | (1 << 15) | (3 << 12) | (3 << 7) | 0x33;
+
+    // For small values, clmulh should be 0
+    let (cpu, _) = run_program_with_regs(&[clmulh], 1, &[(1, 3), (2, 3)]);
+    assert_eq!(cpu.regs[3], 0, "CLMULH(3,3) = 0 (all fits in low)");
+
+    // Large values: clmulh(max, max) should be non-zero
+    let (cpu, _) = run_program_with_regs(&[clmulh], 1, &[(1, u64::MAX), (2, u64::MAX)]);
+    assert_ne!(cpu.regs[3], 0, "CLMULH(MAX,MAX) != 0");
+}
+
+#[test]
+fn test_zbc_clmulr() {
+    // CLMULR x3, x1, x2: carry-less multiply reversed
+    // funct7=0x05, funct3=2, opcode=0x33
+    let clmulr = (0x05 << 25) | (2 << 20) | (1 << 15) | (2 << 12) | (3 << 7) | 0x33;
+
+    // clmulr(a, b) = bit_reverse(clmul(bit_reverse(a), bit_reverse(b)))
+    // Simple test: clmulr(1, 1) = result of reversed multiply
+    let (cpu, _) = run_program_with_regs(&[clmulr], 1, &[(1, 1), (2, 1)]);
+    // clmulr(1, 1): for i=0, b>>0 & 1 =1, result ^= 1 >> (63-0) = 1>>63 = 0. Hmm let me compute...
+    // Actually clmulr(1,1): i=0: result ^= 1 >> 63 = 0. So result = 0
+    assert_eq!(cpu.regs[3], 0, "CLMULR(1,1) = 0");
+
+    // clmulr(a, b) where a has high bit set
+    let (cpu, _) = run_program_with_regs(&[clmulr], 1, &[(1, 1u64 << 63), (2, 1u64 << 63)]);
+    // i=63: result ^= (1<<63) >> (63-63) = (1<<63) >> 0 = 1<<63
+    assert_eq!(cpu.regs[3], 1u64 << 63, "CLMULR with high bits");
+}
