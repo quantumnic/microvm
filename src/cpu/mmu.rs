@@ -18,6 +18,16 @@ const PTE_U: u64 = 1 << 4;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 
+// Svpbmt: Page-Based Memory Types (PTE bits 62:61)
+const PTE_PBMT_MASK: u64 = 0x3 << 61;
+#[allow(dead_code)]
+const PTE_PBMT_PMA: u64 = 0 << 61; // Use PMA attributes (default)
+#[allow(dead_code)]
+const PTE_PBMT_NC: u64 = 1 << 61; // Non-cacheable, idempotent (normal memory, no cache)
+#[allow(dead_code)]
+const PTE_PBMT_IO: u64 = 2 << 61; // Non-cacheable, non-idempotent (I/O)
+const PTE_PBMT_RSVD: u64 = 3 << 61; // Reserved — causes page fault
+
 /// TLB entry: cached virtual-to-physical page mapping
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -231,7 +241,14 @@ impl Mmu {
                 continue;
             }
 
-            // Leaf PTE found — check permissions
+            // Leaf PTE found
+
+            // Svpbmt: check reserved PBMT encoding (11 = reserved → page fault)
+            if pte & PTE_PBMT_MASK == PTE_PBMT_RSVD {
+                return Err(self.page_fault(access));
+            }
+
+            // Check permissions
             self.check_leaf_permissions(access, mode, pte, csrs)?;
 
             // Superpage alignment check: lower PPN bits must be zero

@@ -4221,3 +4221,138 @@ fn test_amo_doubleword() {
         "mem = new value"
     );
 }
+
+#[test]
+fn test_svpbmt_pma_translation() {
+    // Svpbmt: PBMT=PMA (00) should translate normally
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+
+    // 1GiB superpage: map VA 0x80000000 to PA 0x80000000
+    let pt_base = 0x10000u64;
+    let pt_phys = DRAM_BASE + pt_base;
+
+    // VPN[2]=2 for 0x80000000: entry at index 2
+    let ppn = DRAM_BASE >> 12; // PPN for 0x80000000
+                               // PBMT=PMA (bits 62:61 = 00), V|R|W|X|A|D
+    let pte = (ppn << 10) | 0xCF; // V|R|W|X|A|D
+    bus.write64(pt_phys + 2 * 8, pte);
+
+    let satp = (8u64 << 60) | (pt_phys >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    let result = cpu.mmu.translate(
+        DRAM_BASE,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(result, Ok(DRAM_BASE));
+}
+
+#[test]
+fn test_svpbmt_nc_translation() {
+    // Svpbmt: PBMT=NC (01) should translate normally
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+
+    let pt_base = 0x10000u64;
+    let pt_phys = DRAM_BASE + pt_base;
+
+    let ppn = DRAM_BASE >> 12;
+    // PBMT=NC (bits 62:61 = 01)
+    let pte = (1u64 << 61) | (ppn << 10) | 0xCF;
+    bus.write64(pt_phys + 2 * 8, pte);
+
+    let satp = (8u64 << 60) | (pt_phys >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    let result = cpu.mmu.translate(
+        DRAM_BASE,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(result, Ok(DRAM_BASE));
+}
+
+#[test]
+fn test_svpbmt_io_translation() {
+    // Svpbmt: PBMT=IO (10) should translate normally
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+
+    let pt_base = 0x10000u64;
+    let pt_phys = DRAM_BASE + pt_base;
+
+    let ppn = DRAM_BASE >> 12;
+    // PBMT=IO (bits 62:61 = 10)
+    let pte = (2u64 << 61) | (ppn << 10) | 0xCF;
+    bus.write64(pt_phys + 2 * 8, pte);
+
+    let satp = (8u64 << 60) | (pt_phys >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    let result = cpu.mmu.translate(
+        DRAM_BASE,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(result, Ok(DRAM_BASE));
+}
+
+#[test]
+fn test_svpbmt_reserved_faults() {
+    // Svpbmt: PBMT=Reserved (11) should cause page fault
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+
+    let pt_base = 0x10000u64;
+    let pt_phys = DRAM_BASE + pt_base;
+
+    let ppn = DRAM_BASE >> 12;
+    // PBMT=Reserved (bits 62:61 = 11)
+    let pte = (3u64 << 61) | (ppn << 10) | 0xCF;
+    bus.write64(pt_phys + 2 * 8, pte);
+
+    let satp = (8u64 << 60) | (pt_phys >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    let result = cpu.mmu.translate(
+        DRAM_BASE,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(
+        result,
+        Err(13),
+        "Reserved PBMT should cause load page fault"
+    );
+
+    let result = cpu.mmu.translate(
+        DRAM_BASE,
+        microvm::cpu::mmu::AccessType::Write,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert_eq!(
+        result,
+        Err(15),
+        "Reserved PBMT should cause store page fault"
+    );
+}

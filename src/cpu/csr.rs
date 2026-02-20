@@ -1,5 +1,4 @@
 use super::PrivilegeMode;
-use std::collections::HashMap;
 
 // Machine-level CSRs
 pub const MSTATUS: u16 = 0x300;
@@ -93,8 +92,12 @@ const SSTATUS_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM
     | (3 << 32)   // UXL
     | (1 << 63); // SD
 
+/// CSR address space size (12-bit addresses = 4096 entries)
+const CSR_COUNT: usize = 4096;
+
 pub struct CsrFile {
-    regs: HashMap<u16, u64>,
+    /// Fixed array for all CSR registers (indexed by 12-bit address)
+    regs: Box<[u64; CSR_COUNT]>,
     /// PMP configuration registers (pmpcfg0-pmpcfg3 for RV64 = 2 regs × 8 entries each)
     pub pmpcfg: [u64; 4],
     /// PMP address registers (pmpaddr0-pmpaddr15)
@@ -128,7 +131,7 @@ impl Default for CsrFile {
 impl CsrFile {
     pub fn new() -> Self {
         let mut csrs = Self {
-            regs: HashMap::new(),
+            regs: Box::new([0u64; CSR_COUNT]),
             pmpcfg: [0; 4],
             pmpaddr: [0; 16],
             mtime: 0,
@@ -143,26 +146,22 @@ impl CsrFile {
             | (1 << 12)  // M - Multiply/Divide
             | (1 << 18)  // S - Supervisor mode
             | (1 << 20); // U - User mode
-        csrs.regs.insert(MISA, misa);
-        csrs.regs.insert(MHARTID, 0);
+        csrs.regs[MISA as usize] = misa;
+        csrs.regs[MHARTID as usize] = 0;
         // MSTATUS: set UXL=2 (64-bit), SXL=2 (64-bit), FS=1 (Initial)
         let mstatus = (2u64 << 32) | (2u64 << 34) | (1u64 << 13); // UXL | SXL | FS=Initial
-        csrs.regs.insert(MSTATUS, mstatus);
-        // Read-only zero registers
-        csrs.regs.insert(MVENDORID, 0);
-        csrs.regs.insert(MARCHID, 0);
-        csrs.regs.insert(MIMPID, 0);
+        csrs.regs[MSTATUS as usize] = mstatus;
         // Enable Sstc extension: MENVCFG.STCE (bit 63)
-        csrs.regs.insert(MENVCFG, 1u64 << 63);
+        csrs.regs[MENVCFG as usize] = 1u64 << 63;
         // stimecmp defaults to max (no interrupt)
-        csrs.regs.insert(STIMECMP, u64::MAX);
+        csrs.regs[STIMECMP as usize] = u64::MAX;
         csrs
     }
 
     /// Set cycle/instret counters (called from CPU step)
     pub fn update_counters(&mut self, cycle: u64) {
-        self.regs.insert(MCYCLE, cycle);
-        self.regs.insert(MINSTRET, cycle); // 1:1 for now
+        self.regs[MCYCLE as usize] = cycle;
+        self.regs[MINSTRET as usize] = cycle; // 1:1 for now
     }
 
     /// Check if a counter CSR is accessible from the given privilege mode.
@@ -179,13 +178,10 @@ impl CsrFile {
         };
         match mode {
             PrivilegeMode::Machine => true,
-            PrivilegeMode::Supervisor => {
-                let mcounteren = self.regs.get(&MCOUNTEREN).copied().unwrap_or(0);
-                (mcounteren >> bit) & 1 != 0
-            }
+            PrivilegeMode::Supervisor => (self.regs[MCOUNTEREN as usize] >> bit) & 1 != 0,
             PrivilegeMode::User => {
-                let mcounteren = self.regs.get(&MCOUNTEREN).copied().unwrap_or(0);
-                let scounteren = self.regs.get(&SCOUNTEREN).copied().unwrap_or(0);
+                let mcounteren = self.regs[MCOUNTEREN as usize];
+                let scounteren = self.regs[SCOUNTEREN as usize];
                 ((mcounteren >> bit) & 1 != 0) && ((scounteren >> bit) & 1 != 0)
             }
         }
@@ -193,45 +189,35 @@ impl CsrFile {
 
     /// Check if stimecmp timer has fired (Sstc extension)
     pub fn stimecmp_pending(&self) -> bool {
-        let stimecmp = self.regs.get(&STIMECMP).copied().unwrap_or(u64::MAX);
-        self.mtime >= stimecmp
+        self.mtime >= self.regs[STIMECMP as usize]
     }
 
     /// Mark floating-point state as Dirty (FS=3) in mstatus, and set SD bit
     pub fn set_fs_dirty(&mut self) {
-        let mut mstatus = self.regs.get(&MSTATUS).copied().unwrap_or(0);
+        let mstatus = self.regs[MSTATUS as usize];
         let fs = (mstatus >> 13) & 3;
         if fs != 3 {
-            mstatus = (mstatus & !MSTATUS_FS) | (3u64 << 13); // FS = Dirty
-            mstatus |= 1u64 << 63; // SD
-            self.regs.insert(MSTATUS, mstatus);
+            let mut new = (mstatus & !MSTATUS_FS) | (3u64 << 13); // FS = Dirty
+            new |= 1u64 << 63; // SD
+            self.regs[MSTATUS as usize] = new;
         }
     }
 
     /// Check if FP instructions are allowed (FS != 0/Off)
     pub fn fp_enabled(&self) -> bool {
-        let mstatus = self.regs.get(&MSTATUS).copied().unwrap_or(0);
-        ((mstatus >> 13) & 3) != 0
+        ((self.regs[MSTATUS as usize] >> 13) & 3) != 0
     }
 
     pub fn read(&self, addr: u16) -> u64 {
         match addr {
             // User-level counter CSRs (read-only shadows)
-            CYCLE => self.regs.get(&MCYCLE).copied().unwrap_or(0),
-            INSTRET => self.regs.get(&MINSTRET).copied().unwrap_or(0),
+            CYCLE => self.regs[MCYCLE as usize],
+            INSTRET => self.regs[MINSTRET as usize],
             TIME => self.mtime,
-            STIMECMP => self.regs.get(&STIMECMP).copied().unwrap_or(u64::MAX),
-            SSTATUS => self.regs.get(&MSTATUS).copied().unwrap_or(0) & SSTATUS_MASK,
-            SIE => {
-                let mie = self.regs.get(&MIE).copied().unwrap_or(0);
-                let mideleg = self.regs.get(&MIDELEG).copied().unwrap_or(0);
-                mie & mideleg
-            }
-            SIP => {
-                let mip = self.regs.get(&MIP).copied().unwrap_or(0);
-                let mideleg = self.regs.get(&MIDELEG).copied().unwrap_or(0);
-                mip & mideleg
-            }
+            STIMECMP => self.regs[STIMECMP as usize],
+            SSTATUS => self.regs[MSTATUS as usize] & SSTATUS_MASK,
+            SIE => self.regs[MIE as usize] & self.regs[MIDELEG as usize],
+            SIP => self.regs[MIP as usize] & self.regs[MIDELEG as usize],
             // PMP config registers (RV64: pmpcfg0 at 0x3A0, pmpcfg2 at 0x3A2)
             0x3A0 => self.pmpcfg[0],
             0x3A1 => 0, // pmpcfg1 is not accessible on RV64
@@ -240,21 +226,21 @@ impl CsrFile {
             // PMP address registers (0x3B0 - 0x3BF)
             0x3B0..=0x3BF => self.pmpaddr[(addr - 0x3B0) as usize],
             // FP CSRs
-            FFLAGS => self.regs.get(&FCSR).copied().unwrap_or(0) & 0x1F,
-            FRM => (self.regs.get(&FCSR).copied().unwrap_or(0) >> 5) & 0x7,
-            FCSR => self.regs.get(&FCSR).copied().unwrap_or(0) & 0xFF,
+            FFLAGS => self.regs[FCSR as usize] & 0x1F,
+            FRM => (self.regs[FCSR as usize] >> 5) & 0x7,
+            FCSR => self.regs[FCSR as usize] & 0xFF,
             // Environment config CSRs
-            SENVCFG => self.regs.get(&SENVCFG).copied().unwrap_or(0),
-            MENVCFG => self.regs.get(&MENVCFG).copied().unwrap_or(0),
+            SENVCFG => self.regs[SENVCFG as usize],
+            MENVCFG => self.regs[MENVCFG as usize],
             MENVCFGH => 0, // RV64: high half is 0
-            MCOUNTINHIBIT => self.regs.get(&MCOUNTINHIBIT).copied().unwrap_or(0),
+            MCOUNTINHIBIT => self.regs[MCOUNTINHIBIT as usize],
             // Machine HPM counters (mhpmcounter3-31) — all zero
             0xB03..=0xB1F => 0,
             // Machine HPM event selectors (mhpmevent3-31) — all zero
             0x323..=0x33F => 0,
             // User HPM counters (hpmcounter3-31) — shadows, all zero
             0xC03..=0xC1F => 0,
-            _ => self.regs.get(&addr).copied().unwrap_or(0),
+            _ => self.regs[addr as usize],
         }
     }
 
@@ -262,25 +248,24 @@ impl CsrFile {
         match addr {
             MISA | MHARTID | MVENDORID | MARCHID | MIMPID => {} // Read-only
             SSTATUS => {
-                let mstatus = self.regs.get(&MSTATUS).copied().unwrap_or(0);
-                let new_mstatus = (mstatus & !SSTATUS_MASK) | (val & SSTATUS_MASK);
-                self.regs.insert(MSTATUS, new_mstatus);
+                let mstatus = self.regs[MSTATUS as usize];
+                self.regs[MSTATUS as usize] = (mstatus & !SSTATUS_MASK) | (val & SSTATUS_MASK);
             }
             SIE => {
-                let mideleg = self.regs.get(&MIDELEG).copied().unwrap_or(0);
-                let mie = self.regs.get(&MIE).copied().unwrap_or(0);
-                self.regs.insert(MIE, (mie & !mideleg) | (val & mideleg));
+                let mideleg = self.regs[MIDELEG as usize];
+                let mie = self.regs[MIE as usize];
+                self.regs[MIE as usize] = (mie & !mideleg) | (val & mideleg);
             }
             SIP => {
-                let mideleg = self.regs.get(&MIDELEG).copied().unwrap_or(0);
-                let mip = self.regs.get(&MIP).copied().unwrap_or(0);
+                let mideleg = self.regs[MIDELEG as usize];
+                let mip = self.regs[MIP as usize];
                 // Only SSIP is writable from S-mode
                 let writable = mideleg & (1 << 1);
-                self.regs.insert(MIP, (mip & !writable) | (val & writable));
+                self.regs[MIP as usize] = (mip & !writable) | (val & writable);
             }
             MSTATUS => {
                 // Preserve read-only fields: SXL, UXL
-                let old = self.regs.get(&MSTATUS).copied().unwrap_or(0);
+                let old = self.regs[MSTATUS as usize];
                 let readonly_mask = (3u64 << 32) | (3u64 << 34); // SXL | UXL
                 let mut new_val = (val & !readonly_mask) | (old & readonly_mask);
                 // SD (bit 63) is read-only: set when FS=3 (Dirty)
@@ -290,7 +275,7 @@ impl CsrFile {
                 } else {
                     new_val &= !(1u64 << 63);
                 }
-                self.regs.insert(MSTATUS, new_val);
+                self.regs[MSTATUS as usize] = new_val;
             }
             // PMP config registers
             0x3A0 => self.pmpcfg[0] = val,
@@ -301,16 +286,15 @@ impl CsrFile {
             0x3B0..=0x3BF => self.pmpaddr[(addr - 0x3B0) as usize] = val,
             // FP CSR writes
             FFLAGS => {
-                let old_fcsr = self.regs.get(&FCSR).copied().unwrap_or(0);
-                self.regs.insert(FCSR, (old_fcsr & !0x1F) | (val & 0x1F));
+                let old = self.regs[FCSR as usize];
+                self.regs[FCSR as usize] = (old & !0x1F) | (val & 0x1F);
             }
             FRM => {
-                let old_fcsr = self.regs.get(&FCSR).copied().unwrap_or(0);
-                self.regs
-                    .insert(FCSR, (old_fcsr & !0xE0) | ((val & 0x7) << 5));
+                let old = self.regs[FCSR as usize];
+                self.regs[FCSR as usize] = (old & !0xE0) | ((val & 0x7) << 5);
             }
             FCSR => {
-                self.regs.insert(FCSR, val & 0xFF);
+                self.regs[FCSR as usize] = val & 0xFF;
             }
             // HPM counters and event selectors — writable but no effect
             0xB03..=0xB1F | 0x323..=0x33F => {}
@@ -319,12 +303,12 @@ impl CsrFile {
                 // Accept mode 0 (Bare), 8 (Sv39), 9 (Sv48), 10 (Sv57); ignore unsupported modes
                 let mode = val >> 60;
                 if mode == 0 || mode == 8 || mode == 9 || mode == 10 {
-                    self.regs.insert(SATP, val);
+                    self.regs[SATP as usize] = val;
                 }
                 // Writes with unsupported modes are silently ignored (spec allows this)
             }
             _ => {
-                self.regs.insert(addr, val);
+                self.regs[addr as usize] = val;
             }
         }
     }
