@@ -1064,19 +1064,51 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             // On a single-hart system these are all no-ops that succeed
             match fid {
                 0 => {
-                    // remote_fence_i
+                    // remote_fence_i — icache flush (nop on single-hart)
                     cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true
                 }
                 1 => {
                     // remote_sfence_vma
+                    // a0 = hart_mask, a1 = hart_mask_base, a2 = start_addr, a3 = size
+                    let start_addr = cpu.regs[12];
+                    let size = cpu.regs[13];
+                    if size == 0 || size == u64::MAX {
+                        cpu.mmu.flush_tlb();
+                    } else {
+                        // Flush specific pages
+                        let end = start_addr.saturating_add(size);
+                        let mut addr = start_addr & !0xFFF;
+                        while addr < end {
+                            cpu.mmu.flush_tlb_vaddr(addr);
+                            addr = addr.saturating_add(4096);
+                            if addr == 0 {
+                                break;
+                            }
+                        }
+                    }
                     cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true
                 }
                 2 => {
-                    // remote_sfence_vma_asid
+                    // remote_sfence_vma_asid — same as above (single ASID)
+                    let start_addr = cpu.regs[12];
+                    let size = cpu.regs[13];
+                    if size == 0 || size == u64::MAX {
+                        cpu.mmu.flush_tlb();
+                    } else {
+                        let end = start_addr.saturating_add(size);
+                        let mut addr = start_addr & !0xFFF;
+                        while addr < end {
+                            cpu.mmu.flush_tlb_vaddr(addr);
+                            addr = addr.saturating_add(4096);
+                            if addr == 0 {
+                                break;
+                            }
+                        }
+                    }
                     cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true

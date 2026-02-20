@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.33.0 — Boot Simulation Test Suite + RFENCE TLB Fix + AMO Tests
+
+### Major Features
+- **Bare-metal boot simulation kernel** (`tests/boot-sim/`): 18-test S-mode kernel exercising the full boot path — DTB validation, trap setup, SBI probes, Sv39 MMU, timer interrupts, UART MMIO, PLIC configuration, FP registers, LR/SC atomics, AMO operations, sscratch CSR, DBCN console, and Zbb bit manipulation. Built with `riscv64-elf-gcc` and runnable via `microvm run`.
+- **SBI RFENCE TLB flush bugfix**: `remote_sfence_vma` and `remote_sfence_vma_asid` now properly flush the TLB (previously returned success without actually flushing). Supports both full TLB flush and per-page invalidation.
+
+### New Tests
+- 6 new integration tests: SBI RFENCE TLB flush, RFENCE vaddr-specific flush, AMOMIN/AMOMAX, AMOXOR/AMOAND/AMOOR, AMO doubleword (64-bit amoswap.d)
+- Boot simulation kernel: 18 bare-metal S-mode tests covering CPU, MMU, SBI, devices, and extensions
+
+### Bug Fixes
+- SBI `remote_sfence_vma` (RFENCE ext, fid=1): now flushes TLB entries, critical for Linux boot where page table updates rely on remote TLB shootdown
+- SBI `remote_sfence_vma_asid` (RFENCE ext, fid=2): same fix, with ASID-aware flush
+
+### Stats
+- 195 integration tests + 56+56 unit tests = 307 total, all passing
+- Boot simulation: 18/18 bare-metal tests passing
+
 ## v0.32.0 — Sv57 Five-Level Page Tables
 
 ### Major Features

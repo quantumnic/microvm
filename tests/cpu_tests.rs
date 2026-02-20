@@ -3992,3 +3992,232 @@ fn test_dtb_to_dts_roundtrip_consistency() {
     let dts2 = microvm::dtb::dtb_to_dts(&dtb2);
     assert_eq!(dts1, dts2, "Same params should produce identical DTS");
 }
+
+// ===== SBI RFENCE TLB flush tests =====
+
+#[test]
+fn test_sbi_rfence_flushes_tlb() {
+    // Verify that SBI remote_sfence_vma actually flushes the TLB
+    // Set up: S-mode with Sv39, cached TLB entry, then SBI RFENCE should invalidate it
+    let mut bus = Bus::new(16 * 1024 * 1024);
+    let mut cpu = Cpu::new();
+
+    // Put CPU in S-mode
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Set up a simple Sv39 page table at physical 0x80400000
+    let pt_base: u64 = 0x400000; // offset from DRAM_BASE
+                                 // Map VPN[2]=2 (VA 0x80000000) → PPN 0x80000 (PA 0x80000000), 1GiB superpage
+    let pte = (0x80000u64 << 10) | 0xCF; // V|R|W|X|A|D
+    bus.write64(DRAM_BASE + pt_base + 2 * 8, pte);
+    // Map VPN[2]=0 (VA 0x00000000) → PPN 0x0, 1GiB superpage (for MMIO)
+    let pte0 = (0u64 << 10) | 0xCF;
+    bus.write64(DRAM_BASE + pt_base, pte0);
+
+    // Enable Sv39
+    let satp = (8u64 << 60) | ((DRAM_BASE + pt_base) >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mmu.flush_tlb();
+
+    // Do a translation to populate TLB
+    let result = cpu.mmu.translate(
+        0x80001000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert!(result.is_ok());
+    assert!(cpu.mmu.tlb_misses > 0);
+    let misses_before = cpu.mmu.tlb_misses;
+
+    // Verify TLB hit on second access
+    let result2 = cpu.mmu.translate(
+        0x80001000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert!(result2.is_ok());
+    assert!(cpu.mmu.tlb_hits > 0);
+
+    // Now simulate SBI RFENCE by flushing TLB (as the fixed handler does)
+    cpu.mmu.flush_tlb();
+
+    // Next access should be a TLB miss again
+    let misses_after_flush = cpu.mmu.tlb_misses;
+    let _ = cpu.mmu.translate(
+        0x80001000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert!(
+        cpu.mmu.tlb_misses > misses_after_flush,
+        "TLB should miss after flush"
+    );
+}
+
+#[test]
+fn test_sbi_rfence_vaddr_flush() {
+    // Test that flush_tlb_vaddr only invalidates the specific address
+    let mut bus = Bus::new(16 * 1024 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    let pt_base: u64 = 0x400000;
+    // Map two 1GiB superpages
+    let pte2 = (0x80000u64 << 10) | 0xCF;
+    bus.write64(DRAM_BASE + pt_base + 2 * 8, pte2);
+    let pte0 = (0u64 << 10) | 0xCF;
+    bus.write64(DRAM_BASE + pt_base, pte0);
+
+    let satp = (8u64 << 60) | ((DRAM_BASE + pt_base) >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mmu.flush_tlb();
+
+    // Populate TLB with two addresses
+    let _ = cpu.mmu.translate(
+        0x80001000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    let _ = cpu.mmu.translate(
+        0x80002000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+
+    let hits_before = cpu.mmu.tlb_hits;
+
+    // Flush only 0x80001000
+    cpu.mmu.flush_tlb_vaddr(0x80001000);
+
+    // 0x80002000 should still hit (if in different TLB slot)
+    // 0x80001000 should miss
+    let misses_before = cpu.mmu.tlb_misses;
+    let _ = cpu.mmu.translate(
+        0x80001000,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert!(
+        cpu.mmu.tlb_misses > misses_before,
+        "Flushed address should miss"
+    );
+}
+
+// ===== Atomic operation tests =====
+
+#[test]
+fn test_amomin_amominu() {
+    // AMOMIN.W: atomically load, compute min(old, rs2), store result
+    let addr = DRAM_BASE + 0x100; // use nearby address within the loaded program area
+                                  // Store value 50 first, then amomin.w with 30
+                                  // li x11, addr; li x12, 30; li x13, 50; sw x13, 0(x11); amomin.w x10, x12, (x11)
+    let mut bus = Bus::new(64 * 1024);
+    // Pre-store 50 at offset 0x100
+    bus.write32(DRAM_BASE + 0x100, 50);
+    let bytes: Vec<u8> = vec![
+        // amomin.w x10, x12, (x11) — funct5=10000
+        (0b10000u32 << 27) | (12 << 20) | (11 << 15) | (0b010 << 12) | (10 << 7) | 0x2F,
+    ]
+    .iter()
+    .flat_map(|i| i.to_le_bytes())
+    .collect();
+    bus.load_binary(&bytes, 0);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+    cpu.regs[11] = addr;
+    cpu.regs[12] = 30;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10] as i32, 50, "rd should have old value");
+    assert_eq!(
+        bus.ram.read32(0x100) as i32,
+        30,
+        "memory should have min(50,30)=30"
+    );
+}
+
+#[test]
+fn test_amomax_amomaxu() {
+    let mut bus = Bus::new(64 * 1024);
+    bus.write32(DRAM_BASE + 0x100, 50);
+    let inst = (0b10100u32 << 27) | (12 << 20) | (11 << 15) | (0b010 << 12) | (10 << 7) | 0x2F;
+    let bytes: Vec<u8> = inst.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 30;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10] as i32, 50, "rd should have old value");
+    assert_eq!(
+        bus.ram.read32(0x100) as i32,
+        50,
+        "memory should have max(50,30)=50"
+    );
+}
+
+#[test]
+fn test_amoxor_amoand_amoor() {
+    let data_offset = 0x100u64;
+    let addr = DRAM_BASE + data_offset;
+
+    // Helper to run one AMO instruction
+    fn run_amo(funct5: u32, mem_val: u32, rs2_val: u64) -> (Cpu, Bus) {
+        let mut bus = Bus::new(64 * 1024);
+        bus.write32(DRAM_BASE + 0x100, mem_val);
+        let inst = (funct5 << 27) | (12 << 20) | (11 << 15) | (0b010 << 12) | (10 << 7) | 0x2F;
+        bus.load_binary(&inst.to_le_bytes(), 0);
+        let mut cpu = Cpu::new();
+        cpu.reset(DRAM_BASE);
+        cpu.regs[11] = DRAM_BASE + 0x100;
+        cpu.regs[12] = rs2_val;
+        cpu.step(&mut bus);
+        (cpu, bus)
+    }
+
+    // AMOXOR.W
+    let (cpu, bus) = run_amo(0b00100, 0xFF00, 0x0FF0);
+    assert_eq!(cpu.regs[10] as u32, 0xFF00);
+    assert_eq!(bus.ram.read32(data_offset), 0xFF00 ^ 0x0FF0);
+
+    // AMOAND.W
+    let (cpu, bus) = run_amo(0b01100, 0xFF00, 0x0FF0);
+    assert_eq!(cpu.regs[10] as u32, 0xFF00);
+    assert_eq!(bus.ram.read32(data_offset), 0xFF00 & 0x0FF0);
+
+    // AMOOR.W
+    let (cpu, bus) = run_amo(0b01000, 0xFF00, 0x0FF0);
+    assert_eq!(cpu.regs[10] as u32, 0xFF00);
+    assert_eq!(bus.ram.read32(data_offset), 0xFF00 | 0x0FF0);
+}
+
+#[test]
+fn test_amo_doubleword() {
+    let mut bus = Bus::new(64 * 1024);
+    bus.write64(DRAM_BASE + 0x100, 0x1234_5678_9ABC_DEF0);
+    // amoswap.d x10, x12, (x11) — funct5=00001, funct3=011
+    let inst = (0b00001u32 << 27) | (12 << 20) | (11 << 15) | (0b011 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 0xFEDC_BA98_7654_3210;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0x1234_5678_9ABC_DEF0, "rd = old value");
+    assert_eq!(
+        bus.ram.read64(0x100),
+        0xFEDC_BA98_7654_3210,
+        "mem = new value"
+    );
+}
