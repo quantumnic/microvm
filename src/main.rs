@@ -63,6 +63,10 @@ enum Commands {
         /// Start GDB server on given port (e.g. --gdb 1234)
         #[arg(long)]
         gdb: Option<u16>,
+
+        /// Stop after N seconds of wall-clock time
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -82,6 +86,7 @@ fn main() {
             trace,
             max_insns,
             gdb: gdb_port,
+            timeout_secs,
         } => {
             let addr = u64::from_str_radix(load_addr.trim_start_matches("0x"), 16)
                 .expect("Invalid load address");
@@ -96,6 +101,7 @@ fn main() {
                 trace,
                 max_insns,
                 gdb_port,
+                timeout_secs,
             };
 
             let mut vm = vm::Vm::new(config);

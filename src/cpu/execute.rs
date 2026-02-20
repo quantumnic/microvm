@@ -846,12 +846,45 @@ fn op_system(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) -> bool
 ///   a0-a5 = arguments
 ///   Returns: a0 = error code, a1 = value
 /// Returns true if handled, false to fall through to normal ecall.
+/// Get human-readable name for SBI extension ID
+fn sbi_ext_name(eid: u64) -> &'static str {
+    match eid {
+        0x00 => "legacy:set_timer",
+        0x01 => "legacy:putchar",
+        0x02 => "legacy:getchar",
+        0x08 => "legacy:shutdown",
+        0x10 => "base",
+        0x54494D45 => "TIME",
+        0x735049 => "sPI",
+        0x48534D => "HSM",
+        0x52464E43 => "RFNC",
+        0x53525354 => "SRST",
+        0x4442434E => "DBCN",
+        0x504D55 => "PMU",
+        0x535553 => "SUSP",
+        0x4E41434C => "NACL",
+        0x535441 => "STA",
+        0x43505043 => "CPPC",
+        0x46574654 => "FWFT",
+        _ => "unknown",
+    }
+}
+
 fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
     let eid = cpu.regs[17]; // a7
     let fid = cpu.regs[16]; // a6
     let a0 = cpu.regs[10];
     // SBI return: a0 = error, a1 = value
     // SBI_SUCCESS = 0, SBI_ERR_NOT_SUPPORTED = -2
+
+    log::debug!(
+        "SBI call: {}(eid={:#x}, fid={}, a0={:#x}) at PC={:#x}",
+        sbi_ext_name(eid),
+        eid,
+        fid,
+        a0,
+        cpu.pc
+    );
 
     match eid {
         // Legacy SBI extensions (deprecated but Linux still uses them early)

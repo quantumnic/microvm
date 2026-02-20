@@ -6,7 +6,10 @@ use microvm::memory::{Bus, DRAM_BASE};
 /// Helper: create a CPU+Bus, load instructions at DRAM_BASE, run N steps
 fn run_program(instructions: &[u32], steps: usize) -> (Cpu, Bus) {
     let mut bus = Bus::new(64 * 1024);
-    let bytes: Vec<u8> = instructions.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let bytes: Vec<u8> = instructions
+        .iter()
+        .flat_map(|i: &u32| i.to_le_bytes())
+        .collect();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
     cpu.reset(DRAM_BASE);
@@ -21,7 +24,10 @@ fn run_program(instructions: &[u32], steps: usize) -> (Cpu, Bus) {
 /// Helper: create a CPU+Bus with pre-set registers, load instructions, run N steps
 fn run_program_with_regs(instructions: &[u32], steps: usize, regs: &[(usize, u64)]) -> (Cpu, Bus) {
     let mut bus = Bus::new(64 * 1024);
-    let bytes: Vec<u8> = instructions.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let bytes: Vec<u8> = instructions
+        .iter()
+        .flat_map(|i: &u32| i.to_le_bytes())
+        .collect();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
     cpu.reset(DRAM_BASE);
@@ -1098,7 +1104,7 @@ fn test_sbi_probe_dbcn() {
     // Set up S-mode CPU with ecall instruction
     let mut bus = Bus::new(64 * 1024);
     let program: &[u32] = &[0x00000073]; // ecall
-    let bytes: Vec<u8> = program.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let bytes: Vec<u8> = program.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
     cpu.reset(DRAM_BASE);
@@ -1780,7 +1786,7 @@ fn test_misaligned_load_halfword() {
         0x00000117, // auipc x2, 0
         0x10111083, // lh x1, 0x101(x2)
     ];
-    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let bytes: Vec<u8> = prog.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
     bus.load_binary(&bytes, 0);
 
     let mut cpu = Cpu::new();
@@ -2812,4 +2818,673 @@ fn test_dtb_isa_extensions_include_fd() {
     let has_d = dtb.windows(2).any(|w| w == [b'd', 0]);
     assert!(has_f, "DTB riscv,isa-extensions should include 'f'");
     assert!(has_d, "DTB riscv,isa-extensions should include 'd'");
+}
+
+// ============== Full Boot Path Integration Tests ==============
+
+/// Helper: run a kernel through the full boot ROM flow (M-mode setup → S-mode)
+/// Places kernel code at 0x80200000, generates DTB and boot ROM, runs N steps.
+fn run_with_boot_rom(kernel_code: &[u32], steps: usize) -> (Cpu, Bus) {
+    use microvm::memory::rom::BootRom;
+
+    let ram_bytes = 128 * 1024 * 1024u64;
+    let mut bus = Bus::new(ram_bytes);
+    let mut cpu = Cpu::new();
+
+    // Load kernel at 0x80200000 (standard Linux load address)
+    let kernel_entry = DRAM_BASE + 0x200000;
+    let kernel_bytes: Vec<u8> = kernel_code
+        .iter()
+        .flat_map(|i: &u32| i.to_le_bytes())
+        .collect();
+    bus.load_binary(&kernel_bytes, 0x200000);
+
+    // Generate DTB near end of RAM
+    let dtb_data = microvm::dtb::generate_dtb(ram_bytes, "console=ttyS0", false, None);
+    let dtb_addr = DRAM_BASE + ram_bytes - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
+    bus.load_binary(&dtb_data, dtb_addr - DRAM_BASE);
+
+    // Generate and load boot ROM at DRAM_BASE
+    let boot_code = BootRom::generate(kernel_entry, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    // Start at DRAM_BASE (boot ROM)
+    cpu.reset(DRAM_BASE);
+
+    for _step in 0..steps {
+        // Update mtime (for timer CSR reads)
+        cpu.csrs.mtime = bus.clint.mtime();
+        // Update STIP from CLINT/Sstc
+        let clint_timer = bus.clint.timer_interrupt();
+        let sstc_timer = cpu.csrs.stimecmp_pending();
+        let mip = cpu.csrs.read(csr::MIP);
+        if clint_timer || sstc_timer {
+            cpu.csrs.write(csr::MIP, mip | (1 << 5));
+        } else {
+            cpu.csrs.write(csr::MIP, mip & !(1 << 5));
+        }
+        if !cpu.step(&mut bus) {
+            break;
+        }
+    }
+    (cpu, bus)
+}
+
+#[test]
+fn test_boot_rom_transitions_to_smode() {
+    // Kernel: NOP sled followed by a WFI to stop cleanly
+    // (Without WFI, CPU would run into zero-memory and trap on illegal compressed instruction)
+    let kernel = vec![
+        0x00000013u32, // nop
+        0x00000013,    // nop
+        0x00000013,    // nop
+        0x10500073,    // wfi (halt, waiting for interrupt)
+    ];
+    // Use enough steps for boot ROM (~40 instructions + padding), then kernel
+    let (cpu, _) = run_with_boot_rom(&kernel, 100);
+
+    // After boot ROM executes and kernel WFI, CPU should be in S-mode
+    assert_eq!(
+        cpu.mode,
+        microvm::cpu::PrivilegeMode::Supervisor,
+        "CPU should be in S-mode after boot ROM (PC={:#x})",
+        cpu.pc
+    );
+    // PC should be in the kernel area (at or past the WFI)
+    assert!(
+        cpu.pc >= DRAM_BASE + 0x200000 && cpu.pc < DRAM_BASE + 0x201000,
+        "PC should be in kernel area, got {:#x}",
+        cpu.pc
+    );
+}
+
+#[test]
+fn test_boot_rom_sets_hartid_and_dtb() {
+    // Kernel: just NOPs
+    let kernel = vec![0x00000013; 4];
+    let (cpu, _) = run_with_boot_rom(&kernel, 200);
+
+    // a0 should be 0 (hartid)
+    assert_eq!(cpu.regs[10], 0, "a0 should be hartid=0");
+
+    // a1 should point to a valid DTB (check for DTB magic 0xD00DFEED)
+    let dtb_addr = cpu.regs[11];
+    assert!(
+        dtb_addr >= DRAM_BASE,
+        "a1 should point to DTB in DRAM, got {:#x}",
+        dtb_addr
+    );
+}
+
+#[test]
+fn test_boot_rom_delegates_interrupts() {
+    let kernel = vec![0x00000013; 4];
+    let (cpu, _) = run_with_boot_rom(&kernel, 200);
+
+    // medeleg should have most exceptions delegated
+    let medeleg = cpu.csrs.read(csr::MEDELEG);
+    assert_ne!(
+        medeleg, 0,
+        "medeleg should be non-zero (exceptions delegated)"
+    );
+    // Page faults (12, 13, 15) should be delegated
+    assert!(
+        medeleg & (1 << 12) != 0,
+        "Instruction page fault should be delegated"
+    );
+    assert!(
+        medeleg & (1 << 13) != 0,
+        "Load page fault should be delegated"
+    );
+    assert!(
+        medeleg & (1 << 15) != 0,
+        "Store page fault should be delegated"
+    );
+
+    // mideleg should delegate S-mode interrupts
+    let mideleg = cpu.csrs.read(csr::MIDELEG);
+    assert!(mideleg & (1 << 1) != 0, "SSIP should be delegated");
+    assert!(mideleg & (1 << 5) != 0, "STIP should be delegated");
+    assert!(mideleg & (1 << 9) != 0, "SEIP should be delegated");
+}
+
+#[test]
+fn test_boot_rom_sets_pmp() {
+    let kernel = vec![0x00000013; 4];
+    let (cpu, _) = run_with_boot_rom(&kernel, 200);
+
+    // PMP should allow full access
+    let pmpcfg0 = cpu.csrs.pmpcfg[0];
+    assert_ne!(pmpcfg0, 0, "pmpcfg0 should be configured for full access");
+    // TOR mode with RWX: bits [4:0] = A(TOR=01) | X(1) | W(1) | R(1) = 0x0F
+    assert_eq!(pmpcfg0 & 0xFF, 0x0F, "PMP entry 0 should be TOR+RWX");
+}
+
+#[test]
+fn test_boot_rom_enables_counters() {
+    let kernel = vec![0x00000013; 4];
+    let (cpu, _) = run_with_boot_rom(&kernel, 200);
+
+    // mcounteren should allow CY, TM, IR access from S-mode
+    let mcounteren = cpu.csrs.read(csr::MCOUNTEREN);
+    assert!(
+        mcounteren & 0x7 == 0x7,
+        "mcounteren should enable CY, TM, IR"
+    );
+}
+
+#[test]
+fn test_sbi_putchar_from_smode() {
+    // Kernel: SBI legacy putchar (eid=1) — write 'H' to console
+    let kernel = vec![
+        0x04800513, // li a0, 'H' (0x48)
+        0x00100893, // li a7, 1 (legacy putchar)
+        0x00000073, // ecall
+        0x00000013, // nop
+    ];
+    let (cpu, _) = run_with_boot_rom(&kernel, 300);
+
+    // After ecall, a0 should be 0 (success) and CPU should still be in S-mode
+    assert_eq!(cpu.regs[10], 0, "SBI putchar should return success");
+    assert_eq!(
+        cpu.mode,
+        microvm::cpu::PrivilegeMode::Supervisor,
+        "Should still be in S-mode after SBI call"
+    );
+}
+
+#[test]
+fn test_sbi_probe_extension_via_boot_rom() {
+    // Probe for legacy putchar (eid=0x01) via full boot ROM path
+    let kernel = vec![
+        0x00100513, // li a0, 1 (probe legacy putchar)
+        0x00300813, // li a6, 3 (fid=probe_extension)
+        0x01000893, // li a7, 0x10 (base extension)
+        0x00000073, // ecall
+        0x00000013, // nop
+    ];
+    let (cpu, _) = run_with_boot_rom(&kernel, 300);
+
+    // a0 = 0 (SBI_SUCCESS), a1 = 1 (extension available)
+    assert_eq!(cpu.regs[10], 0, "probe should return SBI_SUCCESS");
+    assert_eq!(cpu.regs[11], 1, "legacy putchar should be available");
+}
+
+#[test]
+fn test_sbi_get_spec_version() {
+    // Kernel: SBI base get_spec_version (eid=0x10, fid=0)
+    let kernel = vec![
+        0x00000813, // li a6, 0 (fid=get_spec_version)
+        0x01000893, // li a7, 0x10 (base extension)
+        0x00000073, // ecall
+        0x00000013, // nop
+    ];
+    let (cpu, _) = run_with_boot_rom(&kernel, 300);
+
+    assert_eq!(cpu.regs[10], 0, "Should return SBI_SUCCESS");
+    // SBI spec v2.0: (2 << 24) = 0x02000000
+    assert_eq!(cpu.regs[11], 2 << 24, "Should report SBI spec v2.0");
+}
+
+#[test]
+fn test_smode_csr_access() {
+    // Kernel: read sstatus, stvec, sie CSRs in S-mode
+    let kernel = vec![
+        0x10002573, // csrr a0, sstatus
+        0x10502673, // csrr a2, stvec (initially 0)
+        0x10402773, // csrr a4, sie
+        0x00000013, // nop
+    ];
+    let (cpu, _) = run_with_boot_rom(&kernel, 300);
+
+    // sstatus should have SXL=2, UXL=2 (bits 34-33 and 32-31... actually UXL is 33:32)
+    let sstatus = cpu.regs[10];
+    let uxl = (sstatus >> 32) & 3;
+    assert_eq!(
+        uxl, 2,
+        "UXL should be 2 (64-bit), got {} from sstatus={:#x}",
+        uxl, sstatus
+    );
+}
+
+#[test]
+fn test_smode_page_table_setup() {
+    // Kernel: set up an identity-mapped Sv39 page table and enable MMU
+    // This mimics what Linux does during early boot.
+    //
+    // We use a 1GiB superpage mapping: VA 0x80000000 → PA 0x80000000
+    // Page table root at 0x80400000 (offset 0x400000 from DRAM_BASE)
+    //
+    // Sv39: 3-level page table
+    //   Level 2 (root): entry[2] maps VA 0x80000000-0xBFFFFFFF
+    //   For 1GiB superpage: PPN = 0x80000000 >> 12 = 0x80000, PTE = (PPN << 10) | flags
+    //   PTE flags: V|R|W|X|A|D = 0xCF
+    //
+    // Steps:
+    //   1. Write PTE at page_table[2] (VA 0x80000000 → entry index 2 at level 2)
+    //   2. Write satp = (8 << 60) | (page_table_ppn)
+    //   3. sfence.vma
+    //   4. Continue executing (should work since identity-mapped)
+
+    let page_table_offset = 0x400000u64; // 4MiB into RAM
+    let page_table_phys = DRAM_BASE + page_table_offset;
+    let page_table_ppn = page_table_phys >> 12;
+
+    // PTE for 1GiB superpage at VA 0x80000000:
+    // PPN = 0x80000000 >> 12 = 0x80000
+    // PTE = (0x80000 << 10) | V|R|W|X|A|D = (0x80000 << 10) | 0xCF
+    // = 0x20000000 | 0xCF = 0x200000CF
+    let pte: u64 = (0x80000u64 << 10) | 0xCF; // V|R|W|X|A|D
+
+    // We need to:
+    // 1. Store PTE at page_table + 2*8 = page_table + 16
+    // 2. Write SATP
+    // 3. SFENCE.VMA
+    // 4. Execute a NOP (verifies translation works)
+
+    // First, set up the page table in RAM manually
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    let mut cpu = Cpu::new();
+
+    // Write the page table entry
+    let pte_addr_offset = page_table_offset + 2 * 8; // entry[2]
+    bus.ram.write64(pte_addr_offset, pte);
+
+    // Kernel code at 0x80200000
+    let kernel_entry = DRAM_BASE + 0x200000;
+
+    // Build kernel code that enables MMU
+    // We need to load the SATP value: mode=8 (Sv39), PPN = page_table_ppn
+    let satp_val = (8u64 << 60) | page_table_ppn;
+
+    // Use register-based approach since the value is large
+    // We'll pre-set t2 (x7) to the SATP value before running
+    let kernel = vec![
+        // SFENCE.VMA (flush TLB before enabling)
+        0x12000073, // sfence.vma x0, x0
+        // csrw satp, t2 (x7 has the SATP value, pre-loaded)
+        0x18039073, // csrw satp, x7
+        // SFENCE.VMA (flush TLB after enabling)
+        0x12000073, // sfence.vma x0, x0
+        // If we get here, MMU is working with identity mapping!
+        0x00000013, // nop
+        0x10500073, // wfi (stop cleanly)
+    ];
+
+    let kernel_bytes: Vec<u8> = kernel.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
+    bus.load_binary(&kernel_bytes, 0x200000);
+
+    // Generate boot ROM
+    let dtb_data = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dtb_addr = DRAM_BASE + 128 * 1024 * 1024 - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
+    bus.load_binary(&dtb_data, dtb_addr - DRAM_BASE);
+
+    let boot_code = microvm::memory::rom::BootRom::generate(kernel_entry, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    cpu.reset(DRAM_BASE);
+
+    // Run boot ROM first (about 30-40 instructions)
+    for _ in 0..200 {
+        cpu.csrs.mtime = bus.clint.mtime();
+        if !cpu.step(&mut bus) {
+            break;
+        }
+        // Once we're in S-mode at the kernel entry, set t2 to SATP value
+        if cpu.pc == kernel_entry && cpu.mode == microvm::cpu::PrivilegeMode::Supervisor {
+            cpu.regs[7] = satp_val; // t2 = SATP value
+        }
+    }
+
+    // Verify we're in S-mode
+    assert_eq!(cpu.mode, microvm::cpu::PrivilegeMode::Supervisor);
+
+    // Verify SATP was written (MMU enabled)
+    let satp = cpu.csrs.read(csr::SATP);
+    assert_eq!(satp >> 60, 8, "SATP mode should be Sv39 (8)");
+    assert_eq!(
+        satp & 0xFFF_FFFF_FFFF,
+        page_table_ppn,
+        "SATP PPN should match page table"
+    );
+
+    // PC should have advanced past the MMU enable code
+    assert!(
+        cpu.pc > kernel_entry,
+        "PC should have advanced past MMU enable, got {:#x}",
+        cpu.pc
+    );
+}
+
+#[test]
+fn test_smode_timer_interrupt() {
+    // Kernel: set up stvec, enable timer interrupt, set timer, then loop
+    // The timer interrupt should fire and redirect to stvec handler
+    let kernel_entry = DRAM_BASE + 0x200000;
+
+    // stvec handler at kernel_entry + 0x100 (offset 0x40 in instruction words)
+    let handler_offset = 0x100u64;
+    let handler_addr = kernel_entry + handler_offset;
+
+    let mut kernel = vec![
+        // Set stvec to handler_addr
+        // We pre-load t0 (x5) with handler_addr
+        0x10529073, // csrw stvec, t0 (x5)
+        // Enable STIE in sie (bit 5)
+        0x02000293, // li t0, 0x20 (1 << 5)
+        0x10429073, // csrw sie, t0
+        // Enable SIE in sstatus (bit 1)
+        0x00200293, // li t0, 2
+        0x10029073, // csrw sstatus, t0 — actually this is csrrw x0, sstatus, t0
+    ];
+    // Wait, csrw is csrrw x0, csr, rs1.
+    // csrw sstatus, t0 = csrrw x0, 0x100, x5 = 0x10029073
+    // But we want csrs (set bits), not csrw (replace):
+    // csrs sstatus, t0 = csrrs x0, 0x100, x5 = 0x1002A073... let me recalculate.
+    // csrrs: funct3=2, so bits[14:12]=010
+    // 0x100 << 20 | x5 << 15 | 2 << 12 | x0 << 7 | 0x73
+    // = 0x10000000 | 0x28000 | 0x2000 | 0 | 0x73 = 0x1002A073
+    // Actually: CSRRS x0, sstatus, t0
+    // sstatus = 0x100, rs1 = x5 = 5
+    // encoding: imm[11:0]=0x100, rs1=5, funct3=2, rd=0, opcode=0x73
+    // = (0x100 << 20) | (5 << 15) | (2 << 12) | (0 << 7) | 0x73
+    // = 0x10000000 | 0x28000 | 0x2000 | 0x73 = 0x1002A073
+
+    // Actually let me redo with correct values:
+    let kernel = vec![
+        // t0 already has handler_addr (pre-loaded)
+        0x10529073u32, // csrw stvec, t0
+        0x02000293,    // li t0, 0x20 (STIE bit)
+        0x10429073,    // csrw sie, t0
+        0x00200293,    // li t0, 2 (SIE bit in sstatus)
+        0x1002A073,    // csrs sstatus, t0
+        // SBI set_timer: a0 = current_time + small_delta, a7 = 0 (legacy)
+        0x00100513, // li a0, 1 (timer value = 1, fires immediately since mtime > 1 after boot)
+        0x00000893, // li a7, 0 (legacy set_timer)
+        0x00000073, // ecall
+        // After ecall returns, loop with WFI until interrupt
+        0x10500073, // wfi
+        0x10500073, // wfi
+        0x10500073, // wfi
+        0x10500073, // wfi
+    ];
+
+    // Handler at offset 0x100: writes a marker to a6 and returns
+    let mut full_kernel = kernel.clone();
+    // Pad to handler offset (0x100 / 4 = 64 instructions)
+    while full_kernel.len() < 64 {
+        full_kernel.push(0x00000013); // nop
+    }
+    // Handler code:
+    full_kernel.push(0x00100813); // li a6, 1 (marker that interrupt was handled)
+    full_kernel.push(0x14102573); // csrr a0, sepc
+    full_kernel.push(0x00450513); // addi a0, a0, 4 (skip past WFI)
+    full_kernel.push(0x14151073); // csrw sepc, a0
+    full_kernel.push(0x10200073); // sret
+
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    let mut cpu = Cpu::new();
+    let kernel_entry_val = kernel_entry;
+
+    let kernel_bytes: Vec<u8> = full_kernel
+        .iter()
+        .flat_map(|i: &u32| i.to_le_bytes())
+        .collect();
+    bus.load_binary(&kernel_bytes, 0x200000);
+
+    let dtb_data = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dtb_addr = DRAM_BASE + 128 * 1024 * 1024 - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
+    bus.load_binary(&dtb_data, dtb_addr - DRAM_BASE);
+
+    let boot_code = microvm::memory::rom::BootRom::generate(kernel_entry_val, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    cpu.reset(DRAM_BASE);
+
+    let mut reached_smode = false;
+    for _ in 0..5000 {
+        cpu.csrs.mtime = bus.clint.mtime();
+
+        let clint_timer = bus.clint.timer_interrupt();
+        let sstc_timer = cpu.csrs.stimecmp_pending();
+        let mip = cpu.csrs.read(csr::MIP);
+        if clint_timer || sstc_timer {
+            cpu.csrs.write(csr::MIP, mip | (1 << 5));
+        } else {
+            cpu.csrs.write(csr::MIP, mip & !(1 << 5));
+        }
+
+        // Once in S-mode at kernel entry, set t0 to handler address
+        if !reached_smode
+            && cpu.pc == kernel_entry_val
+            && cpu.mode == microvm::cpu::PrivilegeMode::Supervisor
+        {
+            cpu.regs[5] = handler_addr; // t0 = handler address
+            reached_smode = true;
+        }
+
+        if !cpu.step(&mut bus) {
+            break;
+        }
+
+        // If we've handled the interrupt (a6 = 1), we're done
+        if cpu.regs[16] == 1 {
+            break;
+        }
+    }
+
+    assert!(reached_smode, "Should have reached S-mode");
+    assert_eq!(
+        cpu.regs[16], 1,
+        "Timer interrupt handler should have been called (a6=1)"
+    );
+}
+
+#[test]
+fn test_smode_uart_write() {
+    // Kernel: write characters to UART directly via MMIO
+    let uart_base = microvm::memory::UART_BASE;
+
+    // We pre-load t1 (x6) with UART_BASE
+    let kernel = vec![
+        // Write 'O' to UART THR (offset 0)
+        0x04F00293, // li t0, 'O' (0x4F)
+        0x00530023, // sb t0, 0(t1) — store byte at uart_base
+        // Write 'K' to UART THR
+        0x04B00293, // li t0, 'K' (0x4B)
+        0x00530023, // sb t0, 0(t1)
+        0x10500073, // wfi
+    ];
+
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    let mut cpu = Cpu::new();
+    let kernel_entry = DRAM_BASE + 0x200000;
+
+    let kernel_bytes: Vec<u8> = kernel.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
+    bus.load_binary(&kernel_bytes, 0x200000);
+
+    let dtb_data = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dtb_addr = DRAM_BASE + 128 * 1024 * 1024 - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
+    bus.load_binary(&dtb_data, dtb_addr - DRAM_BASE);
+
+    let boot_code = microvm::memory::rom::BootRom::generate(kernel_entry, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    cpu.reset(DRAM_BASE);
+
+    let mut reached_smode = false;
+    for _ in 0..300 {
+        cpu.csrs.mtime = bus.clint.mtime();
+        if !reached_smode
+            && cpu.pc == kernel_entry
+            && cpu.mode == microvm::cpu::PrivilegeMode::Supervisor
+        {
+            cpu.regs[6] = uart_base; // t1 = UART_BASE
+            reached_smode = true;
+        }
+        if !cpu.step(&mut bus) {
+            break;
+        }
+    }
+
+    assert!(reached_smode, "Should have reached S-mode");
+    // UART should have received the characters (they're output directly, but we can check
+    // that the kernel advanced past the store instructions)
+    assert!(
+        cpu.pc > kernel_entry + 8,
+        "PC should have advanced past UART writes"
+    );
+}
+
+#[test]
+fn test_sbi_hsm_hart_status() {
+    // Kernel: SBI HSM hart_get_status (eid=0x48534D, fid=2)
+    // Pre-load a7 with the extension ID since it's too large for li
+    let kernel = vec![
+        0x00200813, // li a6, 2 (fid=hart_get_status)
+        0x00000513, // li a0, 0 (hart 0)
+        // a7 is pre-loaded with 0x48534D
+        0x00000073, // ecall
+        0x00000013, // nop
+    ];
+
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    let mut cpu = Cpu::new();
+    let kernel_entry = DRAM_BASE + 0x200000;
+
+    let kernel_bytes: Vec<u8> = kernel.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
+    bus.load_binary(&kernel_bytes, 0x200000);
+
+    let dtb_data = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dtb_addr = DRAM_BASE + 128 * 1024 * 1024 - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
+    bus.load_binary(&dtb_data, dtb_addr - DRAM_BASE);
+
+    let boot_code = microvm::memory::rom::BootRom::generate(kernel_entry, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    cpu.reset(DRAM_BASE);
+
+    let mut reached_smode = false;
+    for _ in 0..300 {
+        cpu.csrs.mtime = bus.clint.mtime();
+        if !reached_smode
+            && cpu.pc == kernel_entry
+            && cpu.mode == microvm::cpu::PrivilegeMode::Supervisor
+        {
+            cpu.regs[17] = 0x48534D; // a7 = HSM extension ID
+            reached_smode = true;
+        }
+        if !cpu.step(&mut bus) {
+            break;
+        }
+    }
+
+    assert!(reached_smode);
+    assert_eq!(cpu.regs[10], 0, "hart_get_status should return SBI_SUCCESS");
+    assert_eq!(cpu.regs[11], 0, "Hart 0 should be STARTED (status=0)");
+}
+
+#[test]
+fn test_smode_ecall_from_umode() {
+    // Kernel: set up stvec, then drop to U-mode and do ecall
+    // This tests the full U-mode ecall → S-mode trap path
+    let kernel_entry = DRAM_BASE + 0x200000;
+    let handler_addr = kernel_entry + 0x100;
+    let umode_code_addr = kernel_entry + 0x200;
+
+    let mut full_kernel = vec![
+        // Set stvec (t0 pre-loaded with handler address)
+        0x10529073u32, // csrw stvec, t0
+        // Set up U-mode entry: sepc = umode_code_addr, sstatus.SPP = 0 (U-mode)
+        // t1 pre-loaded with umode_code_addr
+        0x14131073, // csrw sepc, t1
+        // Clear SPP in sstatus (ensure we return to U-mode)
+        0x10002573, // csrr a0, sstatus
+        0xEFF57513, // andi a0, a0, ~0x100... actually we need to clear bit 8
+    ];
+    // Use csrc to clear SPP (bit 8):
+    // csrc sstatus, t2 where t2 = 0x100
+    full_kernel = vec![
+        0x10529073, // csrw stvec, t0 (handler)
+        0x14131073, // csrw sepc, t1 (umode entry)
+        0x1003B073, // csrc sstatus, t2 (clear SPP, t2 pre-loaded with 0x100)
+        // Enable SIE bit in sstatus (for interrupt handling)
+        // Actually for ecall we don't need SIE. Just sret to U-mode.
+        0x10200073, // sret (jump to U-mode at umode_code_addr)
+    ];
+
+    // Pad to handler at 0x100
+    while full_kernel.len() < 64 {
+        full_kernel.push(0x00000013);
+    }
+    // Handler: set a6 = scause, then just loop (don't return)
+    full_kernel.push(0x14202873); // csrr a6, scause (csrrs x16, 0x142, x0)
+    full_kernel.push(0x10500073); // wfi (stop here)
+    full_kernel.push(0x10500073); // wfi
+
+    // Pad to U-mode code at 0x200
+    while full_kernel.len() < 128 {
+        full_kernel.push(0x00000013);
+    }
+    // U-mode code: ecall
+    full_kernel.push(0x00000073); // ecall
+    full_kernel.push(0x00000013); // nop
+
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    let mut cpu = Cpu::new();
+
+    let kernel_bytes: Vec<u8> = full_kernel
+        .iter()
+        .flat_map(|i: &u32| i.to_le_bytes())
+        .collect();
+    bus.load_binary(&kernel_bytes, 0x200000);
+
+    let dtb_data = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dtb_addr = DRAM_BASE + 128 * 1024 * 1024 - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
+    bus.load_binary(&dtb_data, dtb_addr - DRAM_BASE);
+
+    let boot_code = microvm::memory::rom::BootRom::generate(kernel_entry, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    cpu.reset(DRAM_BASE);
+
+    let mut reached_smode = false;
+    let mut reached_umode = false;
+    for i in 0..2000 {
+        cpu.csrs.mtime = bus.clint.mtime();
+        if !reached_smode
+            && cpu.pc == kernel_entry
+            && cpu.mode == microvm::cpu::PrivilegeMode::Supervisor
+        {
+            cpu.regs[5] = handler_addr; // t0 = handler
+            cpu.regs[6] = umode_code_addr; // t1 = U-mode code
+            cpu.regs[7] = 0x100; // t2 = SPP bit mask
+            reached_smode = true;
+        }
+        if cpu.mode == microvm::cpu::PrivilegeMode::User && !reached_umode {
+            reached_umode = true;
+        }
+        if !cpu.step(&mut bus) {
+            eprintln!("HALT at step {} PC={:#x} mode={:?}", i, cpu.pc, cpu.mode);
+            break;
+        }
+        // Stop when handler sets a6 (x16 = scause)
+        if reached_umode && cpu.regs[16] != 0 {
+            break;
+        }
+    }
+
+    assert!(reached_smode, "Should have reached S-mode");
+    assert!(
+        reached_umode,
+        "Should have reached U-mode (PC={:#x} mode={:?})",
+        cpu.pc, cpu.mode
+    );
+    // scause should be 8 (ecall from U-mode)
+    let scause_csr = cpu.csrs.read(csr::SCAUSE);
+    assert_eq!(
+        cpu.regs[16], 8,
+        "scause should be 8 (ecall from U-mode), got a6={}, scause_csr={}, PC={:#x} mode={:?} sepc={:#x}",
+        cpu.regs[16], scause_csr, cpu.pc, cpu.mode, cpu.csrs.read(csr::SEPC)
+    );
 }

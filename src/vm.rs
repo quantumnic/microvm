@@ -19,6 +19,7 @@ pub struct VmConfig {
     pub trace: bool,
     pub max_insns: Option<u64>,
     pub gdb_port: Option<u16>,
+    pub timeout_secs: Option<u64>,
 }
 
 pub struct Vm {
@@ -153,6 +154,10 @@ impl Vm {
 
         log::info!("Starting emulation...");
 
+        // Wall-clock timeout support
+        let start_time = std::time::Instant::now();
+        let timeout = self.config.timeout_secs.map(std::time::Duration::from_secs);
+
         // Main execution loop
         let mut insn_count: u64 = 0;
         loop {
@@ -160,6 +165,15 @@ impl Vm {
                 if insn_count >= max {
                     log::info!("Reached max instruction count ({})", max);
                     break;
+                }
+            }
+            // Check wall-clock timeout (every 65536 instructions to avoid syscall overhead)
+            if insn_count & 0xFFFF == 0 {
+                if let Some(dur) = timeout {
+                    if start_time.elapsed() >= dur {
+                        log::info!("Timeout after {} seconds", dur.as_secs());
+                        break;
+                    }
                 }
             }
             // Update mtime in CSR file for TIME CSR reads
@@ -303,7 +317,18 @@ impl Vm {
             }
         }
 
-        log::info!("Emulation ended after {} instructions", insn_count);
+        let elapsed = start_time.elapsed();
+        let mips = if elapsed.as_micros() > 0 {
+            insn_count as f64 / elapsed.as_secs_f64() / 1_000_000.0
+        } else {
+            0.0
+        };
+        log::info!(
+            "Emulation ended after {} instructions in {:.2}s ({:.1} MIPS)",
+            insn_count,
+            elapsed.as_secs_f64(),
+            mips
+        );
     }
 }
 
