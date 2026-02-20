@@ -1026,8 +1026,9 @@ fn test_dtb_contains_isa_extensions() {
 fn test_dtb_isa_string_includes_su() {
     let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
     assert!(
-        dtb.windows(b"rv64imacsu".len()).any(|w| w == b"rv64imacsu"),
-        "DTB ISA string should be rv64imacsu"
+        dtb.windows(b"rv64imafdcsu".len())
+            .any(|w| w == b"rv64imafdcsu"),
+        "DTB ISA string should be rv64imafdcsu"
     );
 }
 
@@ -2746,4 +2747,69 @@ fn test_misa_has_f_d() {
     let misa = cpu.csrs.read(csr::MISA);
     assert_ne!(misa & (1 << 5), 0, "MISA should have F bit set");
     assert_ne!(misa & (1 << 3), 0, "MISA should have D bit set");
+}
+
+// ============== Syscon Device ==============
+
+#[test]
+fn test_syscon_poweroff() {
+    use microvm::devices::syscon::{Syscon, SysconAction};
+    let mut syscon = Syscon::new();
+    assert_eq!(syscon.take_action(), SysconAction::None);
+    syscon.write(0, 0x5555);
+    assert_eq!(syscon.take_action(), SysconAction::Poweroff);
+    // Action should be cleared after take
+    assert_eq!(syscon.take_action(), SysconAction::None);
+}
+
+#[test]
+fn test_syscon_reboot() {
+    use microvm::devices::syscon::{Syscon, SysconAction};
+    let mut syscon = Syscon::new();
+    syscon.write(0, 0x7777);
+    assert_eq!(syscon.take_action(), SysconAction::Reboot);
+    assert_eq!(syscon.take_action(), SysconAction::None);
+}
+
+#[test]
+fn test_syscon_unknown_value() {
+    use microvm::devices::syscon::{Syscon, SysconAction};
+    let mut syscon = Syscon::new();
+    syscon.write(0, 0x1234);
+    assert_eq!(syscon.take_action(), SysconAction::None);
+}
+
+#[test]
+fn test_syscon_bus_integration() {
+    use microvm::devices::syscon::SysconAction;
+    let mut bus = Bus::new(16 * 1024 * 1024);
+    // Write poweroff value via bus
+    bus.write32(microvm::memory::SYSCON_BASE, 0x5555);
+    assert_eq!(bus.syscon.take_action(), SysconAction::Poweroff);
+}
+
+#[test]
+fn test_dtb_contains_syscon() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    assert!(
+        dtb.windows(b"syscon-poweroff".len())
+            .any(|w| w == b"syscon-poweroff"),
+        "DTB should contain syscon-poweroff"
+    );
+    assert!(
+        dtb.windows(b"syscon-reboot".len())
+            .any(|w| w == b"syscon-reboot"),
+        "DTB should contain syscon-reboot"
+    );
+}
+
+#[test]
+fn test_dtb_isa_extensions_include_fd() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    // The extensions stringlist should contain "f" and "d"
+    // They appear as null-terminated strings in the DTB blob
+    let has_f = dtb.windows(2).any(|w| w == [b'f', 0]);
+    let has_d = dtb.windows(2).any(|w| w == [b'd', 0]);
+    assert!(has_f, "DTB riscv,isa-extensions should include 'f'");
+    assert!(has_d, "DTB riscv,isa-extensions should include 'd'");
 }

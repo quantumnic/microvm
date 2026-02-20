@@ -221,7 +221,7 @@ pub fn generate_dtb(
     b.prop_str("compatible", "riscv");
     b.prop_str(
         "riscv,isa",
-        "rv64imacsu_zicsr_zifencei_zicbom_zicboz_zicbop_zicond_zihintpause_zawrs_zba_zbb_zbs_zbc_sstc_zicntr_svinval",
+        "rv64imafdcsu_zicsr_zifencei_zicbom_zicboz_zicbop_zicond_zihintpause_zawrs_zba_zbb_zbs_zbc_sstc_zicntr_svinval",
     );
     b.prop_str("riscv,isa-base", "rv64i");
     b.prop_str("mmu-type", "riscv,sv48");
@@ -233,6 +233,8 @@ pub fn generate_dtb(
             "i",
             "m",
             "a",
+            "f",
+            "d",
             "c",
             "zicsr",
             "zifencei",
@@ -387,6 +389,35 @@ pub fn generate_dtb(
     );
     b.prop_u32_array("interrupts", &[12]);
     b.prop_u32("interrupt-parent", 2);
+    b.end_node();
+
+    // Syscon (poweroff/reboot)
+    b.begin_node(&format!("syscon@{:x}", memory::SYSCON_BASE));
+    b.prop_str("compatible", "syscon");
+    b.prop_u32_array(
+        "reg",
+        &[
+            (memory::SYSCON_BASE >> 32) as u32,
+            memory::SYSCON_BASE as u32,
+            0,
+            memory::SYSCON_SIZE as u32,
+        ],
+    );
+    b.prop_u32("phandle", 3);
+    b.end_node();
+
+    b.begin_node("poweroff");
+    b.prop_str("compatible", "syscon-poweroff");
+    b.prop_u32("regmap", 3);
+    b.prop_u32("offset", 0);
+    b.prop_u32("value", 0x5555);
+    b.end_node();
+
+    b.begin_node("reboot");
+    b.prop_str("compatible", "syscon-reboot");
+    b.prop_u32("regmap", 3);
+    b.prop_u32("offset", 0);
+    b.prop_u32("value", 0x7777);
     b.end_node();
 
     // Goldfish RTC (real-time clock)

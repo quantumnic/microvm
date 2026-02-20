@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::cpu::csr;
 use crate::cpu::Cpu;
+use crate::devices::syscon::SysconAction;
 use crate::dtb;
 use crate::gdb::{GdbAction, GdbServer};
 use crate::loader;
@@ -253,6 +254,19 @@ impl Vm {
                         }
                     }
                 }
+            }
+
+            // Check for syscon poweroff/reboot
+            match self.bus.syscon.take_action() {
+                SysconAction::Poweroff => {
+                    log::info!("System poweroff after {} instructions", insn_count);
+                    std::process::exit(0);
+                }
+                SysconAction::Reboot => {
+                    log::info!("System reboot after {} instructions", insn_count);
+                    std::process::exit(0);
+                }
+                SysconAction::None => {}
             }
 
             // Periodic tasks (every 1024 instructions)
