@@ -48,6 +48,10 @@ pub struct Cpu {
     pub reservation: Option<u64>,
     /// Cycle counter
     pub cycle: u64,
+    /// Last trap cause (for profiling; set in handle_exception/handle_interrupt)
+    pub last_trap: Option<(u64, bool)>,
+    /// Last SBI call (eid, fid) for profiling
+    pub last_sbi: Option<(u64, u64)>,
 }
 
 impl Default for Cpu {
@@ -68,6 +72,8 @@ impl Cpu {
             wfi: false,
             reservation: None,
             cycle: 0,
+            last_trap: None,
+            last_sbi: None,
         }
     }
 
@@ -166,6 +172,7 @@ impl Cpu {
                     _ => false,
                 };
                 if can_take {
+                    self.last_trap = Some((code, true));
                     self.trap_to_smode(code, true);
                     return;
                 }
@@ -176,6 +183,7 @@ impl Cpu {
                     _ => true, // M-mode interrupts always preempt lower modes
                 };
                 if can_take {
+                    self.last_trap = Some((code, true));
                     self.trap_to_mmode(code, true);
                     return;
                 }
@@ -184,6 +192,7 @@ impl Cpu {
     }
 
     pub fn handle_exception(&mut self, cause: u64, tval: u64, _bus: &mut Bus) {
+        self.last_trap = Some((cause, false));
         let medeleg = self.csrs.read(csr::MEDELEG);
         if (medeleg >> cause) & 1 == 1 && self.mode != PrivilegeMode::Machine {
             self.csrs.write(csr::STVAL, tval);

@@ -8,6 +8,7 @@ use crate::gdb::{GdbAction, GdbServer};
 use crate::loader;
 use crate::memory::rom::BootRom;
 use crate::memory::{Bus, DRAM_BASE};
+use crate::profile::Profile;
 use crate::snapshot;
 
 pub struct VmConfig {
@@ -23,6 +24,7 @@ pub struct VmConfig {
     pub timeout_secs: Option<u64>,
     pub save_snapshot: Option<PathBuf>,
     pub load_snapshot: Option<PathBuf>,
+    pub profile: bool,
 }
 
 pub struct Vm {
@@ -169,6 +171,13 @@ impl Vm {
         let start_time = std::time::Instant::now();
         let timeout = self.config.timeout_secs.map(std::time::Duration::from_secs);
 
+        // Execution profiler
+        let mut profiler = if self.config.profile {
+            Some(Profile::new())
+        } else {
+            None
+        };
+
         // Main execution loop
         let mut insn_count: u64 = 0;
         loop {
@@ -285,6 +294,42 @@ impl Vm {
                 }
             }
 
+            // Profile: record instruction before execution
+            let mut prof_opcode: u8 = 0;
+            if let Some(ref mut prof) = profiler {
+                let prof_pc = self.cpu.pc;
+                let phys = self
+                    .cpu
+                    .mmu
+                    .translate(
+                        prof_pc,
+                        crate::cpu::mmu::AccessType::Execute,
+                        self.cpu.mode,
+                        &self.cpu.csrs,
+                        &mut self.bus,
+                    )
+                    .unwrap_or(prof_pc);
+                let raw16 = self.bus.read16(phys);
+                let inst = if raw16 & 0x03 != 0x03 {
+                    crate::cpu::decode::expand_compressed(raw16 as u32)
+                } else {
+                    self.bus.read32(phys)
+                };
+                let mode = self.cpu.mode as u8;
+                let mn = crate::cpu::disasm::mnemonic(inst);
+                prof.record_insn(prof_pc, mn, mode);
+
+                prof_opcode = (inst & 0x7F) as u8;
+                match prof_opcode {
+                    0x03 | 0x07 => prof.record_load(),  // LOAD, FP LOAD
+                    0x23 | 0x27 => prof.record_store(), // STORE, FP STORE
+                    _ => {}
+                }
+            }
+
+            // Save PC before step for branch profiling
+            let pre_step_pc = if profiler.is_some() { self.cpu.pc } else { 0 };
+
             if !self.cpu.step(&mut self.bus) {
                 // Report termination to GDB if connected
                 if let Some(ref mut gdb_server) = gdb {
@@ -294,6 +339,23 @@ impl Vm {
             }
 
             insn_count += 1;
+
+            // Profile: post-step recording
+            if let Some(ref mut prof) = profiler {
+                // Branch taken/not-taken
+                if prof_opcode == 0x63 {
+                    let diff = self.cpu.pc.wrapping_sub(pre_step_pc);
+                    prof.record_branch(diff != 4 && diff != 2);
+                }
+                // Traps
+                if let Some((cause, is_int)) = self.cpu.last_trap.take() {
+                    prof.record_trap(cause, is_int);
+                }
+                // SBI calls
+                if let Some((eid, fid)) = self.cpu.last_sbi.take() {
+                    prof.record_sbi(eid, fid);
+                }
+            }
 
             // GDB: check for breakpoints and single-step
             if let Some(ref mut gdb_server) = gdb {
@@ -360,6 +422,11 @@ impl Vm {
             if let Err(e) = snapshot::save_snapshot(snap_path, &self.cpu, &mut self.bus) {
                 eprintln!("Failed to save snapshot: {}", e);
             }
+        }
+
+        // Print profile summary
+        if let Some(ref prof) = profiler {
+            prof.print_summary();
         }
 
         let elapsed = start_time.elapsed();

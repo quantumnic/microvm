@@ -651,3 +651,135 @@ mod tests {
         assert!(s.contains("lr.d"), "got: {}", s);
     }
 }
+
+/// Fast instruction mnemonic classifier for profiling.
+/// Returns a static string identifying the instruction type.
+pub fn mnemonic(inst: u32) -> &'static str {
+    let opcode = inst & 0x7F;
+    let funct3 = ((inst >> 12) & 7) as u8;
+    let funct7 = ((inst >> 25) & 0x7F) as u8;
+
+    match opcode {
+        0x37 => "lui",
+        0x17 => "auipc",
+        0x6F => "jal",
+        0x67 => "jalr",
+        0x63 => match funct3 {
+            0 => "beq",
+            1 => "bne",
+            4 => "blt",
+            5 => "bge",
+            6 => "bltu",
+            7 => "bgeu",
+            _ => "branch?",
+        },
+        0x03 => match funct3 {
+            0 => "lb",
+            1 => "lh",
+            2 => "lw",
+            3 => "ld",
+            4 => "lbu",
+            5 => "lhu",
+            6 => "lwu",
+            _ => "load?",
+        },
+        0x23 => match funct3 {
+            0 => "sb",
+            1 => "sh",
+            2 => "sw",
+            3 => "sd",
+            _ => "store?",
+        },
+        0x13 => match funct3 {
+            0 => "addi",
+            1 => match funct7 >> 1 {
+                0 => "slli",
+                _ => "shli?",
+            },
+            2 => "slti",
+            3 => "sltiu",
+            4 => "xori",
+            5 => match funct7 >> 1 {
+                0 => "srli",
+                0x10 => "srai",
+                _ => "shri?",
+            },
+            6 => "ori",
+            7 => "andi",
+            _ => "imm?",
+        },
+        0x1B => match funct3 {
+            0 => "addiw",
+            1 => "slliw",
+            5 => {
+                if funct7 == 0x20 {
+                    "sraiw"
+                } else {
+                    "srliw"
+                }
+            }
+            _ => "immw?",
+        },
+        0x33 => match (funct7, funct3) {
+            (0x00, 0) => "add",
+            (0x20, 0) => "sub",
+            (0x00, 1) => "sll",
+            (0x00, 2) => "slt",
+            (0x00, 3) => "sltu",
+            (0x00, 4) => "xor",
+            (0x00, 5) => "srl",
+            (0x20, 5) => "sra",
+            (0x00, 6) => "or",
+            (0x00, 7) => "and",
+            (0x01, 0) => "mul",
+            (0x01, 1) => "mulh",
+            (0x01, 2) => "mulhsu",
+            (0x01, 3) => "mulhu",
+            (0x01, 4) => "div",
+            (0x01, 5) => "divu",
+            (0x01, 6) => "rem",
+            (0x01, 7) => "remu",
+            _ => "alu?",
+        },
+        0x3B => match (funct7, funct3) {
+            (0x00, 0) => "addw",
+            (0x20, 0) => "subw",
+            (0x00, 1) => "sllw",
+            (0x00, 5) => "srlw",
+            (0x20, 5) => "sraw",
+            (0x01, 0) => "mulw",
+            (0x01, 4) => "divw",
+            (0x01, 5) => "divuw",
+            (0x01, 6) => "remw",
+            (0x01, 7) => "remuw",
+            _ => "aluw?",
+        },
+        0x2F => "atomic",
+        0x0F => "fence",
+        0x73 => match funct3 {
+            0 => {
+                let imm = inst >> 20;
+                match imm {
+                    0x000 => "ecall",
+                    0x001 => "ebreak",
+                    0x102 => "sret",
+                    0x302 => "mret",
+                    0x105 => "wfi",
+                    _ => "system",
+                }
+            }
+            1 => "csrrw",
+            2 => "csrrs",
+            3 => "csrrc",
+            5 => "csrrwi",
+            6 => "csrrsi",
+            7 => "csrrci",
+            _ => "csr?",
+        },
+        0x07 => "fload",
+        0x27 => "fstore",
+        0x43 | 0x47 | 0x4B | 0x4F => "fmadd",
+        0x53 => "fpu",
+        _ => "unknown",
+    }
+}

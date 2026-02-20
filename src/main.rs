@@ -7,6 +7,7 @@ mod dtb;
 mod gdb;
 mod loader;
 mod memory;
+mod profile;
 mod snapshot;
 mod vm;
 
@@ -95,6 +96,10 @@ enum Commands {
         /// Load VM snapshot from file before running
         #[arg(long)]
         load_snapshot: Option<PathBuf>,
+
+        /// Enable execution profiling (prints summary on exit)
+        #[arg(long)]
+        profile: bool,
     },
 }
 
@@ -136,6 +141,7 @@ fn main() {
             timeout_secs,
             save_snapshot,
             load_snapshot,
+            profile,
         } => {
             let addr = u64::from_str_radix(load_addr.trim_start_matches("0x"), 16)
                 .expect("Invalid load address");
@@ -153,6 +159,7 @@ fn main() {
                 timeout_secs,
                 save_snapshot,
                 load_snapshot,
+                profile,
             };
 
             let mut vm = vm::Vm::new(config);

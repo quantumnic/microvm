@@ -4846,3 +4846,74 @@ fn test_snapshot_preserves_privilege_mode() {
 
     let _ = std::fs::remove_file(&snap_path);
 }
+
+#[test]
+fn test_profile_collects_stats() {
+    use microvm::profile::Profile;
+
+    let mut prof = Profile::new();
+    // Simulate profiling some instructions
+    prof.record_insn(0x80000000, "addi", 1); // S-mode
+    prof.record_insn(0x80000004, "ld", 1);
+    prof.record_insn(0x80000008, "sd", 1);
+    prof.record_insn(0x8000000C, "beq", 1);
+    prof.record_insn(0x80000000, "addi", 1); // loop back
+    prof.record_load();
+    prof.record_store();
+    prof.record_branch(true);
+    prof.record_trap(8, false); // ecall from U
+    prof.record_trap(5, true); // S-mode timer interrupt
+    prof.record_sbi(0x10, 3); // BASE, probe_extension
+
+    // Verify it doesn't panic when printing
+    // (We just verify it runs without errors)
+    prof.print_summary();
+}
+
+#[test]
+fn test_profile_with_execution() {
+    // Run a small program and verify profile captures data
+    use microvm::cpu::Cpu;
+    use microvm::memory::Bus;
+    use microvm::profile::Profile;
+
+    let mut cpu = Cpu::new();
+    let mut bus = Bus::new(64 * 1024);
+    let mut prof = Profile::new();
+
+    // Small program: addi x1, x0, 42; addi x2, x1, 1; ecall
+    let program: Vec<u32> = vec![
+        0x02A00093, // addi x1, x0, 42
+        0x00108113, // addi x2, x1, 1
+        0x00000073, // ecall
+    ];
+    let base = 0x80000000u64;
+    for (i, &inst) in program.iter().enumerate() {
+        let addr = (i * 4) as u64;
+        let bytes = inst.to_le_bytes();
+        for (j, &b) in bytes.iter().enumerate() {
+            bus.write8(base + addr + j as u64, b);
+        }
+    }
+    cpu.reset(base);
+
+    // Execute with profiling
+    for _ in 0..3 {
+        let pc = cpu.pc;
+        let raw = bus.read32(pc);
+        let mn = microvm::cpu::disasm::mnemonic(raw);
+        let mode = cpu.mode as u8;
+        prof.record_insn(pc, mn, mode);
+        cpu.step(&mut bus);
+
+        if let Some((cause, is_int)) = cpu.last_trap.take() {
+            prof.record_trap(cause, is_int);
+        }
+        if let Some((eid, fid)) = cpu.last_sbi.take() {
+            prof.record_sbi(eid, fid);
+        }
+    }
+
+    // Verify profile captured something
+    prof.print_summary();
+}

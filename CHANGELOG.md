@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.38.0 — Execution Profiler (`--profile`)
+
+### Major Features
+- **Execution profiler**: `--profile` flag collects comprehensive runtime statistics and prints a detailed summary on exit:
+  - **Instruction distribution**: Top 20 most-executed instructions by mnemonic with frequency bars
+  - **Hottest PCs**: Top 15 program counter values by execution count
+  - **Privilege mode distribution**: Time spent in M/S/U mode with percentages
+  - **Memory access stats**: Load/store counts as percentage of total instructions
+  - **Branch stats**: Taken vs not-taken branch ratio
+  - **Exception/interrupt counters**: Categorized by cause with human-readable names
+  - **SBI call statistics**: Grouped by extension ID and function ID
+- **Mnemonic classifier** (`disasm::mnemonic()`): Fast O(1) instruction classification for profiling, supports all RV64GC instructions
+- **CPU instrumentation**: Trap and SBI call tracking via `last_trap`/`last_sbi` fields on CPU struct
+- **Memory-bounded**: Hot PC tracking automatically prunes to 10K entries when exceeding 100K
+
+### New Tests
+- `test_profile_record_and_counts`: Instruction recording and mode tracking
+- `test_profile_memory_stats`: Load/store counter accuracy
+- `test_profile_branch_stats`: Branch taken/not-taken tracking
+- `test_profile_traps`: Exception and interrupt recording
+- `test_profile_sbi`: SBI call grouping by EID/FID
+- `test_profile_prune`: Memory pruning under high PC cardinality
+- `test_format_count`: Human-readable number formatting (K/M/G)
+- `test_bar`: Visual bar rendering
+- `test_exception_names`: Exception cause name lookup
+- `test_interrupt_names`: Interrupt cause name lookup
+- `test_profile_collects_stats`: End-to-end profile data collection
+- `test_profile_with_execution`: Profile integration with actual CPU execution
+
+### Stats
+- 217 integration tests + 69+69 unit tests = 355 total, all passing
+
 ## v0.37.0 — Snapshot/Restore (Save & Load VM State)
 
 ### Major Features

@@ -885,6 +885,7 @@ fn sbi_ext_name(eid: u64) -> &'static str {
 fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
     let eid = cpu.regs[17]; // a7
     let fid = cpu.regs[16]; // a6
+    cpu.last_sbi = Some((eid, fid));
     let a0 = cpu.regs[10];
     // SBI return: a0 = error, a1 = value
     // SBI_SUCCESS = 0, SBI_ERR_NOT_SUPPORTED = -2
