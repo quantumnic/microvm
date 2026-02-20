@@ -245,6 +245,105 @@ impl CsrFile {
         }
     }
 
+    /// Check PMP (Physical Memory Protection) for a physical address.
+    /// Returns true if access is allowed, false if denied.
+    /// Per RISC-V spec: S/U-mode accesses are denied by default (no matching entry = deny).
+    /// M-mode accesses are allowed by default unless a PMP entry with L bit locks it.
+    pub fn pmp_check(
+        &self,
+        paddr: u64,
+        size: u64,
+        access: super::mmu::AccessType,
+        mode: PrivilegeMode,
+    ) -> bool {
+        // Check each byte of the access range against PMP
+        // For simplicity and correctness, check start and end addresses
+        // (PMP is checked per-byte conceptually, but contiguous ranges within
+        // one PMP region are fine)
+        self.pmp_check_addr(paddr, access, mode)
+            && (size <= 1 || self.pmp_check_addr(paddr + size - 1, access, mode))
+    }
+
+    fn pmp_check_addr(
+        &self,
+        paddr: u64,
+        access: super::mmu::AccessType,
+        mode: PrivilegeMode,
+    ) -> bool {
+        let mut prev_addr: u64 = 0;
+
+        for i in 0..16usize {
+            let cfg_reg = i / 8; // pmpcfg0 or pmpcfg1
+            let cfg_byte = (self.pmpcfg[cfg_reg] >> ((i % 8) * 8)) as u8;
+
+            // Skip disabled entries (A=0)
+            let a_field = (cfg_byte >> 3) & 3;
+            if a_field == 0 {
+                prev_addr = self.pmpaddr[i];
+                continue;
+            }
+
+            let locked = cfg_byte & 0x80 != 0;
+            let r = cfg_byte & 0x01 != 0;
+            let w = cfg_byte & 0x02 != 0;
+            let x = cfg_byte & 0x04 != 0;
+
+            // Determine address range [range_start, range_end) in byte addresses
+            // pmpaddr stores address >> 2 (granularity of 4 bytes)
+            let (range_start, range_end) = match a_field {
+                1 => {
+                    // TOR (Top of Range): [pmpaddr[i-1]<<2, pmpaddr[i]<<2)
+                    let top = self.pmpaddr[i] << 2;
+                    let bot = prev_addr << 2;
+                    (bot, top)
+                }
+                2 => {
+                    // NA4 (Naturally Aligned 4-byte)
+                    let base = self.pmpaddr[i] << 2;
+                    (base, base + 4)
+                }
+                3 => {
+                    // NAPOT (Naturally Aligned Power-of-Two)
+                    // Find lowest clear bit in pmpaddr to determine size
+                    let addr = self.pmpaddr[i];
+                    // Count trailing ones to find the size encoding
+                    let trailing_ones = addr.trailing_ones() as u64;
+                    if trailing_ones >= 62 {
+                        // Full address space
+                        (0, u64::MAX)
+                    } else {
+                        let size = 1u64 << (trailing_ones + 3); // +3 because pmpaddr is addr>>2, and min NAPOT is 8 bytes
+                        let base = (addr & !((1u64 << (trailing_ones + 1)) - 1)) << 2;
+                        (base, base.saturating_add(size))
+                    }
+                }
+                _ => unreachable!(),
+            };
+
+            prev_addr = self.pmpaddr[i];
+
+            // Check if address falls in this range
+            if paddr >= range_start && paddr < range_end {
+                // Found matching entry
+                if mode == PrivilegeMode::Machine && !locked {
+                    // M-mode with non-locked entry: always allowed
+                    return true;
+                }
+                // Check permission bits
+                return match access {
+                    super::mmu::AccessType::Read => r,
+                    super::mmu::AccessType::Write => w,
+                    super::mmu::AccessType::Execute => x,
+                };
+            }
+        }
+
+        // No matching entry
+        // M-mode: default allow
+        // S/U-mode: default deny
+        mode == PrivilegeMode::Machine
+    }
+
     pub fn write(&mut self, addr: u16, val: u64) {
         match addr {
             MISA | MHARTID | MVENDORID | MARCHID | MIMPID => {} // Read-only

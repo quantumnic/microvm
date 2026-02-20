@@ -269,24 +269,22 @@ fn disasm_op_imm(raw: u32, rd: usize, rs1: usize, funct3: u32, funct7: u32, imm:
         }
         5 => {
             let shamt = (raw >> 20) & 0x3F;
-            if funct7 == 0x20 {
+            let funct6 = (raw >> 26) & 0x3F;
+            if funct6 == 0x10 {
                 format!("srai    {}, {}, {}", r(rd), r(rs1), shamt)
-            } else if funct7 == 0x30 {
+            } else if funct6 == 0x18 {
                 format!("rori    {}, {}, {}", r(rd), r(rs1), shamt) // Zbb
-            } else if raw == 0x6B805013 || (funct7 >> 1) == 0x14 {
-                format!("orc.b   {}, {}", r(rd), r(rs1)) // Zbb
-            } else if (funct7 >> 1) == 0x1A {
-                format!("rev8    {}, {}", r(rd), r(rs1)) // Zbb
-            } else if (funct7 >> 1) == 0x12 {
+            } else if funct6 == 0x12 {
                 format!("bexti   {}, {}, {}", r(rd), r(rs1), shamt) // Zbs
-            } else if (funct7 >> 1) == 0x24 {
-                format!("bclri   {}, {}, {}", r(rd), r(rs1), shamt) // Zbs
-            } else if (funct7 >> 1) == 0x34 {
-                format!("binvi   {}, {}, {}", r(rd), r(rs1), shamt) // Zbs
-            } else if (funct7 >> 1) == 0x14 {
-                format!("bseti   {}, {}, {}", r(rd), r(rs1), shamt) // Zbs
             } else {
-                format!("srli    {}, {}, {}", r(rd), r(rs1), shamt)
+                let funct12 = (raw >> 20) & 0xFFF;
+                if funct12 == 0x287 {
+                    format!("orc.b   {}, {}", r(rd), r(rs1)) // Zbb
+                } else if funct12 == 0x6B8 {
+                    format!("rev8    {}, {}", r(rd), r(rs1)) // Zbb
+                } else {
+                    format!("srli    {}, {}, {}", r(rd), r(rs1), shamt)
+                }
             }
         }
         6 => format!("ori     {}, {}, {}", r(rd), r(rs1), imm),

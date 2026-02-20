@@ -4,6 +4,16 @@ use microvm::cpu::Cpu;
 use microvm::memory::{Bus, DRAM_BASE};
 
 /// Helper: create a CPU+Bus, load instructions at DRAM_BASE, run N steps
+/// Configure PMP entry 0 to allow all memory (NAPOT full address space).
+/// This is needed for S-mode and U-mode tests to pass PMP checks.
+fn setup_pmp_allow_all(cpu: &mut Cpu) {
+    // NAPOT with all-ones address = full address space
+    // pmpaddr0 = all ones (covers everything)
+    cpu.csrs.pmpaddr[0] = u64::MAX >> 2; // pmpaddr stores addr >> 2
+                                         // pmpcfg0 byte 0: A=NAPOT(3), R=1, W=1, X=1 = 0b00011_111 = 0x1F
+    cpu.csrs.pmpcfg[0] = 0x1F;
+}
+
 fn run_program(instructions: &[u32], steps: usize) -> (Cpu, Bus) {
     let mut bus = Bus::new(64 * 1024);
     let bytes: Vec<u8> = instructions
@@ -12,6 +22,8 @@ fn run_program(instructions: &[u32], steps: usize) -> (Cpu, Bus) {
         .collect();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     for _ in 0..steps {
         if !cpu.step(&mut bus) {
@@ -30,6 +42,8 @@ fn run_program_with_regs(instructions: &[u32], steps: usize, regs: &[(usize, u64
         .collect();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     for &(reg, val) in regs {
         cpu.regs[reg] = val;
@@ -508,6 +522,7 @@ fn test_sbi_base_get_spec_version() {
     // Set up CPU in S-mode, make SBI base extension call
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     // Switch to S-mode by setting up mstatus and using mret
     // Simpler: directly set mode and registers
@@ -526,6 +541,7 @@ fn test_sbi_base_get_spec_version() {
 fn test_sbi_probe_extension() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0x10; // Base extension
@@ -542,6 +558,7 @@ fn test_sbi_probe_extension() {
 fn test_sbi_set_timer() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0; // legacy set_timer
@@ -560,6 +577,7 @@ fn test_sbi_set_timer() {
 fn test_sbi_console_putchar() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 1; // legacy console_putchar
@@ -574,6 +592,7 @@ fn test_sbi_console_putchar() {
 fn test_sbi_ipi() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0x735049; // sPI extension
@@ -590,6 +609,7 @@ fn test_sbi_ipi() {
 fn test_sbi_unknown_extension() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0xDEAD; // unknown extension
@@ -653,6 +673,7 @@ fn test_time_csr_reads_mtime() {
 fn test_sret() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     // Set up for SRET: in S-mode, return to user address
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
@@ -672,6 +693,7 @@ fn test_sret() {
 fn test_interrupt_delegation_to_smode() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     // Set up: CPU in S-mode, delegate STI to S-mode
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
@@ -706,6 +728,7 @@ fn test_mmu_ad_bits_set_on_read() {
     // Set up Sv39 page table with valid PTE but A=0, D=0
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
 
     // Page table at offset 0x10000 from DRAM_BASE
@@ -763,6 +786,7 @@ fn test_mmu_ad_bits_set_on_read() {
 fn test_mmu_ad_bits_set_on_write() {
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
 
     let pt_base = 0x10000u64;
@@ -808,6 +832,7 @@ fn test_counter_access_denied_without_counteren() {
     // S-mode trying to read TIME without mcounteren set should trap
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
 
@@ -839,6 +864,7 @@ fn test_counter_access_allowed_with_counteren() {
     // S-mode reading TIME with mcounteren set should work
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
 
@@ -862,6 +888,7 @@ fn test_firmware_boot_drops_to_smode() {
     // Test that the boot ROM firmware properly sets up and drops to S-mode
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
 
     let kernel_entry = DRAM_BASE + 0x200000; // 0x80200000
     let dtb_addr = DRAM_BASE + 0x3F000;
@@ -925,6 +952,7 @@ fn test_sbi_rfence_remote_fence_i() {
     bus.load_binary(&ecall.to_le_bytes(), 0);
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0x52464E43; // a7 = RFENCE EID
@@ -949,6 +977,7 @@ fn test_sbi_rfence_remote_sfence_vma() {
     bus.load_binary(&ecall.to_le_bytes(), 0);
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0x52464E43; // a7 = RFENCE EID
@@ -969,6 +998,7 @@ fn test_sbi_probe_rfence() {
     bus.load_binary(&ecall.to_le_bytes(), 0);
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0x10; // a7 = Base extension
@@ -988,6 +1018,7 @@ fn test_sbi_probe_srst() {
     bus.load_binary(&ecall.to_le_bytes(), 0);
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0x10; // a7 = Base extension
@@ -1107,6 +1138,7 @@ fn test_sbi_probe_dbcn() {
     let bytes: Vec<u8> = program.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     // sbi_probe_extension(0x4442434E): a7=0x10, a6=3, a0=0x4442434E
@@ -1312,6 +1344,7 @@ fn test_dtb_contains_zicntr() {
 fn test_sv48_page_walk() {
     // Set up a simple Sv48 identity mapping: 4-level walk
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let ram_size = 16 * 1024 * 1024u64;
     let mut bus = Bus::new(ram_size);
 
@@ -1362,6 +1395,7 @@ fn test_sv48_page_walk() {
 fn test_sv57_page_walk() {
     // Set up a simple Sv57 identity mapping: 5-level walk
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let ram_size = 16 * 1024 * 1024u64;
     let mut bus = Bus::new(ram_size);
 
@@ -1427,6 +1461,7 @@ fn test_sv57_page_walk() {
 fn test_sv57_2mib_superpage() {
     // Test Sv57 with a 2 MiB superpage (leaf at level 1)
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let ram_size = 16 * 1024 * 1024u64;
     let mut bus = Bus::new(ram_size);
 
@@ -1484,6 +1519,7 @@ fn test_uart_msr_cts_dsr() {
 #[test]
 fn test_hsm_hart_suspend() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(4 * 1024 * 1024);
 
     // Set up S-mode ecall for HSM hart_suspend
@@ -1512,6 +1548,7 @@ fn test_mstatus_fs_with_fpu() {
 
     // FS should be writable (Dirty=3 sets SD bit)
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mstatus = cpu.csrs.read(csr::MSTATUS);
     cpu.csrs
         .write(csr::MSTATUS, (mstatus & !(3 << 13)) | (3 << 13));
@@ -1580,6 +1617,7 @@ fn test_stip_clint_and_sstc_union() {
     use microvm::memory::Bus;
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let _bus = Bus::new(1024 * 1024);
 
     // Neither timer active — STIP should not be set
@@ -1598,6 +1636,7 @@ fn test_stip_clint_and_sstc_union() {
 fn test_tlb_caches_translation() {
     // Set up Sv48 page table, translate twice, verify TLB hit on second access
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let ram_size = 16 * 1024 * 1024u64;
     let mut bus = Bus::new(ram_size);
     // Build page tables
@@ -1643,6 +1682,7 @@ fn test_tlb_caches_translation() {
 #[test]
 fn test_tlb_flush_invalidates() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let ram_size = 16 * 1024 * 1024u64;
     let mut bus = Bus::new(ram_size);
 
@@ -1687,6 +1727,7 @@ fn test_tlb_flush_invalidates() {
 #[test]
 fn test_tlb_flush_vaddr() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let ram_size = 16 * 1024 * 1024u64;
     let mut bus = Bus::new(ram_size);
 
@@ -1792,6 +1833,7 @@ fn test_menvcfgh_reads_zero() {
 fn test_hpm_counter_access_control() {
     // HPM counters should respect mcounteren/scounteren
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     // Disable all HPM counters in mcounteren (bits 3-31)
     cpu.csrs.write(csr::MCOUNTEREN, 0x7); // only cycle, time, instret enabled
     cpu.csrs.write(csr::SCOUNTEREN, 0x7);
@@ -1814,6 +1856,7 @@ fn test_sbi_pmu_returns_not_supported() {
     // We test via probe_extension which should return 0 for PMU
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     // Set up ecall: a7=0x10 (base), a6=3 (probe), a0=0x504D55 (PMU)
@@ -1860,6 +1903,7 @@ fn test_bus_mmio_32bit_plic_read() {
 fn test_hpm_event_selector_writes_ignored() {
     // Writing to HPM event selectors should not crash
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     for addr in 0x323u16..=0x33F {
         cpu.csrs.write(addr, 0xDEAD);
         assert_eq!(
@@ -1899,6 +1943,7 @@ fn test_misaligned_load_halfword() {
     bus.load_binary(&bytes, 0);
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.step(&mut bus);
     cpu.step(&mut bus);
@@ -1918,6 +1963,7 @@ fn test_misaligned_store_word() {
     // Then sw x4, 0(x2) where x4 = 0xDEADBEEF
     // Easier: set up via direct register writes
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(base);
     cpu.regs[2] = base + 0x101; // misaligned target
     cpu.regs[3] = 0xDEAD_BEEF;
@@ -1950,6 +1996,7 @@ fn test_misaligned_load_word() {
     bus.write8(base + 0x104, 0xCA);
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(base);
     cpu.regs[2] = base + 0x101; // misaligned source
 
@@ -1978,6 +2025,7 @@ fn test_misaligned_load_doubleword() {
     }
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(base);
     cpu.regs[2] = base + 0x103; // misaligned source
 
@@ -2053,6 +2101,7 @@ fn test_sbi_cppc_returns_not_supported() {
     // CPPC extension (EID=0x43505043) should return SBI_ERR_NOT_SUPPORTED
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
 
@@ -2076,6 +2125,7 @@ fn test_sbi_cppc_returns_not_supported() {
 fn test_sbi_fwft_returns_not_supported() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
 
@@ -2404,6 +2454,7 @@ fn test_cbo_zero() {
     bus.load_binary(&bytes, 0);
 
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.regs[1] = target_addr; // rs1 = address to zero
 
@@ -2513,6 +2564,7 @@ fn test_fpu_fadd_s() {
     // FMV.W.X f2, x1: funct7=0x78, rs2=0, rs1=x1, rm=000, rd=f2 => opcode=0x53
     // f2 = 3.0f (0x40400000), f3 = 2.0f (0x40000000)
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     let base = DRAM_BASE;
 
@@ -2540,6 +2592,7 @@ fn test_fpu_fadd_s() {
 #[test]
 fn test_fpu_fsub_s() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[2] = 0xFFFFFFFF_40A00000u64; // 5.0f
     cpu.fregs[3] = 0xFFFFFFFF_40000000u64; // 2.0f
@@ -2555,6 +2608,7 @@ fn test_fpu_fsub_s() {
 #[test]
 fn test_fpu_fmul_s() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[2] = 0xFFFFFFFF_40400000u64; // 3.0f
     cpu.fregs[3] = 0xFFFFFFFF_40800000u64; // 4.0f
@@ -2569,6 +2623,7 @@ fn test_fpu_fmul_s() {
 #[test]
 fn test_fpu_fdiv_s() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[2] = 0xFFFFFFFF_41200000u64; // 10.0f
     cpu.fregs[3] = 0xFFFFFFFF_40000000u64; // 2.0f
@@ -2583,6 +2638,7 @@ fn test_fpu_fdiv_s() {
 #[test]
 fn test_fpu_fadd_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[2] = (3.0f64).to_bits();
     cpu.fregs[3] = (2.0f64).to_bits();
@@ -2598,6 +2654,7 @@ fn test_fpu_fadd_d() {
 #[test]
 fn test_fpu_fmul_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[2] = (3.0f64).to_bits();
     cpu.fregs[3] = (4.0f64).to_bits();
@@ -2612,6 +2669,7 @@ fn test_fpu_fmul_d() {
 #[test]
 fn test_fpu_fsqrt_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[2] = (9.0f64).to_bits();
 
@@ -2626,6 +2684,7 @@ fn test_fpu_fsqrt_d() {
 #[test]
 fn test_fpu_fmv_w_x_and_x_w() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
 
     // FMV.W.X f1, x2: move integer bits to FP reg
@@ -2648,6 +2707,7 @@ fn test_fpu_fmv_w_x_and_x_w() {
 #[test]
 fn test_fpu_fmv_d_x_and_x_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
 
     // FMV.D.X f1, x2
@@ -2668,6 +2728,7 @@ fn test_fpu_fmv_d_x_and_x_d() {
 #[test]
 fn test_fpu_fcvt_s_w_and_w_s() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
 
     // FCVT.S.W f1, x2: convert i32 to f32
@@ -2688,6 +2749,7 @@ fn test_fpu_fcvt_s_w_and_w_s() {
 #[test]
 fn test_fpu_feq_flt_fle_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[2] = (3.0f64).to_bits();
     cpu.fregs[3] = (5.0f64).to_bits();
@@ -2715,6 +2777,7 @@ fn test_fpu_feq_flt_fle_d() {
 #[test]
 fn test_fpu_fclass_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
 
     // +normal
@@ -2741,6 +2804,7 @@ fn test_fpu_fclass_d() {
 #[test]
 fn test_fpu_fcvt_d_s_and_s_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
 
     // FCVT.D.S f1, f2: convert f32 to f64
@@ -2769,6 +2833,7 @@ fn test_fpu_fcvt_d_s_and_s_d() {
 #[test]
 fn test_fpu_fmadd_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[1] = (2.0f64).to_bits();
     cpu.fregs[2] = (3.0f64).to_bits();
@@ -2786,6 +2851,7 @@ fn test_fpu_fmadd_d() {
 #[test]
 fn test_fpu_fsgnj_d() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     cpu.fregs[1] = (3.0f64).to_bits();
     cpu.fregs[2] = (-1.0f64).to_bits();
@@ -2805,6 +2871,7 @@ fn test_fpu_fsgnj_d() {
 #[test]
 fn test_fpu_flw_fsw() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     let addr = DRAM_BASE + 0x100;
 
@@ -2833,6 +2900,7 @@ fn test_fpu_flw_fsw() {
 #[test]
 fn test_fpu_fld_fsd() {
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let mut bus = Bus::new(64 * 1024);
     let addr = DRAM_BASE + 0x100;
 
@@ -2939,6 +3007,7 @@ fn run_with_boot_rom(kernel_code: &[u32], steps: usize) -> (Cpu, Bus) {
     let ram_bytes = 128 * 1024 * 1024u64;
     let mut bus = Bus::new(ram_bytes);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
 
     // Load kernel at 0x80200000 (standard Linux load address)
     let kernel_entry = DRAM_BASE + 0x200000;
@@ -3194,6 +3263,7 @@ fn test_smode_page_table_setup() {
     // First, set up the page table in RAM manually
     let mut bus = Bus::new(128 * 1024 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
 
     // Write the page table entry
     let pte_addr_offset = page_table_offset + 2 * 8; // entry[2]
@@ -3333,6 +3403,7 @@ fn test_smode_timer_interrupt() {
 
     let mut bus = Bus::new(128 * 1024 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let kernel_entry_val = kernel_entry;
 
     let kernel_bytes: Vec<u8> = full_kernel
@@ -3407,6 +3478,7 @@ fn test_smode_uart_write() {
 
     let mut bus = Bus::new(128 * 1024 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let kernel_entry = DRAM_BASE + 0x200000;
 
     let kernel_bytes: Vec<u8> = kernel.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
@@ -3459,6 +3531,7 @@ fn test_sbi_hsm_hart_status() {
 
     let mut bus = Bus::new(128 * 1024 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     let kernel_entry = DRAM_BASE + 0x200000;
 
     let kernel_bytes: Vec<u8> = kernel.iter().flat_map(|i: &u32| i.to_le_bytes()).collect();
@@ -3541,6 +3614,7 @@ fn test_smode_ecall_from_umode() {
 
     let mut bus = Bus::new(128 * 1024 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
 
     let kernel_bytes: Vec<u8> = full_kernel
         .iter()
@@ -3621,6 +3695,7 @@ fn test_sv39_4k_page_table_walk() {
 
     let mut bus = Bus::new(16 * 1024 * 1024); // 16 MiB RAM
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
 
     // Memory layout in RAM (offsets from DRAM_BASE):
     // 0x000000: code (runs identity-mapped)
@@ -4001,6 +4076,7 @@ fn test_sbi_rfence_flushes_tlb() {
     // Set up: S-mode with Sv39, cached TLB entry, then SBI RFENCE should invalidate it
     let mut bus = Bus::new(16 * 1024 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
 
     // Put CPU in S-mode
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
@@ -4065,6 +4141,7 @@ fn test_sbi_rfence_vaddr_flush() {
     // Test that flush_tlb_vaddr only invalidates the specific address
     let mut bus = Bus::new(16 * 1024 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
 
     let pt_base: u64 = 0x400000;
@@ -4135,6 +4212,7 @@ fn test_amomin_amominu() {
     .collect();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.regs[11] = addr;
     cpu.regs[12] = 30;
@@ -4155,6 +4233,7 @@ fn test_amomax_amomaxu() {
     let bytes: Vec<u8> = inst.to_le_bytes().to_vec();
     bus.load_binary(&bytes, 0);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.regs[11] = DRAM_BASE + 0x100;
     cpu.regs[12] = 30;
@@ -4179,6 +4258,7 @@ fn test_amoxor_amoand_amoor() {
         let inst = (funct5 << 27) | (12 << 20) | (11 << 15) | (0b010 << 12) | (10 << 7) | 0x2F;
         bus.load_binary(&inst.to_le_bytes(), 0);
         let mut cpu = Cpu::new();
+        setup_pmp_allow_all(&mut cpu);
         cpu.reset(DRAM_BASE);
         cpu.regs[11] = DRAM_BASE + 0x100;
         cpu.regs[12] = rs2_val;
@@ -4210,6 +4290,7 @@ fn test_amo_doubleword() {
     let inst = (0b00001u32 << 27) | (12 << 20) | (11 << 15) | (0b011 << 12) | (10 << 7) | 0x2F;
     bus.load_binary(&inst.to_le_bytes(), 0);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.regs[11] = DRAM_BASE + 0x100;
     cpu.regs[12] = 0xFEDC_BA98_7654_3210;
@@ -4227,6 +4308,7 @@ fn test_svpbmt_pma_translation() {
     // Svpbmt: PBMT=PMA (00) should translate normally
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
 
     // 1GiB superpage: map VA 0x80000000 to PA 0x80000000
@@ -4258,6 +4340,7 @@ fn test_svpbmt_nc_translation() {
     // Svpbmt: PBMT=NC (01) should translate normally
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
 
     let pt_base = 0x10000u64;
@@ -4287,6 +4370,7 @@ fn test_svpbmt_io_translation() {
     // Svpbmt: PBMT=IO (10) should translate normally
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
 
     let pt_base = 0x10000u64;
@@ -4316,6 +4400,7 @@ fn test_svpbmt_reserved_faults() {
     // Svpbmt: PBMT=Reserved (11) should cause page fault
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
 
     let pt_base = 0x10000u64;
@@ -4375,6 +4460,7 @@ fn test_svadu_hardware_ad_bits() {
     // Verify that MMU sets A and D bits automatically in PTEs (Svadu behavior)
     let mut bus = Bus::new(256 * 1024);
     let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
 
     // Set up a simple Sv39 page table
@@ -4428,4 +4514,205 @@ fn test_svadu_boot_rom_sets_menvcfg() {
     let adue = (menvcfg >> 61) & 1;
     assert_eq!(stce, 1, "STCE bit should be set");
     assert_eq!(adue, 1, "ADUE bit should be set");
+}
+
+#[test]
+fn test_compressed_jalr_return_address() {
+    // Test that c.jalr saves PC+2 (not PC+4) as return address
+    // Program:
+    //   0x80000000: li t0, 0x80000008    (target for c.jalr)
+    //   0x80000004: c.jalr t0            (should set ra = PC+2 = 0x80000006)
+    //   0x80000006: nop                  (this is where ra should point)
+    //   0x80000008: nop                  (this is where c.jalr jumps to)
+    //
+    // c.jalr t0 = 0x9282
+    // We need to pack the 16-bit instruction correctly.
+    // At offset 4: c.jalr t0 (0x9282) + c.nop (0x0001) packed into one u32
+    let code: &[u32] = &[
+        // li t0, target — use auipc + addi
+        0x00000297, // auipc t0, 0 → t0 = 0x80000000
+        0x00828293, // addi t0, t0, 8 → t0 = 0x80000008
+        // At offset 8 (0x80000008): two compressed instructions packed as u32
+        // c.jalr t0 (0x9282) at byte 8, c.nop (0x0001) at byte 10
+        0x00019282u32, // little-endian: bytes [82, 92, 01, 00] → c.jalr t0, then c.nop
+                       // At offset 12 (0x8000000C): nop (this is the target 0x80000008... wait, let me recalculate
+    ];
+    // Actually, let me redo this more carefully.
+    // Offset 0: auipc t0, 0 (4 bytes) → t0 = 0x80000000
+    // Offset 4: addi t0, t0, 12 (4 bytes) → t0 = 0x8000000C
+    // Offset 8: c.jalr t0 (2 bytes) → ra = 0x80000008 + 2 = 0x8000000A, jump to 0x8000000C
+    // Offset 10: c.nop (2 bytes) — skipped by jump
+    // Offset 12: c.nop (2 bytes) — landed here
+    let mut bus = Bus::new(64 * 1024);
+    let instrs: &[u32] = &[
+        0x00000297, // auipc t0, 0 → t0 = DRAM_BASE
+        0x00c28293, // addi t0, t0, 12 → t0 = DRAM_BASE+12
+    ];
+    let bytes: Vec<u8> = instrs.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    // At offset 8: c.jalr t0 (0x9282) + c.nop (0x0001)
+    let compressed: u32 = 0x00019282; // c.jalr t0 at byte 0-1, c.nop at byte 2-3
+    bus.load_binary(&compressed.to_le_bytes(), 8);
+    // At offset 12: c.nop + c.nop
+    let nops: u32 = 0x00010001;
+    bus.load_binary(&nops.to_le_bytes(), 12);
+
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    // Execute 4 instructions: auipc, addi, c.jalr, c.nop (at target)
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+    // ra should be DRAM_BASE + 8 + 2 = DRAM_BASE + 10 (PC of c.jalr + 2)
+    assert_eq!(
+        cpu.regs[1],
+        DRAM_BASE + 10,
+        "c.jalr should save PC+2 (not PC+4) as return address"
+    );
+    // PC should now be at DRAM_BASE + 12 + 2 (after executing the nop at target)
+    assert_eq!(cpu.pc, DRAM_BASE + 14);
+}
+
+// ============== PMP (Physical Memory Protection) Tests ==============
+
+#[test]
+fn test_pmp_smode_denied_without_pmp() {
+    // S-mode access without PMP configured should fault
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    // Deliberately do NOT set up PMP
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Store instruction: sw x0, 0(x0) — will try to access address 0
+    // Use a simple ADDI to test instruction fetch (which also needs PMP)
+    let addi = 0x00100093u32; // addi x1, x0, 1
+    bus.load_binary(&addi.to_le_bytes(), 0);
+
+    // Step should trap (instruction access fault, cause=1)
+    cpu.step(&mut bus);
+
+    // Should have taken an exception — check mcause or scause
+    // The exception goes to M-mode (medeleg not set for access faults by default)
+    let mcause = cpu.csrs.read(csr::MCAUSE);
+    assert_eq!(
+        mcause, 1,
+        "Should get instruction access fault (cause=1) without PMP"
+    );
+}
+
+#[test]
+fn test_pmp_mmode_allowed_without_pmp() {
+    // M-mode should have full access even without PMP entries
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    // No PMP setup — M-mode default allows everything
+    cpu.reset(DRAM_BASE);
+
+    let addi = 0x00100093u32; // addi x1, x0, 1
+    bus.load_binary(&addi.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[1], 1, "M-mode should execute without PMP");
+}
+
+#[test]
+fn test_pmp_napot_allows_smode() {
+    // NAPOT covering DRAM should allow S-mode access
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    let addi = 0x00100093u32; // addi x1, x0, 1
+    bus.load_binary(&addi.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[1], 1, "S-mode should execute with NAPOT PMP");
+}
+
+#[test]
+fn test_pmp_tor_range() {
+    // TOR mode: allow only a specific range
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+
+    // pmpaddr0 = 0 (bottom of range for TOR)
+    // pmpaddr1 = (DRAM_BASE + 0x10000) >> 2 (top of range, 64KiB from DRAM_BASE)
+    // pmpcfg0 byte 0: A=0 (OFF) — pmpaddr0 is just the base for TOR
+    // pmpcfg0 byte 1: A=TOR(1), R=1, W=1, X=1 = 0x0F
+    cpu.csrs.pmpaddr[0] = DRAM_BASE >> 2;
+    cpu.csrs.pmpaddr[1] = (DRAM_BASE + 0x10000) >> 2;
+    cpu.csrs.pmpcfg[0] = 0x0F << 8; // byte 1 = 0x0F (TOR, RWX)
+
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    let addi = 0x00100093u32; // addi x1, x0, 1
+    bus.load_binary(&addi.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[1], 1, "S-mode should execute within TOR PMP range");
+}
+
+#[test]
+fn test_pmp_read_only_blocks_write() {
+    // PMP with R+X but no W — writes should fault
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+
+    // NAPOT covering all memory, Read + eXecute only (no Write)
+    cpu.csrs.pmpaddr[0] = u64::MAX >> 2;
+    cpu.csrs.pmpcfg[0] = 0x1D; // A=NAPOT(3), X=1, W=0, R=1 = 0b00011_1_0_1
+
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Delegate store access fault to S-mode
+    cpu.csrs.write(csr::MEDELEG, 1 << 7);
+
+    // SD x0, 0(x2) — store, x2=DRAM_BASE
+    // We need x2 to have a valid address
+    cpu.regs[2] = DRAM_BASE + 0x100;
+    let sw = 0x00013023u32; // sd x0, 0(x2)
+    bus.load_binary(&sw.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+
+    // Should get store access fault (cause=7)
+    let scause = cpu.csrs.read(csr::SCAUSE);
+    assert_eq!(
+        scause, 7,
+        "Write to read-only PMP region should cause store access fault"
+    );
+}
+
+#[test]
+fn test_pmp_locked_restricts_mmode() {
+    // Locked PMP entry should restrict even M-mode
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+
+    // Entry 0: locked, no permissions, NAPOT covering small range at DRAM_BASE
+    // pmpaddr0 for 8-byte NAPOT at DRAM_BASE: (DRAM_BASE >> 2) | 0 (trailing 0 = 8 bytes)
+    // Actually for NAPOT: addr = base >> 2 | (size/8 - 1) for power-of-2 sizes
+    // For 4KiB at DRAM_BASE: addr = (DRAM_BASE >> 2) | 0x1FF (trailing 9 ones = 4K)
+    cpu.csrs.pmpaddr[0] = (DRAM_BASE >> 2) | 0x1FF; // 4KiB NAPOT at DRAM_BASE
+    cpu.csrs.pmpcfg[0] = 0x98; // L=1, A=NAPOT(3), R=0, W=0, X=0 = 0b1_00_11_000
+
+    // Entry 1: allow everything else (so M-mode can still run from elsewhere)
+    cpu.csrs.pmpaddr[1] = u64::MAX >> 2;
+    cpu.csrs.pmpcfg[0] |= 0x1F << 8; // byte 1: NAPOT RWX
+
+    cpu.reset(DRAM_BASE);
+    // M-mode, but locked entry blocks DRAM_BASE
+
+    let addi = 0x00100093u32;
+    bus.load_binary(&addi.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+
+    // Should fault — locked entry denies M-mode
+    let mcause = cpu.csrs.read(csr::MCAUSE);
+    assert_eq!(
+        mcause, 1,
+        "Locked PMP with no X should cause instruction access fault even in M-mode"
+    );
 }

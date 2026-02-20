@@ -190,14 +190,21 @@ impl Mmu {
         let satp = csrs.read(csr::SATP);
         let satp_mode = satp >> 60;
 
-        // If bare mode or M-mode, no translation
+        // If bare mode or M-mode, no translation — but still check PMP
         if satp_mode == 0 || mode == PrivilegeMode::Machine {
+            if !csrs.pmp_check(vaddr, 1, access, mode) {
+                return Err(self.access_fault(access));
+            }
             return Ok(vaddr);
         }
 
         // TLB lookup
         if let Some(phys) = self.tlb_lookup(vaddr, access, mode, csrs) {
             self.tlb_hits += 1;
+            // PMP check still needed on TLB hits
+            if !csrs.pmp_check(phys, 1, access, mode) {
+                return Err(self.access_fault(access));
+            }
             return Ok(phys);
         }
         self.tlb_misses += 1;
@@ -294,6 +301,11 @@ impl Mmu {
                 _ => unreachable!(),
             };
 
+            // PMP check on the translated physical address
+            if !csrs.pmp_check(phys, 1, access, mode) {
+                return Err(self.access_fault(access));
+            }
+
             // Cache in TLB (with updated A/D bits)
             let cached_flags = pte | PTE_A | if need_d { PTE_D } else { 0 };
             let base_ppn = (phys & !offset_mask) >> 12;
@@ -365,6 +377,15 @@ impl Mmu {
             AccessType::Execute => 12,
             AccessType::Read => 13,
             AccessType::Write => 15,
+        }
+    }
+
+    /// Access fault exceptions (distinct from page faults — used for PMP violations)
+    fn access_fault(&self, access: AccessType) -> u64 {
+        match access {
+            AccessType::Execute => 1, // Instruction access fault
+            AccessType::Read => 5,    // Load access fault
+            AccessType::Write => 7,   // Store/AMO access fault
         }
     }
 }

@@ -57,8 +57,8 @@ pub fn execute(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> bool {
     match opcode {
         0x37 => op_lui(cpu, &inst, inst_len),
         0x17 => op_auipc(cpu, &inst, inst_len),
-        0x6F => op_jal(cpu, &inst),
-        0x67 => op_jalr(cpu, &inst),
+        0x6F => op_jal(cpu, &inst, inst_len),
+        0x67 => op_jalr(cpu, &inst, inst_len),
         0x63 => op_branch(cpu, &inst, inst_len),
         0x03 => op_load(cpu, bus, &inst, inst_len),
         0x23 => op_store(cpu, bus, &inst, inst_len),
@@ -74,6 +74,7 @@ pub fn execute(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> bool {
             cpu.handle_exception(2, raw as u64, bus); // Illegal instruction
         }
     }
+
     true
 }
 
@@ -87,14 +88,14 @@ fn op_auipc(cpu: &mut Cpu, inst: &Instruction, len: u64) {
     cpu.pc += len;
 }
 
-fn op_jal(cpu: &mut Cpu, inst: &Instruction) {
-    cpu.regs[inst.rd] = cpu.pc + 4; // Always saves PC+4 for JAL
+fn op_jal(cpu: &mut Cpu, inst: &Instruction, inst_len: u64) {
+    cpu.regs[inst.rd] = cpu.pc + inst_len; // PC+4 for 32-bit, PC+2 for compressed
     cpu.pc = cpu.pc.wrapping_add(inst.imm_j as u64);
 }
 
-fn op_jalr(cpu: &mut Cpu, inst: &Instruction) {
+fn op_jalr(cpu: &mut Cpu, inst: &Instruction, inst_len: u64) {
     let target = (cpu.regs[inst.rs1].wrapping_add(inst.imm_i as u64)) & !1;
-    cpu.regs[inst.rd] = cpu.pc + 4;
+    cpu.regs[inst.rd] = cpu.pc + inst_len; // PC+4 for 32-bit, PC+2 for compressed
     cpu.pc = target;
 }
 
@@ -338,12 +339,14 @@ fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
         3 => (rs1 < imm) as u64,                   // SLTIU
         4 => rs1 ^ imm,                            // XORI
         5 => {
-            let top7 = (inst.raw >> 25) & 0x7F;
-            match top7 {
-                0x20 => ((rs1 as i64) >> shamt) as u64,    // SRAI
-                0x24 => (rs1 >> shamt) & 1,                // BEXTI (Zbs)
-                0x30 => rs1.rotate_right(shamt),           // RORI (Zbb)
-                0x34 if shamt == 0x18 => rs1.swap_bytes(), // REV8 (Zbb): funct12=0x6B8, shamt=0x18 doesn't match...
+            // Use top 6 bits (funct6) for shift disambiguation:
+            // bits[31:26] distinguish SRLI/SRAI/RORI etc.
+            // bit 25 is part of the 6-bit shamt, not the function code.
+            let top6 = (inst.raw >> 26) & 0x3F;
+            match top6 {
+                0x10 => ((rs1 as i64) >> shamt) as u64, // SRAI (funct6=010000)
+                0x12 => (rs1 >> shamt) & 1,             // BEXTI (Zbs, funct6=010010)
+                0x18 => rs1.rotate_right(shamt),        // RORI (Zbb, funct6=011000)
                 _ => {
                     // Check for REV8 and ORC.B by full funct12
                     let funct12 = (inst.raw >> 20) & 0xFFF;
@@ -613,6 +616,15 @@ fn op_atomic(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
             } else {
                 bus.read64(phys)
             };
+            if val != 0 {
+                log::debug!(
+                    "LR at vaddr={:#x} phys={:#x} val={:#x} (word={})",
+                    addr,
+                    phys,
+                    val,
+                    is_word
+                );
+            }
             cpu.regs[inst.rd] = val;
             cpu.reservation = Some(addr);
         }

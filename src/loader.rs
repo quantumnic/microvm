@@ -17,8 +17,8 @@ pub struct LoadedKernel {
 
 /// RISC-V Linux Image header (64 bytes)
 /// See: https://www.kernel.org/doc/html/latest/arch/riscv/boot-image-header.html
-const RISCV_IMAGE_MAGIC: u32 = 0x5643534f; // "RSCV" (little-endian "OSV\x00" → actually "RISCV" spec uses 0x5643534f)
-                                           // Actually the magic for RISC-V Image header at offset 48 is: 0x5643534f ("RSCV" in LE)
+const RISCV_IMAGE_MAGIC_OLD: u32 = 0x5643534f; // Legacy magic (pre-6.x kernels)
+const RISCV_IMAGE_MAGIC_NEW: [u8; 5] = *b"RISCV"; // Modern magic (Linux 6.x+ EFI stub)
 
 /// ELF magic
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -51,8 +51,16 @@ fn detect_riscv_image(data: &[u8]) -> bool {
     if data.len() < 64 {
         return false;
     }
+    // Check legacy magic (u32 at offset 48)
     let magic = u32::from_le_bytes([data[48], data[49], data[50], data[51]]);
-    magic == RISCV_IMAGE_MAGIC
+    if magic == RISCV_IMAGE_MAGIC_OLD {
+        return true;
+    }
+    // Check modern magic: "RISCV" at offset 48 (Linux 6.x+ with EFI stub)
+    if data[48..53] == RISCV_IMAGE_MAGIC_NEW {
+        return true;
+    }
+    false
 }
 
 fn load_riscv_image(data: &[u8], ram: &mut [u8], dram_base: u64) -> LoadedKernel {
@@ -220,13 +228,17 @@ mod tests {
     #[test]
     fn test_detect_riscv_image() {
         let mut data = vec![0u8; 64];
-        // Set magic at offset 48
-        data[48..52].copy_from_slice(&RISCV_IMAGE_MAGIC.to_le_bytes());
+        // Set legacy magic at offset 48
+        data[48..52].copy_from_slice(&RISCV_IMAGE_MAGIC_OLD.to_le_bytes());
         assert!(detect_riscv_image(&data));
 
         // Wrong magic
         data[48] = 0;
         assert!(!detect_riscv_image(&data));
+
+        // Modern magic "RISCV" at offset 48
+        data[48..53].copy_from_slice(&RISCV_IMAGE_MAGIC_NEW);
+        assert!(detect_riscv_image(&data));
     }
 
     #[test]
@@ -246,7 +258,7 @@ mod tests {
     fn test_load_riscv_image() {
         let mut data = vec![0u8; 256];
         // Set RISC-V Image header
-        data[48..52].copy_from_slice(&RISCV_IMAGE_MAGIC.to_le_bytes());
+        data[48..52].copy_from_slice(&RISCV_IMAGE_MAGIC_OLD.to_le_bytes());
         // text_offset = 0x200000
         data[8..16].copy_from_slice(&0x200000u64.to_le_bytes());
         // image_size = 256
