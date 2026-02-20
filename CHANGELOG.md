@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.35.0 — Svadu Extension (Hardware A/D Bit Management)
+
+### Major Features
+- **Svadu extension**: Hardware-managed Access and Dirty bits in page table entries. The MMU automatically sets A/D bits during page walks, matching what Linux expects for efficient memory management. Advertised in the device tree ISA string and `riscv,isa-extensions`.
+- **MENVCFG.ADUE (bit 61)**: Set in both the CSR init and boot ROM firmware, signaling to the OS that hardware A/D updates are supported.
+- **Boot ROM updated**: Now sets `MENVCFG = STCE | ADUE` (bits 63 + 61) enabling both Sstc timer and Svadu extensions for the guest OS.
+
+### New Tests
+- `test_svadu_menvcfg_adue_set`: Verifies MENVCFG has ADUE bit set on CPU init
+- `test_svadu_hardware_ad_bits`: End-to-end test — creates page table with A=0/D=0, performs read/write through MMU, verifies hardware sets A and D bits in the PTE
+- `test_svadu_boot_rom_sets_menvcfg`: Verifies boot ROM correctly initializes MENVCFG
+
+### Stats
+- 202 integration tests + 56+56 unit tests = 314 total, all passing
+
 ## v0.33.0 — Boot Simulation Test Suite + RFENCE TLB Fix + AMO Tests
 
 ### Major Features

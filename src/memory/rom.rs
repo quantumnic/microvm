@@ -56,12 +56,14 @@ impl BootRom {
         // The trap handler is placed right after mret; we'll point mtvec at a wfi+j loop
         // For now, we'll set mtvec after all code is emitted (see below)
 
-        // ===== Enable Sstc in menvcfg (bit 63) =====
-        // li t0, 1 << 63; csrw menvcfg, t0
-        // Since bit 63 needs a full 64-bit load:
-        code.push(0x00100293); // addi t0, zero, 1
-        let shamt63 = 63u32;
-        code.push((shamt63 << 20) | (5 << 15) | (1 << 12) | (5 << 7) | 0x13); // slli t0, t0, 63
+        // ===== Enable Sstc + Svadu in menvcfg =====
+        // MENVCFG.STCE (bit 63) = Sstc timer compare
+        // MENVCFG.ADUE (bit 61) = hardware A/D bit updates (Svadu)
+        // Value: (1 << 63) | (1 << 61) = 0xA000000000000000
+        // Build: t0 = 0b101 << 61
+        code.push(0x00500293); // addi t0, zero, 5  (t0 = 5 = 0b101)
+        let shamt61 = 61u32;
+        code.push((shamt61 << 20) | (5 << 15) | (1 << 12) | (5 << 7) | 0x13); // slli t0, t0, 61
         code.push(0x30A29073); // csrw menvcfg(0x30A), t0
 
         // ===== Set up mstatus for S-mode entry =====

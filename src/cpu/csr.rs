@@ -152,7 +152,8 @@ impl CsrFile {
         let mstatus = (2u64 << 32) | (2u64 << 34) | (1u64 << 13); // UXL | SXL | FS=Initial
         csrs.regs[MSTATUS as usize] = mstatus;
         // Enable Sstc extension: MENVCFG.STCE (bit 63)
-        csrs.regs[MENVCFG as usize] = 1u64 << 63;
+        // Enable Svadu: MENVCFG.ADUE (bit 61) — hardware A/D bit updates
+        csrs.regs[MENVCFG as usize] = (1u64 << 63) | (1u64 << 61);
         // stimecmp defaults to max (no interrupt)
         csrs.regs[STIMECMP as usize] = u64::MAX;
         csrs

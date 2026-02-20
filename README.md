@@ -224,6 +224,7 @@ microvm run --example minimal-kernel
 - [x] VirtIO Block/Console/Network/RNG
 - [x] F/D extensions (floating point)
 - [x] Sv57 (5-level page tables)
+- [x] Svadu (hardware A/D bit management)
 - [ ] Boot actual Linux kernel
 
 ### v0.4.0 — Developer Experience

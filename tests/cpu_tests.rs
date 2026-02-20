@@ -4356,3 +4356,76 @@ fn test_svpbmt_reserved_faults() {
         "Reserved PBMT should cause store page fault"
     );
 }
+
+#[test]
+fn test_svadu_menvcfg_adue_set() {
+    // Verify that MENVCFG has both STCE (bit 63) and ADUE (bit 61) set
+    let cpu = Cpu::new();
+    let menvcfg = cpu.csrs.read(csr::MENVCFG);
+    assert_ne!(menvcfg & (1u64 << 63), 0, "MENVCFG.STCE should be set");
+    assert_ne!(
+        menvcfg & (1u64 << 61),
+        0,
+        "MENVCFG.ADUE should be set (Svadu)"
+    );
+}
+
+#[test]
+fn test_svadu_hardware_ad_bits() {
+    // Verify that MMU sets A and D bits automatically in PTEs (Svadu behavior)
+    let mut bus = Bus::new(256 * 1024);
+    let mut cpu = Cpu::new();
+    cpu.reset(DRAM_BASE);
+
+    // Set up a simple Sv39 page table
+    let pt_base = 0x10000u64;
+    let pt_phys = DRAM_BASE + pt_base;
+
+    // Create a megapage PTE: valid, readable, writable, executable (S-mode, no U bit)
+    // BUT without A and D bits set — hardware should set them
+    let ppn = DRAM_BASE >> 12;
+    // Flags: V(1) R(2) W(4) X(8) = 0x0F, no A(64) or D(128), no U(16)
+    let pte_no_ad = (ppn << 10) | 0x0F; // V+R+W+X, no U, no A, no D
+    bus.write64(pt_phys + 2 * 8, pte_no_ad); // VPN[2]=2 for address 0x80000000
+
+    let satp = (8u64 << 60) | (pt_phys >> 12);
+    cpu.csrs.write(csr::SATP, satp);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Read access should succeed and set A bit
+    let result = cpu.mmu.translate(
+        DRAM_BASE,
+        microvm::cpu::mmu::AccessType::Read,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert!(result.is_ok(), "Read should succeed with hardware A/D");
+    let updated_pte = bus.read64(pt_phys + 2 * 8);
+    assert_ne!(updated_pte & (1 << 6), 0, "A bit should be set by hardware");
+
+    // Write access should succeed and set D bit
+    cpu.mmu.flush_tlb(); // Flush TLB to force re-walk
+    let result = cpu.mmu.translate(
+        DRAM_BASE,
+        microvm::cpu::mmu::AccessType::Write,
+        cpu.mode,
+        &cpu.csrs,
+        &mut bus,
+    );
+    assert!(result.is_ok(), "Write should succeed with hardware A/D");
+    let updated_pte = bus.read64(pt_phys + 2 * 8);
+    assert_ne!(updated_pte & (1 << 7), 0, "D bit should be set by hardware");
+}
+
+#[test]
+fn test_svadu_boot_rom_sets_menvcfg() {
+    // Verify that the boot ROM sets MENVCFG with STCE and ADUE
+    let (cpu, _bus) = run_program(&[], 0);
+    // After CPU new(), MENVCFG should have both bits
+    let menvcfg = cpu.csrs.read(csr::MENVCFG);
+    let stce = (menvcfg >> 63) & 1;
+    let adue = (menvcfg >> 61) & 1;
+    assert_eq!(stce, 1, "STCE bit should be set");
+    assert_eq!(adue, 1, "ADUE bit should be set");
+}
