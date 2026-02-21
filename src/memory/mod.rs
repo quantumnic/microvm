@@ -6,6 +6,14 @@ use crate::devices::{
     virtio_console::VirtioConsole, virtio_net::VirtioNet, virtio_rng::VirtioRng,
 };
 
+/// SBI HSM hart start request: (target_hart, start_addr, opaque)
+#[derive(Debug, Clone)]
+pub struct HartStartRequest {
+    pub hart_id: usize,
+    pub start_addr: u64,
+    pub opaque: u64,
+}
+
 // Memory map
 pub const UART_BASE: u64 = 0x1000_0000;
 pub const UART_SIZE: u64 = 0x100;
@@ -39,6 +47,10 @@ pub struct Bus {
     pub virtio_net: VirtioNet,
     pub rtc: GoldfishRtc,
     pub syscon: Syscon,
+    /// Pending hart start requests from SBI HSM
+    pub hart_start_queue: Vec<HartStartRequest>,
+    /// Number of harts in the system (for SBI validation)
+    pub num_harts: usize,
 }
 
 impl Bus {
@@ -54,6 +66,8 @@ impl Bus {
             virtio_net: VirtioNet::new(),
             rtc: GoldfishRtc::new(),
             syscon: Syscon::new(),
+            hart_start_queue: Vec::new(),
+            num_harts: 1,
         }
     }
 

@@ -346,11 +346,23 @@ fn is_printable_str(s: &str) -> bool {
 
 /// Generate a Device Tree Blob for Linux boot
 /// `initrd_info` is an optional (start, end) pair of physical addresses for the initrd.
+/// `num_harts` specifies the number of CPU harts (default 1).
 pub fn generate_dtb(
     ram_size: u64,
     cmdline: &str,
     has_virtio_blk: bool,
     initrd_info: Option<(u64, u64)>,
+) -> Vec<u8> {
+    generate_dtb_smp(ram_size, cmdline, has_virtio_blk, initrd_info, 1)
+}
+
+/// Generate a Device Tree Blob with SMP support
+pub fn generate_dtb_smp(
+    ram_size: u64,
+    cmdline: &str,
+    has_virtio_blk: bool,
+    initrd_info: Option<(u64, u64)>,
+    num_harts: usize,
 ) -> Vec<u8> {
     let mut b = DtbBuilder::new();
 
@@ -391,58 +403,61 @@ pub fn generate_dtb(
     b.prop_u32("#size-cells", 0);
     b.prop_u32("timebase-frequency", 10_000_000);
 
-    b.begin_node("cpu@0");
-    b.prop_str("device_type", "cpu");
-    b.prop_u32("reg", 0);
-    b.prop_str("compatible", "riscv");
-    b.prop_str(
-        "riscv,isa",
-        "rv64imafdcsu_zicsr_zifencei_zicbom_zicboz_zicbop_zicond_zihintpause_zawrs_zba_zbb_zbs_zbc_sstc_zicntr_svinval_svpbmt_svadu",
-    );
-    b.prop_str("riscv,isa-base", "rv64i");
-    b.prop_str("mmu-type", "riscv,sv57");
-    b.prop_str("status", "okay");
-    // ISA extensions as stringlist for newer kernels (Linux 6.2+)
-    b.prop_stringlist(
-        "riscv,isa-extensions",
-        &[
-            "i",
-            "m",
-            "a",
-            "f",
-            "d",
-            "c",
-            "zicsr",
-            "zifencei",
-            "zicbom",
-            "zicboz",
-            "zicbop",
-            "zicond",
-            "zihintpause",
-            "zawrs",
-            "zba",
-            "zbb",
-            "zbs",
-            "zbc",
-            "sstc",
-            "zicntr",
-            "svinval",
-            "svpbmt",
-            "svadu",
-        ],
-    );
-    // Cache block size for Zicbom (Linux probes this; 64 is standard)
-    b.prop_u32("riscv,cbom-block-size", 64);
-    b.prop_u32("riscv,cboz-block-size", 64);
+    // Phandle allocation: intc phandles start at 1 (one per hart)
+    // PLIC phandle = num_harts + 1, syscon phandle = num_harts + 2
+    let plic_phandle = num_harts as u32 + 1;
+    let syscon_phandle = num_harts as u32 + 2;
 
-    b.begin_node("interrupt-controller");
-    b.prop_u32("#interrupt-cells", 1);
-    b.prop_null("interrupt-controller");
-    b.prop_str("compatible", "riscv,cpu-intc");
-    b.prop_u32("phandle", 1);
-    b.end_node(); // interrupt-controller
+    let isa_str = "rv64imafdcsu_zicsr_zifencei_zicbom_zicboz_zicbop_zicond_zihintpause_zawrs_zba_zbb_zbs_zbc_sstc_zicntr_svinval_svpbmt_svadu";
+    let isa_extensions: &[&str] = &[
+        "i",
+        "m",
+        "a",
+        "f",
+        "d",
+        "c",
+        "zicsr",
+        "zifencei",
+        "zicbom",
+        "zicboz",
+        "zicbop",
+        "zicond",
+        "zihintpause",
+        "zawrs",
+        "zba",
+        "zbb",
+        "zbs",
+        "zbc",
+        "sstc",
+        "zicntr",
+        "svinval",
+        "svpbmt",
+        "svadu",
+    ];
 
-    b.end_node(); // cpu@0
+    for hart in 0..num_harts {
+        let intc_phandle = hart as u32 + 1;
+        b.begin_node(&format!("cpu@{hart}"));
+        b.prop_str("device_type", "cpu");
+        b.prop_u32("reg", hart as u32);
+        b.prop_str("compatible", "riscv");
+        b.prop_str("riscv,isa", isa_str);
+        b.prop_str("riscv,isa-base", "rv64i");
+        b.prop_str("mmu-type", "riscv,sv57");
+        b.prop_str("status", "okay");
+        b.prop_stringlist("riscv,isa-extensions", isa_extensions);
+        b.prop_u32("riscv,cbom-block-size", 64);
+        b.prop_u32("riscv,cboz-block-size", 64);
+
+        b.begin_node("interrupt-controller");
+        b.prop_u32("#interrupt-cells", 1);
+        b.prop_null("interrupt-controller");
+        b.prop_str("compatible", "riscv,cpu-intc");
+        b.prop_u32("phandle", intc_phandle);
+        b.end_node(); // interrupt-controller
+
+        b.end_node(); // cpu@N
+    }
     b.end_node(); // cpus
 
     // SOC
@@ -452,7 +467,7 @@ pub fn generate_dtb(
     b.prop_u32("#size-cells", 2);
     b.prop_null("ranges");
 
-    // CLINT
+    // CLINT — interrupts-extended lists [intc_phandle, 3(MSIP), intc_phandle, 7(MTIP)] per hart
     b.begin_node(&format!("clint@{:x}", memory::CLINT_BASE));
     b.prop_str("compatible", "riscv,clint0");
     b.prop_u32_array(
@@ -464,10 +479,17 @@ pub fn generate_dtb(
             memory::CLINT_SIZE as u32,
         ],
     );
-    b.prop_u32_array("interrupts-extended", &[1, 3, 1, 7]);
+    {
+        let mut clint_ext = Vec::with_capacity(num_harts * 4);
+        for hart in 0..num_harts {
+            let phandle = hart as u32 + 1;
+            clint_ext.extend_from_slice(&[phandle, 3, phandle, 7]); // MSIP=3, MTIP=7
+        }
+        b.prop_u32_array("interrupts-extended", &clint_ext);
+    }
     b.end_node();
 
-    // PLIC
+    // PLIC — interrupts-extended: [intc, 11(MEIP), intc, 9(SEIP)] per hart
     b.begin_node(&format!("plic@{:x}", memory::PLIC_BASE));
     b.prop_str("compatible", "riscv,plic0");
     b.prop_u32_array(
@@ -481,9 +503,16 @@ pub fn generate_dtb(
     );
     b.prop_u32("#interrupt-cells", 1);
     b.prop_null("interrupt-controller");
-    b.prop_u32_array("interrupts-extended", &[1, 11, 1, 9]);
+    {
+        let mut plic_ext = Vec::with_capacity(num_harts * 4);
+        for hart in 0..num_harts {
+            let phandle = hart as u32 + 1;
+            plic_ext.extend_from_slice(&[phandle, 11, phandle, 9]); // MEIP=11, SEIP=9
+        }
+        b.prop_u32_array("interrupts-extended", &plic_ext);
+    }
     b.prop_u32("riscv,ndev", 31);
-    b.prop_u32("phandle", 2);
+    b.prop_u32("phandle", plic_phandle);
     b.end_node();
 
     // UART
@@ -503,7 +532,7 @@ pub fn generate_dtb(
     b.prop_u32("reg-io-width", 1); // 8-bit I/O
     b.prop_u32("fifo-size", 16); // 16550A FIFO depth
     b.prop_u32_array("interrupts", &[10]);
-    b.prop_u32("interrupt-parent", 2);
+    b.prop_u32("interrupt-parent", plic_phandle);
     b.end_node();
 
     // VirtIO MMIO Block Device
@@ -520,7 +549,7 @@ pub fn generate_dtb(
             ],
         );
         b.prop_u32_array("interrupts", &[8]);
-        b.prop_u32("interrupt-parent", 2);
+        b.prop_u32("interrupt-parent", plic_phandle);
         b.end_node();
     }
 
@@ -537,7 +566,7 @@ pub fn generate_dtb(
         ],
     );
     b.prop_u32_array("interrupts", &[9]);
-    b.prop_u32("interrupt-parent", 2);
+    b.prop_u32("interrupt-parent", plic_phandle);
     b.end_node();
 
     // VirtIO MMIO RNG Device (provides entropy to guest)
@@ -553,7 +582,7 @@ pub fn generate_dtb(
         ],
     );
     b.prop_u32_array("interrupts", &[11]);
-    b.prop_u32("interrupt-parent", 2);
+    b.prop_u32("interrupt-parent", plic_phandle);
     b.end_node();
 
     // VirtIO MMIO Network Device
@@ -569,7 +598,7 @@ pub fn generate_dtb(
         ],
     );
     b.prop_u32_array("interrupts", &[12]);
-    b.prop_u32("interrupt-parent", 2);
+    b.prop_u32("interrupt-parent", plic_phandle);
     b.end_node();
 
     // Syscon (poweroff/reboot)
@@ -584,19 +613,19 @@ pub fn generate_dtb(
             memory::SYSCON_SIZE as u32,
         ],
     );
-    b.prop_u32("phandle", 3);
+    b.prop_u32("phandle", syscon_phandle);
     b.end_node();
 
     b.begin_node("poweroff");
     b.prop_str("compatible", "syscon-poweroff");
-    b.prop_u32("regmap", 3);
+    b.prop_u32("regmap", syscon_phandle);
     b.prop_u32("offset", 0);
     b.prop_u32("value", 0x5555);
     b.end_node();
 
     b.begin_node("reboot");
     b.prop_str("compatible", "syscon-reboot");
-    b.prop_u32("regmap", 3);
+    b.prop_u32("regmap", syscon_phandle);
     b.prop_u32("offset", 0);
     b.prop_u32("value", 0x7777);
     b.end_node();
@@ -614,7 +643,7 @@ pub fn generate_dtb(
         ],
     );
     b.prop_u32_array("interrupts", &[13]); // PLIC IRQ 13
-    b.prop_u32("interrupt-parent", 2);
+    b.prop_u32("interrupt-parent", plic_phandle);
     b.end_node();
 
     b.end_node(); // soc

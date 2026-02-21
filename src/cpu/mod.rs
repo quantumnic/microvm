@@ -28,8 +28,23 @@ impl PrivilegeMode {
     }
 }
 
+/// Hart state for SBI HSM
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HartState {
+    /// Hart is running
+    Started,
+    /// Hart is stopped (waiting for hart_start)
+    Stopped,
+    /// Hart is suspended (WFI-like, waiting for interrupt)
+    Suspended,
+    /// Hart start is pending (will begin execution next step)
+    StartPending,
+}
+
 /// RV64GC CPU core
 pub struct Cpu {
+    /// Hart ID
+    pub hart_id: u64,
     /// General-purpose registers x0-x31
     pub regs: [u64; 32],
     /// Floating-point registers f0-f31 (IEEE 754 double stored as u64 bits)
@@ -52,6 +67,8 @@ pub struct Cpu {
     pub last_trap: Option<(u64, bool)>,
     /// Last SBI call (eid, fid) for profiling
     pub last_sbi: Option<(u64, u64)>,
+    /// Hart state for SBI HSM
+    pub hart_state: HartState,
 }
 
 impl Default for Cpu {
@@ -63,6 +80,7 @@ impl Default for Cpu {
 impl Cpu {
     pub fn new() -> Self {
         Self {
+            hart_id: 0,
             regs: [0; 32],
             fregs: [0; 32],
             pc: 0,
@@ -74,7 +92,17 @@ impl Cpu {
             cycle: 0,
             last_trap: None,
             last_sbi: None,
+            hart_state: HartState::Started,
         }
+    }
+
+    /// Create a new CPU with a specific hart ID
+    pub fn with_hart_id(hart_id: u64) -> Self {
+        let mut cpu = Self::new();
+        cpu.hart_id = hart_id;
+        // Set mhartid CSR (use write_raw since it's read-only via write)
+        cpu.csrs.write_raw(csr::MHARTID, hart_id);
+        cpu
     }
 
     /// Reset CPU, set PC to reset vector
@@ -85,6 +113,8 @@ impl Cpu {
         self.mode = PrivilegeMode::Machine;
         self.wfi = false;
         self.cycle = 0;
+        // Restore mhartid after reset
+        self.csrs.write_raw(csr::MHARTID, self.hart_id);
     }
 
     /// Execute one instruction, returns whether to continue

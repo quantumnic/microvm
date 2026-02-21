@@ -1,16 +1,24 @@
+use crate::devices::clint::MAX_HARTS;
+
+/// Maximum PLIC contexts: 2 per hart (M-mode + S-mode)
+const MAX_CONTEXTS: usize = MAX_HARTS * 2;
+
 /// Platform-Level Interrupt Controller
 /// Simplified implementation supporting up to 64 interrupt sources
+/// and up to MAX_HARTS harts (2 contexts each: M-mode + S-mode)
 pub struct Plic {
     /// Priority for each source (0 = disabled)
     priority: [u32; 64],
     /// Pending bits
     pending: u64,
-    /// Enable bits (context 0 = M-mode, context 1 = S-mode)
-    enable: [u64; 2],
+    /// Enable bits per context (context 2*hart=M, 2*hart+1=S)
+    enable: [u64; MAX_CONTEXTS],
     /// Priority threshold per context
-    threshold: [u32; 2],
+    threshold: [u32; MAX_CONTEXTS],
     /// Claimed interrupt per context
-    claimed: [u32; 2],
+    claimed: [u32; MAX_CONTEXTS],
+    /// Number of harts
+    num_harts: usize,
 }
 
 impl Default for Plic {
@@ -24,10 +32,18 @@ impl Plic {
         Self {
             priority: [0; 64],
             pending: 0,
-            enable: [0; 2],
-            threshold: [0; 2],
-            claimed: [0; 2],
+            enable: [0; MAX_CONTEXTS],
+            threshold: [0; MAX_CONTEXTS],
+            claimed: [0; MAX_CONTEXTS],
+            num_harts: 1,
         }
+    }
+
+    /// Create PLIC for multiple harts
+    pub fn with_harts(num_harts: usize) -> Self {
+        let mut plic = Self::new();
+        plic.num_harts = num_harts.min(MAX_HARTS);
+        plic
     }
 
     /// Signal an external interrupt
@@ -39,7 +55,7 @@ impl Plic {
 
     /// Check if there's a pending interrupt for given context
     pub fn has_interrupt(&self, context: usize) -> bool {
-        if context >= 2 {
+        if context >= self.num_harts * 2 {
             return false;
         }
         let enabled_pending = self.pending & self.enable[context];
@@ -53,7 +69,7 @@ impl Plic {
 
     pub fn read(&mut self, offset: u64) -> u64 {
         match offset {
-            // Priority registers: 0x000000 - 0x000FFF
+            // Priority registers: 0x000000 - 0x0000FF
             0x000000..=0x0000FF => {
                 let src = (offset / 4) as usize;
                 if src < 64 {
@@ -62,21 +78,39 @@ impl Plic {
                     0
                 }
             }
-            // Pending bits
+            // Pending bits: 0x001000
             0x001000 => self.pending & 0xFFFFFFFF,
             0x001004 => self.pending >> 32,
-            // Enable bits context 0 (M-mode hart 0)
-            0x002000 => self.enable[0] & 0xFFFFFFFF,
-            0x002004 => self.enable[0] >> 32,
-            // Enable bits context 1 (S-mode hart 0)
-            0x002080 => self.enable[1] & 0xFFFFFFFF,
-            0x002084 => self.enable[1] >> 32,
-            // Threshold & claim context 0
-            0x200000 => self.threshold[0] as u64,
-            0x200004 => self.claim(0) as u64,
-            // Threshold & claim context 1
-            0x201000 => self.threshold[1] as u64,
-            0x201004 => self.claim(1) as u64,
+            // Enable bits: 0x002000 + context * 0x80
+            0x002000..=0x002FFF => {
+                let ctx_offset = offset - 0x002000;
+                let context = (ctx_offset / 0x80) as usize;
+                let reg_off = ctx_offset % 0x80;
+                if context < self.num_harts * 2 {
+                    match reg_off {
+                        0 => self.enable[context] & 0xFFFFFFFF,
+                        4 => self.enable[context] >> 32,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                }
+            }
+            // Threshold & claim: 0x200000 + context * 0x1000
+            0x200000..=0x3FFFFF => {
+                let ctx_offset = offset - 0x200000;
+                let context = (ctx_offset / 0x1000) as usize;
+                let reg_off = ctx_offset % 0x1000;
+                if context < self.num_harts * 2 {
+                    match reg_off {
+                        0 => self.threshold[context] as u64,
+                        4 => self.claim(context) as u64,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                }
+            }
             _ => 0,
         }
     }
@@ -111,22 +145,17 @@ impl Plic {
         }
     }
 
-    /// Save PLIC state for snapshot
+    /// Save PLIC state for snapshot (saves first 2 contexts for backward compat)
     pub fn save_state(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 * 4 + 8 + 16 + 8 + 8);
-        // priorities
         for &p in &self.priority {
             out.extend_from_slice(&p.to_le_bytes());
         }
-        // pending
         out.extend_from_slice(&self.pending.to_le_bytes());
-        // enable
         out.extend_from_slice(&self.enable[0].to_le_bytes());
         out.extend_from_slice(&self.enable[1].to_le_bytes());
-        // threshold
         out.extend_from_slice(&self.threshold[0].to_le_bytes());
         out.extend_from_slice(&self.threshold[1].to_le_bytes());
-        // claimed
         out.extend_from_slice(&self.claimed[0].to_le_bytes());
         out.extend_from_slice(&self.claimed[1].to_le_bytes());
         out
@@ -172,25 +201,44 @@ impl Plic {
 
     pub fn write(&mut self, offset: u64, val: u64) {
         match offset {
+            // Priority registers
             0x000000..=0x0000FF => {
                 let src = (offset / 4) as usize;
                 if src < 64 {
                     self.priority[src] = val as u32;
                 }
             }
-            0x002000 => self.enable[0] = (self.enable[0] & !0xFFFFFFFF) | (val & 0xFFFFFFFF),
-            0x002004 => self.enable[0] = (self.enable[0] & 0xFFFFFFFF) | ((val & 0xFFFFFFFF) << 32),
-            0x002080 => self.enable[1] = (self.enable[1] & !0xFFFFFFFF) | (val & 0xFFFFFFFF),
-            0x002084 => self.enable[1] = (self.enable[1] & 0xFFFFFFFF) | ((val & 0xFFFFFFFF) << 32),
-            0x200000 => self.threshold[0] = val as u32,
-            0x200004 => {
-                // Complete context 0
-                self.complete(0, val as u32);
+            // Enable bits: 0x002000 + context * 0x80
+            0x002000..=0x002FFF => {
+                let ctx_offset = offset - 0x002000;
+                let context = (ctx_offset / 0x80) as usize;
+                let reg_off = ctx_offset % 0x80;
+                if context < self.num_harts * 2 {
+                    match reg_off {
+                        0 => {
+                            self.enable[context] =
+                                (self.enable[context] & !0xFFFFFFFF) | (val & 0xFFFFFFFF)
+                        }
+                        4 => {
+                            self.enable[context] =
+                                (self.enable[context] & 0xFFFFFFFF) | ((val & 0xFFFFFFFF) << 32)
+                        }
+                        _ => {}
+                    }
+                }
             }
-            0x201000 => self.threshold[1] = val as u32,
-            0x201004 => {
-                // Complete context 1
-                self.complete(1, val as u32);
+            // Threshold & claim/complete: 0x200000 + context * 0x1000
+            0x200000..=0x3FFFFF => {
+                let ctx_offset = offset - 0x200000;
+                let context = (ctx_offset / 0x1000) as usize;
+                let reg_off = ctx_offset % 0x1000;
+                if context < self.num_harts * 2 {
+                    match reg_off {
+                        0 => self.threshold[context] = val as u32,
+                        4 => self.complete(context, val as u32),
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }

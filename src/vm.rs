@@ -26,10 +26,11 @@ pub struct VmConfig {
     pub save_snapshot: Option<PathBuf>,
     pub load_snapshot: Option<PathBuf>,
     pub profile: bool,
+    pub num_harts: usize,
 }
 
 pub struct Vm {
-    cpu: Cpu,
+    cpus: Vec<Cpu>,
     bus: Bus,
     config: VmConfig,
 }
@@ -37,13 +38,27 @@ pub struct Vm {
 impl Vm {
     pub fn new(config: VmConfig) -> Self {
         let ram_bytes = config.ram_size_mib * 1024 * 1024;
-        let bus = Bus::new(ram_bytes);
-        let cpu = Cpu::new();
-        Self { cpu, bus, config }
+        let num_harts = config.num_harts.clamp(1, 8);
+        let mut bus = Bus::new(ram_bytes);
+        bus.clint = crate::devices::clint::Clint::with_harts(num_harts);
+        bus.plic = crate::devices::plic::Plic::with_harts(num_harts);
+        bus.num_harts = num_harts;
+
+        let mut cpus = Vec::with_capacity(num_harts);
+        for i in 0..num_harts {
+            let mut cpu = Cpu::with_hart_id(i as u64);
+            if i > 0 {
+                // Secondary harts start in Stopped state (SBI HSM)
+                cpu.hart_state = crate::cpu::HartState::Stopped;
+            }
+            cpus.push(cpu);
+        }
+        Self { cpus, bus, config }
     }
 
     pub fn run(&mut self) {
         let ram_bytes = self.config.ram_size_mib * 1024 * 1024;
+        let num_harts = self.cpus.len();
 
         // Load kernel (auto-detects ELF, RISC-V Image, or raw binary)
         let kernel_data = std::fs::read(&self.config.kernel_path).unwrap_or_else(|e| {
@@ -85,10 +100,9 @@ impl Vm {
                 eprintln!("Failed to read initrd: {}", e);
                 std::process::exit(1);
             });
-            // Place initrd near end of RAM, page-aligned, leaving room for DTB after it
             let initrd_size = initrd_data.len() as u64;
-            let initrd_end_region = DRAM_BASE + ram_bytes - 0x200000; // Leave 2 MiB for DTB
-            let initrd_start = (initrd_end_region - initrd_size) & !0xFFF; // Page-align
+            let initrd_end_region = DRAM_BASE + ram_bytes - 0x200000;
+            let initrd_start = (initrd_end_region - initrd_size) & !0xFFF;
             self.bus.load_binary(&initrd_data, initrd_start - DRAM_BASE);
             log::info!(
                 "Loaded initrd: {} ({} bytes) at {:#x}-{:#x}",
@@ -102,15 +116,15 @@ impl Vm {
             None
         };
 
-        // Generate and load DTB
+        // Generate and load DTB (SMP-aware)
         let has_disk = self.config.disk_path.is_some();
-        let dtb_data = dtb::generate_dtb(
+        let dtb_data = dtb::generate_dtb_smp(
             ram_bytes,
             &self.config.kernel_cmdline,
             has_disk,
             initrd_info,
+            num_harts,
         );
-        // Place DTB at end of RAM (aligned)
         let dtb_addr = DRAM_BASE + ram_bytes - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
         let dtb_offset = dtb_addr - DRAM_BASE;
         self.bus.load_binary(&dtb_data, dtb_offset);
@@ -121,8 +135,11 @@ impl Vm {
         let boot_code = BootRom::generate(kernel_entry, dtb_addr);
         self.bus.load_binary(&boot_code, 0);
 
-        // Reset CPU — start at DRAM_BASE (boot ROM)
-        self.cpu.reset(DRAM_BASE);
+        // Reset hart 0 — start at DRAM_BASE (boot ROM)
+        self.cpus[0].reset(DRAM_BASE);
+        self.cpus[0].hart_state = crate::cpu::HartState::Started;
+
+        // Secondary harts stay stopped (will be started via SBI HSM hart_start)
 
         // Set up terminal for raw mode
         let _raw_guard = setup_terminal();
@@ -130,7 +147,7 @@ impl Vm {
         let trace = self.config.trace;
         let max_insns = self.config.max_insns;
 
-        // Set up GDB server if requested
+        // Set up GDB server if requested (attached to hart 0)
         let mut gdb: Option<GdbServer> = if let Some(port) = self.config.gdb_port {
             match GdbServer::new(port) {
                 Ok(mut server) => {
@@ -138,8 +155,7 @@ impl Vm {
                         eprintln!("GDB client connection failed: {}", e);
                         None
                     } else {
-                        // Initial halt — wait for GDB commands before running
-                        match server.report_stop(&mut self.cpu, &mut self.bus, 5) {
+                        match server.report_stop(&mut self.cpus[0], &mut self.bus, 5) {
                             GdbAction::Continue | GdbAction::Step => {}
                             GdbAction::Disconnect => {
                                 log::info!("GDB disconnected before start");
@@ -158,40 +174,42 @@ impl Vm {
             None
         };
 
-        // Load snapshot if provided (restores CPU, CSRs, RAM, devices)
+        // Load snapshot if provided (restores hart 0 CPU, CSRs, RAM, devices)
         if let Some(ref snap_path) = self.config.load_snapshot {
-            if let Err(e) = snapshot::load_snapshot(snap_path, &mut self.cpu, &mut self.bus) {
+            if let Err(e) = snapshot::load_snapshot(snap_path, &mut self.cpus[0], &mut self.bus) {
                 eprintln!("Failed to load snapshot: {}", e);
                 std::process::exit(1);
             }
         }
 
-        log::info!("Starting emulation... (Ctrl-A h for monitor help)");
+        log::info!(
+            "Starting emulation ({} hart{})... (Ctrl-A h for monitor help)",
+            num_harts,
+            if num_harts > 1 { "s" } else { "" }
+        );
 
-        // Wall-clock timeout support
         let start_time = std::time::Instant::now();
         let timeout = self.config.timeout_secs.map(std::time::Duration::from_secs);
 
-        // Execution profiler
         let mut profiler = if self.config.profile {
             Some(Profile::new())
         } else {
             None
         };
 
-        // Interactive debug monitor
         let mut monitor = Monitor::new();
 
-        // Main execution loop
+        // Main execution loop — round-robin across harts
         let mut insn_count: u64 = 0;
-        loop {
+        'outer: loop {
             if let Some(max) = max_insns {
                 if insn_count >= max {
                     log::info!("Reached max instruction count ({})", max);
                     break;
                 }
             }
-            // Check wall-clock timeout (every 65536 instructions to avoid syscall overhead)
+
+            // Check wall-clock timeout (every 65536 instructions)
             if insn_count & 0xFFFF == 0 {
                 if let Some(dur) = timeout {
                     if start_time.elapsed() >= dur {
@@ -200,177 +218,225 @@ impl Vm {
                     }
                 }
             }
-            // Update mtime in CSR file for TIME CSR reads
-            self.cpu.csrs.mtime = self.bus.clint.mtime();
 
-            // Update timer interrupt — STIP (bit 5)
-            // STIP should be set if EITHER the CLINT timer has fired (SBI legacy path)
-            // OR the Sstc stimecmp has fired. Both sources contribute independently.
-            let clint_timer = self.bus.clint.timer_interrupt();
-            let sstc_timer = self.cpu.csrs.stimecmp_pending();
-            let mip = self.cpu.csrs.read(csr::MIP);
-            if clint_timer || sstc_timer {
-                self.cpu.csrs.write(csr::MIP, mip | (1 << 5)); // Set STIP
-            } else {
-                self.cpu.csrs.write(csr::MIP, mip & !(1 << 5)); // Clear STIP
-            }
-
-            // Update software interrupt
-            if self.bus.clint.software_interrupt() {
-                let mip = self.cpu.csrs.read(csr::MIP);
-                self.cpu.csrs.write(csr::MIP, mip | (1 << 3)); // MSIP
-            } else {
-                let mip = self.cpu.csrs.read(csr::MIP);
-                self.cpu.csrs.write(csr::MIP, mip & !(1 << 3));
-            }
-
-            // Update UART interrupt
+            // Update device interrupts (shared across all harts)
             if self.bus.uart.has_interrupt() {
-                self.bus.plic.set_pending(10); // UART IRQ = 10
+                self.bus.plic.set_pending(10);
             }
-
-            // Update VirtIO block interrupt
             if self.bus.virtio_blk.has_interrupt() {
-                self.bus.plic.set_pending(8); // VirtIO blk IRQ = 8
+                self.bus.plic.set_pending(8);
             }
-
-            // Update VirtIO console interrupt
             if self.bus.virtio_console.has_interrupt() {
-                self.bus.plic.set_pending(9); // VirtIO console IRQ = 9
+                self.bus.plic.set_pending(9);
             }
-
-            // Update VirtIO RNG interrupt
             if self.bus.virtio_rng.has_interrupt() {
-                self.bus.plic.set_pending(11); // VirtIO RNG IRQ = 11
+                self.bus.plic.set_pending(11);
             }
-
-            // Update VirtIO net interrupt
             if self.bus.virtio_net.has_interrupt() {
-                self.bus.plic.set_pending(12); // VirtIO net IRQ = 12
+                self.bus.plic.set_pending(12);
             }
-
-            // Update Goldfish RTC alarm interrupt
             self.bus.rtc.tick();
             if self.bus.rtc.has_interrupt() {
-                self.bus.plic.set_pending(13); // RTC IRQ = 13
+                self.bus.plic.set_pending(13);
             }
 
-            // External interrupts via PLIC → SEIP
-            if self.bus.plic.has_interrupt(1) {
-                let mip = self.cpu.csrs.read(csr::MIP);
-                self.cpu.csrs.write(csr::MIP, mip | (1 << 9)); // SEIP
-            } else {
-                let mip = self.cpu.csrs.read(csr::MIP);
-                self.cpu.csrs.write(csr::MIP, mip & !(1 << 9));
-            }
+            // Step each hart
+            for hart_id in 0..num_harts {
+                use crate::cpu::HartState;
 
-            if trace {
-                // Fetch and disassemble current instruction for trace
-                let trace_pc = self.cpu.pc;
-                let phys_pc = self
-                    .cpu
-                    .mmu
-                    .translate(
-                        trace_pc,
-                        crate::cpu::mmu::AccessType::Execute,
-                        self.cpu.mode,
-                        &self.cpu.csrs,
-                        &mut self.bus,
-                    )
-                    .unwrap_or(trace_pc);
-                let raw16 = self.bus.read16(phys_pc);
-                let (inst_raw, is_compressed) = if raw16 & 0x03 != 0x03 {
-                    let expanded = crate::cpu::decode::expand_compressed(raw16 as u32);
-                    (expanded, true)
+                let cpu = &mut self.cpus[hart_id];
+
+                // Handle StartPending: begin execution at the configured address
+                if cpu.hart_state == HartState::StartPending {
+                    cpu.hart_state = HartState::Started;
+                    log::info!("Hart {} started at PC={:#x}", hart_id, cpu.pc);
+                }
+
+                // Only step Started harts
+                if cpu.hart_state != HartState::Started {
+                    continue;
+                }
+
+                // Update mtime in CSR file
+                cpu.csrs.mtime = self.bus.clint.mtime();
+
+                // Timer interrupt — STIP (bit 5)
+                let clint_timer = self.bus.clint.timer_interrupt_hart(hart_id);
+                let sstc_timer = cpu.csrs.stimecmp_pending();
+                let mip = cpu.csrs.read(csr::MIP);
+                if clint_timer || sstc_timer {
+                    cpu.csrs.write(csr::MIP, mip | (1 << 5));
                 } else {
-                    (self.bus.read32(phys_pc), false)
-                };
-                let disasm = crate::cpu::disasm::disassemble(inst_raw, trace_pc);
-                let mode_ch = match self.cpu.mode {
-                    crate::cpu::PrivilegeMode::Machine => 'M',
-                    crate::cpu::PrivilegeMode::Supervisor => 'S',
-                    crate::cpu::PrivilegeMode::User => 'U',
-                };
-                if is_compressed {
-                    eprintln!(
-                        "[{:>10}] {:#010x} ({:04x})     {}: {}",
-                        insn_count, trace_pc, raw16, mode_ch, disasm
-                    );
+                    cpu.csrs.write(csr::MIP, mip & !(1 << 5));
+                }
+
+                // Software interrupt — MSIP (bit 3)
+                if self.bus.clint.software_interrupt_hart(hart_id) {
+                    let mip = cpu.csrs.read(csr::MIP);
+                    cpu.csrs.write(csr::MIP, mip | (1 << 3));
                 } else {
-                    eprintln!(
-                        "[{:>10}] {:#010x} {:08x}  {}: {}",
-                        insn_count, trace_pc, inst_raw, mode_ch, disasm
-                    );
+                    let mip = cpu.csrs.read(csr::MIP);
+                    cpu.csrs.write(csr::MIP, mip & !(1 << 3));
                 }
-            }
 
-            // Profile: record instruction before execution
-            let mut prof_opcode: u8 = 0;
-            if let Some(ref mut prof) = profiler {
-                let prof_pc = self.cpu.pc;
-                let phys = self
-                    .cpu
-                    .mmu
-                    .translate(
-                        prof_pc,
-                        crate::cpu::mmu::AccessType::Execute,
-                        self.cpu.mode,
-                        &self.cpu.csrs,
-                        &mut self.bus,
-                    )
-                    .unwrap_or(prof_pc);
-                let raw16 = self.bus.read16(phys);
-                let inst = if raw16 & 0x03 != 0x03 {
-                    crate::cpu::decode::expand_compressed(raw16 as u32)
+                // External interrupts via PLIC → SEIP (S-mode context = 2*hart+1)
+                let s_context = hart_id * 2 + 1;
+                if self.bus.plic.has_interrupt(s_context) {
+                    let mip = cpu.csrs.read(csr::MIP);
+                    cpu.csrs.write(csr::MIP, mip | (1 << 9));
                 } else {
-                    self.bus.read32(phys)
+                    let mip = cpu.csrs.read(csr::MIP);
+                    cpu.csrs.write(csr::MIP, mip & !(1 << 9));
+                }
+
+                if trace && hart_id == 0 {
+                    let trace_pc = cpu.pc;
+                    let phys_pc = cpu
+                        .mmu
+                        .translate(
+                            trace_pc,
+                            crate::cpu::mmu::AccessType::Execute,
+                            cpu.mode,
+                            &cpu.csrs,
+                            &mut self.bus,
+                        )
+                        .unwrap_or(trace_pc);
+                    let raw16 = self.bus.read16(phys_pc);
+                    let (inst_raw, is_compressed) = if raw16 & 0x03 != 0x03 {
+                        (crate::cpu::decode::expand_compressed(raw16 as u32), true)
+                    } else {
+                        (self.bus.read32(phys_pc), false)
+                    };
+                    let disasm = crate::cpu::disasm::disassemble(inst_raw, trace_pc);
+                    let mode_ch = match cpu.mode {
+                        crate::cpu::PrivilegeMode::Machine => 'M',
+                        crate::cpu::PrivilegeMode::Supervisor => 'S',
+                        crate::cpu::PrivilegeMode::User => 'U',
+                    };
+                    if is_compressed {
+                        eprintln!(
+                            "[{:>10}] {:#010x} ({:04x})     {}: {}",
+                            insn_count, trace_pc, raw16, mode_ch, disasm
+                        );
+                    } else {
+                        eprintln!(
+                            "[{:>10}] {:#010x} {:08x}  {}: {}",
+                            insn_count, trace_pc, inst_raw, mode_ch, disasm
+                        );
+                    }
+                }
+
+                // Profile: record instruction before execution (hart 0 only)
+                let mut prof_opcode: u8 = 0;
+                if hart_id == 0 {
+                    if let Some(ref mut prof) = profiler {
+                        let prof_pc = cpu.pc;
+                        let phys = cpu
+                            .mmu
+                            .translate(
+                                prof_pc,
+                                crate::cpu::mmu::AccessType::Execute,
+                                cpu.mode,
+                                &cpu.csrs,
+                                &mut self.bus,
+                            )
+                            .unwrap_or(prof_pc);
+                        let raw16 = self.bus.read16(phys);
+                        let inst = if raw16 & 0x03 != 0x03 {
+                            crate::cpu::decode::expand_compressed(raw16 as u32)
+                        } else {
+                            self.bus.read32(phys)
+                        };
+                        let mode = cpu.mode as u8;
+                        let mn = crate::cpu::disasm::mnemonic(inst);
+                        prof.record_insn(prof_pc, mn, mode);
+
+                        prof_opcode = (inst & 0x7F) as u8;
+                        match prof_opcode {
+                            0x03 | 0x07 => prof.record_load(),
+                            0x23 | 0x27 => prof.record_store(),
+                            _ => {}
+                        }
+                    }
+                }
+
+                let pre_step_pc = if profiler.is_some() && hart_id == 0 {
+                    cpu.pc
+                } else {
+                    0
                 };
-                let mode = self.cpu.mode as u8;
-                let mn = crate::cpu::disasm::mnemonic(inst);
-                prof.record_insn(prof_pc, mn, mode);
 
-                prof_opcode = (inst & 0x7F) as u8;
-                match prof_opcode {
-                    0x03 | 0x07 => prof.record_load(),  // LOAD, FP LOAD
-                    0x23 | 0x27 => prof.record_store(), // STORE, FP STORE
-                    _ => {}
+                if !cpu.step(&mut self.bus) {
+                    if let Some(ref mut gdb_server) = gdb {
+                        gdb_server.report_stop(&mut self.cpus[0], &mut self.bus, 5);
+                    }
+                    break 'outer;
+                }
+
+                insn_count += 1;
+
+                // Profile: post-step (hart 0 only)
+                if hart_id == 0 {
+                    if let Some(ref mut prof) = profiler {
+                        if prof_opcode == 0x63 {
+                            let diff = cpu.pc.wrapping_sub(pre_step_pc);
+                            prof.record_branch(diff != 4 && diff != 2);
+                        }
+                        if let Some((cause, is_int)) = cpu.last_trap.take() {
+                            prof.record_trap(cause, is_int);
+                        }
+                        if let Some((eid, fid)) = cpu.last_sbi.take() {
+                            prof.record_sbi(eid, fid);
+                        }
+                    }
                 }
             }
 
-            // Save PC before step for branch profiling
-            let pre_step_pc = if profiler.is_some() { self.cpu.pc } else { 0 };
-
-            if !self.cpu.step(&mut self.bus) {
-                // Report termination to GDB if connected
-                if let Some(ref mut gdb_server) = gdb {
-                    gdb_server.report_stop(&mut self.cpu, &mut self.bus, 5);
-                }
-                break;
-            }
-
-            insn_count += 1;
-
-            // Profile: post-step recording
-            if let Some(ref mut prof) = profiler {
-                // Branch taken/not-taken
-                if prof_opcode == 0x63 {
-                    let diff = self.cpu.pc.wrapping_sub(pre_step_pc);
-                    prof.record_branch(diff != 4 && diff != 2);
-                }
-                // Traps
-                if let Some((cause, is_int)) = self.cpu.last_trap.take() {
-                    prof.record_trap(cause, is_int);
-                }
-                // SBI calls
-                if let Some((eid, fid)) = self.cpu.last_sbi.take() {
-                    prof.record_sbi(eid, fid);
+            // Process hart start requests from SBI HSM
+            while let Some(req) = self.bus.hart_start_queue.pop() {
+                if req.hart_id < num_harts {
+                    let target = &mut self.cpus[req.hart_id];
+                    if target.hart_state == crate::cpu::HartState::Stopped {
+                        target.reset(req.start_addr);
+                        target.mode = crate::cpu::PrivilegeMode::Supervisor;
+                        target.regs[10] = req.hart_id as u64; // a0 = hart_id
+                        target.regs[11] = req.opaque; // a1 = opaque
+                        target.hart_state = crate::cpu::HartState::StartPending;
+                        log::info!(
+                            "Hart {} queued for start at {:#x} (opaque={:#x})",
+                            req.hart_id,
+                            req.start_addr,
+                            req.opaque
+                        );
+                    }
                 }
             }
 
-            // GDB: check for breakpoints and single-step
+            // Handle IPI: CLINT MSIP sets SSIP for S-mode software interrupts
+            // Linux uses SBI send_ipi which writes CLINT msip, and expects SSIP
+            for hart_id in 0..num_harts {
+                if self.bus.clint.msip[hart_id] & 1 != 0 {
+                    let cpu = &mut self.cpus[hart_id];
+                    // Set SSIP (bit 1) — S-mode software interrupt pending
+                    let mip = cpu.csrs.read(csr::MIP);
+                    cpu.csrs.write(csr::MIP, mip | (1 << 1));
+                    // Wake from WFI if suspended
+                    if cpu.hart_state == crate::cpu::HartState::Suspended {
+                        cpu.hart_state = crate::cpu::HartState::Started;
+                        cpu.wfi = false;
+                    }
+                } else {
+                    // Clear SSIP when MSIP is cleared
+                    let cpu = &mut self.cpus[hart_id];
+                    let mip = cpu.csrs.read(csr::MIP);
+                    cpu.csrs.write(csr::MIP, mip & !(1 << 1));
+                }
+            }
+
+            // GDB: check for breakpoints (hart 0)
             if let Some(ref mut gdb_server) = gdb {
-                if gdb_server.should_halt(self.cpu.pc) {
-                    match gdb_server.report_stop(&mut self.cpu, &mut self.bus, 5) {
+                if gdb_server.should_halt(self.cpus[0].pc) {
+                    match gdb_server.report_stop(&mut self.cpus[0], &mut self.bus, 5) {
                         GdbAction::Continue | GdbAction::Step => {}
                         GdbAction::Disconnect => {
                             log::info!("GDB disconnected");
@@ -395,36 +461,28 @@ impl Vm {
 
             // Periodic tasks (every 1024 instructions)
             if insn_count & 0x3FF == 0 {
-                poll_stdin_monitor(&mut self.bus, &self.cpu, &mut monitor);
+                poll_stdin_monitor(&mut self.bus, &self.cpus[0], &mut monitor);
 
-                // Check if monitor requested quit
                 if monitor.quit_requested {
                     log::info!("Monitor quit after {} instructions", insn_count);
                     break;
                 }
 
-                // Process VirtIO block queue
                 if self.bus.virtio_blk.needs_processing() {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_blk.process_queue(ram, dram_base);
                 }
-
-                // Process VirtIO console queues
                 if self.bus.virtio_console.needs_processing() {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_console.process_queues(ram, dram_base);
                 }
-
-                // Process VirtIO RNG queue
                 if self.bus.virtio_rng.needs_processing() {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_rng.process_queue(ram, dram_base);
                 }
-
-                // Process VirtIO net queues
                 if self.bus.virtio_net.needs_processing() {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
@@ -433,14 +491,13 @@ impl Vm {
             }
         }
 
-        // Save snapshot if requested
+        // Save snapshot (hart 0)
         if let Some(ref snap_path) = self.config.save_snapshot {
-            if let Err(e) = snapshot::save_snapshot(snap_path, &self.cpu, &mut self.bus) {
+            if let Err(e) = snapshot::save_snapshot(snap_path, &self.cpus[0], &mut self.bus) {
                 eprintln!("Failed to save snapshot: {}", e);
             }
         }
 
-        // Print profile summary
         if let Some(ref prof) = profiler {
             prof.print_summary();
         }

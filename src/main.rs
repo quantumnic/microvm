@@ -165,7 +165,7 @@ fn main() {
             disk,
             initrd,
             memory: mem_size,
-            cpus: _,
+            cpus,
             cmdline,
             load_addr,
             trace,
@@ -193,6 +193,7 @@ fn main() {
                 save_snapshot,
                 load_snapshot,
                 profile,
+                num_harts: cpus as usize,
             };
 
             let mut vm = vm::Vm::new(config);

@@ -121,7 +121,7 @@ fn op_branch(cpu: &mut Cpu, inst: &Instruction, len: u64) {
 fn op_misc_mem(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
     match inst.funct3 {
         0 | 1 => {
-            // FENCE (funct3=0) and FENCE.I (funct3=1) — NOPs in single-hart emulator
+            // FENCE (funct3=0) and FENCE.I (funct3=1) — memory ordering
         }
         2 => {
             // Zicbom / Zicboz: CBO instructions
@@ -903,7 +903,7 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
         // Legacy SBI extensions (deprecated but Linux still uses them early)
         0x00 => {
             // sbi_set_timer (legacy)
-            bus.clint.mtimecmp = a0;
+            bus.clint.mtimecmp[cpu.hart_id as usize] = a0;
             // Clear STIP when timer is set
             let mip = cpu.csrs.read(csr::MIP);
             cpu.csrs.write(csr::MIP, mip & !(1 << 5));
@@ -1004,7 +1004,7 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             match fid {
                 0 => {
                     // sbi_set_timer
-                    bus.clint.mtimecmp = a0;
+                    bus.clint.mtimecmp[cpu.hart_id as usize] = a0;
                     let mip = cpu.csrs.read(csr::MIP);
                     cpu.csrs.write(csr::MIP, mip & !(1 << 5)); // Clear STIP
                     cpu.regs[10] = 0;
@@ -1022,10 +1022,28 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             // sPI (IPI) extension
             match fid {
                 0 => {
-                    // sbi_send_ipi
-                    // Single-hart system, send IPI to self
-                    let mip = cpu.csrs.read(csr::MIP);
-                    cpu.csrs.write(csr::MIP, mip | (1 << 1)); // Set SSIP
+                    // sbi_send_ipi(hart_mask, hart_mask_base)
+                    let hart_mask = cpu.regs[10];
+                    let hart_mask_base = cpu.regs[11];
+                    let base = if hart_mask_base == u64::MAX {
+                        0usize
+                    } else {
+                        hart_mask_base as usize
+                    };
+                    // Set SSIP for each targeted hart via CLINT MSIP
+                    // (CLINT MSIP triggers MSIP, but for SBI IPI we set SSIP directly
+                    //  via the software interrupt pending bit in each hart's MIP)
+                    // In our architecture, we write to CLINT msip[hart] which the
+                    // VM loop translates to MSIP. For S-mode IPIs, we also set SSIP.
+                    for bit in 0..64u64 {
+                        if hart_mask & (1 << bit) != 0 {
+                            let target = base + bit as usize;
+                            if target < bus.num_harts {
+                                // Set SSIP for target hart via CLINT msip
+                                bus.clint.msip[target] = 1;
+                            }
+                        }
+                    }
                     cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true
@@ -1041,26 +1059,54 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             // HSM (Hart State Management) extension
             match fid {
                 0 => {
-                    // hart_start — single hart, already started
-                    cpu.regs[10] = (-1i64) as u64; // SBI_ERR_ALREADY_AVAILABLE
+                    // hart_start(hart_id, start_addr, opaque)
+                    let target_hart = cpu.regs[10] as usize;
+                    let start_addr = cpu.regs[11];
+                    let opaque = cpu.regs[12];
+                    if target_hart >= bus.num_harts {
+                        cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
+                    } else {
+                        // Queue the start request — VM loop will handle it
+                        bus.hart_start_queue.push(crate::memory::HartStartRequest {
+                            hart_id: target_hart,
+                            start_addr,
+                            opaque,
+                        });
+                        cpu.regs[10] = 0; // SBI_SUCCESS
+                    }
                     cpu.regs[11] = 0;
                     true
                 }
                 1 => {
-                    // hart_stop — single hart, cannot stop
-                    cpu.regs[10] = 0; // SBI_SUCCESS (pretend we stopped)
+                    // hart_stop — stop the calling hart
+                    cpu.hart_state = crate::cpu::HartState::Stopped;
+                    cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true
                 }
                 2 => {
-                    // hart_get_status
-                    cpu.regs[10] = 0; // success
-                    cpu.regs[11] = 0; // STARTED
+                    // hart_get_status(hart_id)
+                    let target_hart = cpu.regs[10] as usize;
+                    if target_hart >= bus.num_harts {
+                        cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
+                    } else if target_hart == cpu.hart_id as usize {
+                        // Asking about ourselves — we're running
+                        cpu.regs[10] = 0; // SBI_SUCCESS
+                        cpu.regs[11] = 0; // STARTED
+                    } else {
+                        // For other harts, we can't see their state from here.
+                        // Return STARTED if they have pending start, STOPPED otherwise.
+                        // The VM loop will set the actual state.
+                        // For now, report STOPPED — the VM loop handles accuracy.
+                        cpu.regs[10] = 0; // SBI_SUCCESS
+                        cpu.regs[11] = 1; // STOPPED (best guess; VM loop corrects)
+                    }
                     true
                 }
                 3 => {
                     // hart_suspend
-                    cpu.wfi = true; // Act like WFI
+                    cpu.hart_state = crate::cpu::HartState::Suspended;
+                    cpu.wfi = true;
                     cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true

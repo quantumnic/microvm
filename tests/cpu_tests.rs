@@ -568,7 +568,7 @@ fn test_sbi_set_timer() {
     let ecall = 0x00000073u32;
     bus.load_binary(&ecall.to_le_bytes(), 0);
     cpu.step(&mut bus);
-    assert_eq!(bus.clint.mtimecmp, 999999999);
+    assert_eq!(bus.clint.mtimecmp[0], 999999999);
     // STIP should be cleared
     assert_eq!(cpu.csrs.read(csr::MIP) & (1 << 5), 0);
 }
@@ -597,12 +597,14 @@ fn test_sbi_ipi() {
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
     cpu.regs[17] = 0x735049; // sPI extension
     cpu.regs[16] = 0; // send_ipi
+    cpu.regs[10] = 1; // hart_mask: bit 0 = hart 0
+    cpu.regs[11] = 0; // hart_mask_base
     let ecall = 0x00000073u32;
     bus.load_binary(&ecall.to_le_bytes(), 0);
     cpu.step(&mut bus);
     assert_eq!(cpu.regs[10], 0); // success
-                                 // SSIP should be set
-    assert_ne!(cpu.csrs.read(csr::MIP) & (1 << 1), 0);
+                                 // CLINT MSIP should be set for hart 0 (VM loop translates to SSIP)
+    assert_eq!(bus.clint.msip[0], 1);
 }
 
 #[test]
@@ -4976,4 +4978,245 @@ fn test_dtb_has_rtc_interrupts() {
     // RTC node should reference interrupt-parent
     assert!(dtb_str.contains("goldfish-rtc"));
     assert!(dtb_str.contains("interrupt-parent"));
+}
+
+// =============================================================================
+// SMP (Multi-Hart) Tests
+// =============================================================================
+
+#[test]
+fn test_cpu_hart_id() {
+    let cpu0 = Cpu::with_hart_id(0);
+    let cpu1 = Cpu::with_hart_id(1);
+    let cpu3 = Cpu::with_hart_id(3);
+    assert_eq!(cpu0.hart_id, 0);
+    assert_eq!(cpu1.hart_id, 1);
+    assert_eq!(cpu3.hart_id, 3);
+    assert_eq!(cpu0.csrs.read(csr::MHARTID), 0);
+    assert_eq!(cpu1.csrs.read(csr::MHARTID), 1);
+    assert_eq!(cpu3.csrs.read(csr::MHARTID), 3);
+}
+
+#[test]
+fn test_cpu_hart_id_survives_reset() {
+    let mut cpu = Cpu::with_hart_id(5);
+    cpu.reset(0x80000000);
+    assert_eq!(cpu.hart_id, 5);
+    assert_eq!(cpu.csrs.read(csr::MHARTID), 5);
+}
+
+#[test]
+fn test_cpu_hart_state_default() {
+    let cpu = Cpu::new();
+    assert_eq!(cpu.hart_state, microvm::cpu::HartState::Started);
+}
+
+#[test]
+fn test_clint_multi_hart() {
+    use microvm::devices::clint::Clint;
+    let mut clint = Clint::with_harts(4);
+    assert_eq!(clint.num_harts, 4);
+
+    // Set different mtimecmp per hart
+    clint.mtimecmp[0] = 100;
+    clint.mtimecmp[1] = 200;
+    clint.mtimecmp[2] = 300;
+    clint.mtimecmp[3] = u64::MAX;
+
+    // MMIO reads should return per-hart values
+    // Hart 0 mtimecmp at offset 0x4000
+    assert_eq!(clint.read(0x4000), 100);
+    // Hart 1 mtimecmp at offset 0x4008
+    assert_eq!(clint.read(0x4008), 200);
+    // Hart 2 mtimecmp at offset 0x4010
+    assert_eq!(clint.read(0x4010), 300);
+}
+
+#[test]
+fn test_clint_multi_hart_msip() {
+    use microvm::devices::clint::Clint;
+    let mut clint = Clint::with_harts(4);
+
+    // Write MSIP for hart 2 via MMIO (offset 0x0008 = hart 2)
+    clint.write(0x0008, 1);
+    assert!(clint.software_interrupt_hart(2));
+    assert!(!clint.software_interrupt_hart(0));
+    assert!(!clint.software_interrupt_hart(1));
+
+    // Clear it
+    clint.write(0x0008, 0);
+    assert!(!clint.software_interrupt_hart(2));
+}
+
+#[test]
+fn test_clint_multi_hart_mtimecmp_write() {
+    use microvm::devices::clint::Clint;
+    let mut clint = Clint::with_harts(2);
+
+    // Write hart 1 mtimecmp low word (offset 0x4008)
+    clint.write(0x4008, 0xDEADBEEF);
+    // Write hart 1 mtimecmp high word (offset 0x400C)
+    clint.write(0x400C, 0x12345678);
+    assert_eq!(clint.mtimecmp[1], 0x12345678_DEADBEEF);
+    // Hart 0 should be unchanged
+    assert_eq!(clint.mtimecmp[0], u64::MAX);
+}
+
+#[test]
+fn test_plic_multi_hart_contexts() {
+    use microvm::devices::plic::Plic;
+    let mut plic = Plic::with_harts(2);
+
+    // Set priority for IRQ 10
+    plic.write(0x000028, 1); // priority[10] = 1
+
+    // Enable IRQ 10 for S-mode context of hart 1 (context 3 = 2*1+1)
+    // Enable offset: 0x002000 + context * 0x80 = 0x002000 + 3*0x80 = 0x002180
+    plic.write(0x002180, 1 << 10);
+
+    // Set pending
+    plic.set_pending(10);
+
+    // Should have interrupt for context 3 (S-mode hart 1)
+    assert!(plic.has_interrupt(3));
+    // Should NOT have interrupt for context 1 (S-mode hart 0, not enabled)
+    assert!(!plic.has_interrupt(1));
+}
+
+#[test]
+fn test_plic_multi_hart_claim_complete() {
+    use microvm::devices::plic::Plic;
+    let mut plic = Plic::with_harts(2);
+
+    plic.write(0x000028, 1); // priority[10] = 1
+                             // Enable for S-mode hart 0 (context 1): 0x002080
+    plic.write(0x002080, 1 << 10);
+    plic.set_pending(10);
+
+    // Claim from context 1: threshold at 0x201000, claim at 0x201004
+    let claimed = plic.read(0x201004);
+    assert_eq!(claimed, 10);
+
+    // Complete
+    plic.write(0x201004, 10);
+    assert!(!plic.has_interrupt(1));
+}
+
+#[test]
+fn test_sbi_hsm_hart_start() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    bus.num_harts = 4;
+
+    // SBI HSM hart_start(hart_id=2, start_addr=0x80200000, opaque=42)
+    cpu.regs[17] = 0x48534D; // HSM
+    cpu.regs[16] = 0; // hart_start
+    cpu.regs[10] = 2; // target hart
+    cpu.regs[11] = 0x80200000; // start addr
+    cpu.regs[12] = 42; // opaque
+
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10], 0); // SBI_SUCCESS
+    assert_eq!(bus.hart_start_queue.len(), 1);
+    assert_eq!(bus.hart_start_queue[0].hart_id, 2);
+    assert_eq!(bus.hart_start_queue[0].start_addr, 0x80200000);
+    assert_eq!(bus.hart_start_queue[0].opaque, 42);
+}
+
+#[test]
+fn test_sbi_hsm_hart_start_invalid() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    bus.num_harts = 2;
+
+    // Try to start hart 5 (doesn't exist)
+    cpu.regs[17] = 0x48534D;
+    cpu.regs[16] = 0;
+    cpu.regs[10] = 5;
+    cpu.regs[11] = 0x80200000;
+
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, -3); // SBI_ERR_INVALID_PARAM
+    assert!(bus.hart_start_queue.is_empty());
+}
+
+#[test]
+fn test_sbi_hsm_hart_stop() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    cpu.regs[17] = 0x48534D; // HSM
+    cpu.regs[16] = 1; // hart_stop
+
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10], 0); // SBI_SUCCESS
+    assert_eq!(cpu.hart_state, microvm::cpu::HartState::Stopped);
+}
+
+#[test]
+fn test_sbi_ipi_multi_hart() {
+    let mut bus = Bus::new(64 * 1024);
+    bus.num_harts = 4;
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Send IPI to harts 1 and 3 (mask = 0b1010, base = 0)
+    cpu.regs[17] = 0x735049; // sPI
+    cpu.regs[16] = 0; // send_ipi
+    cpu.regs[10] = 0b1010; // hart_mask
+    cpu.regs[11] = 0; // hart_mask_base
+
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10], 0); // SBI_SUCCESS
+    assert_eq!(bus.clint.msip[0], 0); // hart 0 not targeted
+    assert_eq!(bus.clint.msip[1], 1); // hart 1 targeted
+    assert_eq!(bus.clint.msip[2], 0); // hart 2 not targeted
+    assert_eq!(bus.clint.msip[3], 1); // hart 3 targeted
+}
+
+#[test]
+fn test_dtb_smp() {
+    use microvm::dtb;
+    let dtb_data = dtb::generate_dtb_smp(128 * 1024 * 1024, "console=ttyS0", false, None, 4);
+    let dts = dtb::dtb_to_dts(&dtb_data);
+    // Should have 4 CPU nodes
+    assert!(dts.contains("cpu@0"));
+    assert!(dts.contains("cpu@1"));
+    assert!(dts.contains("cpu@2"));
+    assert!(dts.contains("cpu@3"));
+    // Each should have an interrupt controller
+    assert!(dts.matches("riscv,cpu-intc").count() >= 4);
+}
+
+#[test]
+fn test_dtb_smp_single_hart_compat() {
+    use microvm::dtb;
+    // Single-hart DTB via the original API should still work
+    let dtb_data = dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dts = dtb::dtb_to_dts(&dtb_data);
+    assert!(dts.contains("cpu@0"));
+    assert!(!dts.contains("cpu@1"));
 }
