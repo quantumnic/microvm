@@ -1065,9 +1065,9 @@ fn test_dtb_contains_isa_extensions() {
 fn test_dtb_isa_string_includes_su() {
     let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
     assert!(
-        dtb.windows(b"rv64imafdcsu".len())
-            .any(|w| w == b"rv64imafdcsu"),
-        "DTB ISA string should be rv64imafdcsu"
+        dtb.windows(b"rv64imafdcvsu".len())
+            .any(|w| w == b"rv64imafdcvsu"),
+        "DTB ISA string should be rv64imafdcvsu"
     );
 }
 
@@ -5955,4 +5955,516 @@ fn test_dtb_advertises_zkn() {
     assert!(dts.contains("zknd"), "DTB should advertise zknd extension");
     assert!(dts.contains("zkne"), "DTB should advertise zkne extension");
     assert!(dts.contains("zknh"), "DTB should advertise zknh extension");
+}
+
+// ============== Vector Extension (V) Tests ==============
+
+/// Helper: encode vsetvli instruction
+/// vsetvli rd, rs1, vtypei
+/// Encoding: 0 | zimm[10:0] | rs1[4:0] | 111 | rd[4:0] | 1010111
+fn vsetvli(rd: u32, rs1: u32, zimm: u32) -> u32 {
+    ((zimm & 0x7FF) << 20) | ((rs1 & 0x1F) << 15) | (7 << 12) | ((rd & 0x1F) << 7) | 0x57
+}
+
+/// Helper: encode vsetivli instruction
+/// vsetivli rd, uimm, vtypei
+/// Encoding: 11 | zimm[9:0] | uimm[4:0] | 111 | rd[4:0] | 1010111
+fn vsetivli(rd: u32, uimm: u32, zimm: u32) -> u32 {
+    (3 << 30)
+        | ((zimm & 0x3FF) << 20)
+        | ((uimm & 0x1F) << 15)
+        | (7 << 12)
+        | ((rd & 0x1F) << 7)
+        | 0x57
+}
+
+/// Helper: encode OPIVV instruction (vector-vector)
+/// funct6 | vm | vs2 | vs1 | 000 | vd | 1010111
+fn opivv(funct6: u32, vd: u32, vs1: u32, vs2: u32, vm: u32) -> u32 {
+    ((funct6 & 0x3F) << 26)
+        | ((vm & 1) << 25)
+        | ((vs2 & 0x1F) << 20)
+        | ((vs1 & 0x1F) << 15)
+        | (0 << 12)
+        | ((vd & 0x1F) << 7)
+        | 0x57
+}
+
+/// Helper: encode OPIVI instruction (vector-immediate)
+/// funct6 | vm | vs2 | imm[4:0] | 011 | vd | 1010111
+fn opivi(funct6: u32, vd: u32, simm5: u32, vs2: u32, vm: u32) -> u32 {
+    ((funct6 & 0x3F) << 26)
+        | ((vm & 1) << 25)
+        | ((vs2 & 0x1F) << 20)
+        | ((simm5 & 0x1F) << 15)
+        | (3 << 12)
+        | ((vd & 0x1F) << 7)
+        | 0x57
+}
+
+/// Helper: encode OPIVX instruction (vector-scalar)
+/// funct6 | vm | vs2 | rs1 | 100 | vd | 1010111
+fn opivx(funct6: u32, vd: u32, rs1: u32, vs2: u32, vm: u32) -> u32 {
+    ((funct6 & 0x3F) << 26)
+        | ((vm & 1) << 25)
+        | ((vs2 & 0x1F) << 20)
+        | ((rs1 & 0x1F) << 15)
+        | (4 << 12)
+        | ((vd & 0x1F) << 7)
+        | 0x57
+}
+
+/// Helper: encode unit-stride vector load
+/// nf | 0 | mop=0 | vm | lumop | rs1 | width | vd | 0000111
+fn vle(eew: u32, vd: u32, rs1: u32, vm: u32) -> u32 {
+    let width = match eew {
+        8 => 0,
+        16 => 5,
+        32 => 6,
+        64 => 7,
+        _ => 0,
+    };
+    ((vm & 1) << 25) | ((rs1 & 0x1F) << 15) | (width << 12) | ((vd & 0x1F) << 7) | 0x07
+}
+
+/// Helper: encode unit-stride vector store
+fn vse(eew: u32, vs3: u32, rs1: u32, vm: u32) -> u32 {
+    let width = match eew {
+        8 => 0,
+        16 => 5,
+        32 => 6,
+        64 => 7,
+        _ => 0,
+    };
+    ((vm & 1) << 25) | ((rs1 & 0x1F) << 15) | (width << 12) | ((vs3 & 0x1F) << 7) | 0x27
+}
+
+/// Helper: ADDI rd, rs1, imm
+fn v_addi(rd: u32, rs1: u32, imm: u32) -> u32 {
+    ((imm & 0xFFF) << 20) | ((rs1 & 0x1F) << 15) | (0 << 12) | ((rd & 0x1F) << 7) | 0x13
+}
+
+/// Helper: encode OPMVX instruction (funct3=6)
+fn opmvx(funct6: u32, vd: u32, rs1: u32, vs2: u32, vm: u32) -> u32 {
+    ((funct6 & 0x3F) << 26)
+        | ((vm & 1) << 25)
+        | ((vs2 & 0x1F) << 20)
+        | ((rs1 & 0x1F) << 15)
+        | (6 << 12)
+        | ((vd & 0x1F) << 7)
+        | 0x57
+}
+
+/// Helper: encode OPMVV instruction (funct3=2)
+fn opmvv(funct6: u32, vd: u32, vs1: u32, vs2: u32, vm: u32) -> u32 {
+    ((funct6 & 0x3F) << 26)
+        | ((vm & 1) << 25)
+        | ((vs2 & 0x1F) << 20)
+        | ((vs1 & 0x1F) << 15)
+        | (2 << 12)
+        | ((vd & 0x1F) << 7)
+        | 0x57
+}
+
+#[test]
+fn test_vsetvli_sets_vl_and_vtype() {
+    // li x1, 8; vsetvli x2, x1, e32,m1
+    let (cpu, _) = run_program(
+        &[
+            v_addi(1, 0, 8),              // x1 = 8
+            vsetvli(2, 1, 0b0_0_010_000), // e32, m1 → VLMAX=4 (VLEN=128/SEW=32)
+        ],
+        2,
+    );
+    // AVL=8, VLMAX=4, so vl=4
+    assert_eq!(cpu.regs[2], 4, "vl should be min(AVL, VLMAX)");
+    assert_eq!(cpu.csrs.read(csr::VL), 4);
+    let vtype = cpu.csrs.read(csr::VTYPE);
+    assert_eq!(vtype >> 63, 0, "vill should not be set");
+}
+
+#[test]
+fn test_vsetivli_immediate_avl() {
+    // vsetivli x3, 3, e8,m1
+    let (cpu, _) = run_program(
+        &[vsetivli(3, 3, 0b0_0_000_000)], // e8, m1, AVL=3
+        1,
+    );
+    assert_eq!(cpu.regs[3], 3, "vl should be 3");
+    assert_eq!(cpu.csrs.read(csr::VL), 3);
+}
+
+#[test]
+fn test_vsetvli_vlmax_mode() {
+    // vsetvli x5, x0, e64,m1 → rs1=0, rd!=0, so vl=VLMAX
+    let (cpu, _) = run_program(
+        &[vsetvli(5, 0, 0b0_0_011_000)], // e64, m1
+        1,
+    );
+    // VLMAX = VLEN/64 * 1 = 128/64 = 2
+    assert_eq!(cpu.regs[5], 2, "vl should be VLMAX=2");
+}
+
+#[test]
+fn test_vsetvli_vill() {
+    // vsetvli x4, x0, e64,mf8 → SEW=64 with LMUL=1/8 is illegal
+    let (cpu, _) = run_program(
+        &[vsetvli(4, 0, 0b0_0_011_101)], // e64, mf8
+        1,
+    );
+    assert_eq!(cpu.csrs.read(csr::VTYPE) >> 63, 1, "vill should be set");
+    assert_eq!(cpu.csrs.read(csr::VL), 0);
+    assert_eq!(cpu.regs[4], 0);
+}
+
+#[test]
+fn test_vadd_vv() {
+    // Set up two vectors in memory, load them, add, store result
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    // Store test data at DRAM_BASE + 0x1000 (src1) and + 0x1010 (src2)
+    let src1_addr = DRAM_BASE + 0x1000;
+    let src2_addr = DRAM_BASE + 0x1010;
+    let dst_addr = DRAM_BASE + 0x1020;
+
+    // Write 4 x u32 elements: [1, 2, 3, 4] and [10, 20, 30, 40]
+    for (i, val) in [1u32, 2, 3, 4].iter().enumerate() {
+        bus.write32(src1_addr + i as u64 * 4, *val);
+    }
+    for (i, val) in [10u32, 20, 30, 40].iter().enumerate() {
+        bus.write32(src2_addr + i as u64 * 4, *val);
+    }
+
+    // Program:
+    // li x1, 4
+    // vsetvli x0, x1, e32,m1
+    // li x2, src1_addr
+    // li x3, src2_addr
+    // li x4, dst_addr
+    // vle32.v v1, (x2)    -- load src1 into v1
+    // vle32.v v2, (x3)    -- load src2 into v2
+    // vadd.vv v3, v2, v1  -- v3 = v2 + v1
+    // vse32.v v3, (x4)    -- store v3 to dst
+
+    let src1_off = 0x1000u32;
+    let src2_off = 0x1010u32;
+    let dst_off = 0x1020u32;
+
+    let prog = [
+        v_addi(1, 0, 4),              // x1 = 4
+        vsetvli(0, 1, 0b0_0_010_000), // vsetvli x0, x1, e32,m1
+        0x00010137 | ((src1_off >> 12) << 12), // lui x2, src1_off>>12 — won't work for 0x1000
+                                      // Actually, let me use addi from x0 approach — but 0x1000 > 12-bit imm.
+                                      // Use lui + addi
+    ];
+
+    // Simpler approach: put program at DRAM_BASE, use offsets relative to DRAM_BASE
+    // x5 = DRAM_BASE (we can load it via AUIPC)
+    // Actually, for testing, let's directly write registers and use small program
+
+    // Direct approach: set x2,x3,x4 via CPU regs before running
+    cpu.regs[10] = src1_addr;
+    cpu.regs[11] = src2_addr;
+    cpu.regs[12] = dst_addr;
+    cpu.regs[1] = 4;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // vsetvli x0, x1, e32,m1
+        vle(32, 1, 10, 1),            // vle32.v v1, (x10)
+        vle(32, 2, 11, 1),            // vle32.v v2, (x11)
+        opivv(0b000000, 3, 1, 2, 1),  // vadd.vv v3, v2, v1
+        vse(32, 3, 12, 1),            // vse32.v v3, (x12)
+    ];
+
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    // Check result: [11, 22, 33, 44]
+    assert_eq!(bus.read32(dst_addr), 11);
+    assert_eq!(bus.read32(dst_addr + 4), 22);
+    assert_eq!(bus.read32(dst_addr + 8), 33);
+    assert_eq!(bus.read32(dst_addr + 12), 44);
+}
+
+#[test]
+fn test_vadd_vi() {
+    // vadd.vi v2, v1, 5 — add immediate 5 to each element
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src_addr = DRAM_BASE + 0x1000;
+    let dst_addr = DRAM_BASE + 0x1010;
+    for (i, val) in [100u32, 200, 300, 400].iter().enumerate() {
+        bus.write32(src_addr + i as u64 * 4, *val);
+    }
+
+    cpu.regs[1] = 4;
+    cpu.regs[10] = src_addr;
+    cpu.regs[11] = dst_addr;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        vle(32, 1, 10, 1),            // vle32.v v1, (x10)
+        opivi(0b000000, 2, 5, 1, 1),  // vadd.vi v2, v1, 5
+        vse(32, 2, 11, 1),            // vse32.v v2, (x11)
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst_addr), 105);
+    assert_eq!(bus.read32(dst_addr + 4), 205);
+    assert_eq!(bus.read32(dst_addr + 8), 305);
+    assert_eq!(bus.read32(dst_addr + 12), 405);
+}
+
+#[test]
+fn test_vsub_vv() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    // Write directly to vector regs, then test vsub
+    cpu.regs[1] = 4;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1, vl=4
+        opivv(0b000010, 3, 1, 2, 1),  // vsub.vv v3, v2, v1
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    // Pre-load vector registers: v2=[50,60,70,80], v1=[10,20,30,40]
+    for (i, val) in [50u32, 60, 70, 80].iter().enumerate() {
+        cpu.vregs.write_elem(2, 32, i, *val as u64);
+    }
+    for (i, val) in [10u32, 20, 30, 40].iter().enumerate() {
+        cpu.vregs.write_elem(1, 32, i, *val as u64);
+    }
+
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+
+    // v3 = v2 - v1 = [40, 40, 40, 40]
+    assert_eq!(cpu.vregs.read_elem(3, 32, 0), 40);
+    assert_eq!(cpu.vregs.read_elem(3, 32, 1), 40);
+    assert_eq!(cpu.vregs.read_elem(3, 32, 2), 40);
+    assert_eq!(cpu.vregs.read_elem(3, 32, 3), 40);
+}
+
+#[test]
+fn test_vand_vor_vxor_vv() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    cpu.regs[1] = 2;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        opivv(0b001001, 3, 1, 2, 1),  // vand.vv v3, v2, v1
+        opivv(0b001010, 4, 1, 2, 1),  // vor.vv v4, v2, v1
+        opivv(0b001011, 5, 1, 2, 1),  // vxor.vv v5, v2, v1
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    cpu.vregs.write_elem(2, 32, 0, 0xFF00FF00);
+    cpu.vregs.write_elem(2, 32, 1, 0xAAAAAAAA);
+    cpu.vregs.write_elem(1, 32, 0, 0x0F0F0F0F);
+    cpu.vregs.write_elem(1, 32, 1, 0x55555555);
+
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(cpu.vregs.read_elem(3, 32, 0), 0x0F000F00); // AND
+    assert_eq!(cpu.vregs.read_elem(3, 32, 1), 0x00000000); // AND: AAAA & 5555 = 0
+    assert_eq!(cpu.vregs.read_elem(4, 32, 0), 0xFF0FFF0F); // OR
+    assert_eq!(cpu.vregs.read_elem(4, 32, 1), 0xFFFFFFFF); // OR
+    assert_eq!(cpu.vregs.read_elem(5, 32, 0), 0xF00FF00F); // XOR
+    assert_eq!(cpu.vregs.read_elem(5, 32, 1), 0xFFFFFFFF); // XOR
+}
+
+#[test]
+fn test_vmseq_vv() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    cpu.regs[1] = 4;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        opivv(0b011000, 3, 1, 2, 1),  // vmseq.vv v3, v2, v1
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    // v2=[10,20,30,40], v1=[10,99,30,99]
+    cpu.vregs.write_elem(2, 32, 0, 10);
+    cpu.vregs.write_elem(2, 32, 1, 20);
+    cpu.vregs.write_elem(2, 32, 2, 30);
+    cpu.vregs.write_elem(2, 32, 3, 40);
+    cpu.vregs.write_elem(1, 32, 0, 10);
+    cpu.vregs.write_elem(1, 32, 1, 99);
+    cpu.vregs.write_elem(1, 32, 2, 30);
+    cpu.vregs.write_elem(1, 32, 3, 99);
+
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+
+    // v3 mask: bit 0=1 (eq), bit 1=0, bit 2=1 (eq), bit 3=0 → 0b0101 = 5
+    assert_eq!(cpu.vregs.data[3][0] & 0xF, 0b0101);
+}
+
+#[test]
+fn test_vmv_s_x() {
+    // vmv.s.x v5, x7 — move scalar to v5[0]
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    cpu.regs[1] = 4;
+    cpu.regs[7] = 0xDEADBEEF;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        opmvx(0b010000, 5, 7, 0, 1),  // vmv.s.x v5, x7
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(cpu.vregs.read_elem(5, 32, 0), 0xDEADBEEF);
+}
+
+#[test]
+fn test_vredsum() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    cpu.regs[1] = 4;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        opmvv(0b000000, 3, 1, 2, 1),  // vredsum.vs v3, v2, v1
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    // v1[0] = 100 (initial accumulator), v2 = [1, 2, 3, 4]
+    cpu.vregs.write_elem(1, 32, 0, 100);
+    cpu.vregs.write_elem(2, 32, 0, 1);
+    cpu.vregs.write_elem(2, 32, 1, 2);
+    cpu.vregs.write_elem(2, 32, 2, 3);
+    cpu.vregs.write_elem(2, 32, 3, 4);
+
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+
+    // result: 100 + 1 + 2 + 3 + 4 = 110
+    assert_eq!(cpu.vregs.read_elem(3, 32, 0), 110);
+}
+
+#[test]
+fn test_vle_vse_e8() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src_addr = DRAM_BASE + 0x1000;
+    let dst_addr = DRAM_BASE + 0x1100;
+
+    // Write 16 bytes
+    for i in 0..16u8 {
+        bus.write8(src_addr + i as u64, i * 10);
+    }
+
+    cpu.regs[1] = 16;
+    cpu.regs[10] = src_addr;
+    cpu.regs[11] = dst_addr;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_000_000), // e8,m1
+        vle(8, 1, 10, 1),             // vle8.v v1, (x10)
+        vse(8, 1, 11, 1),             // vse8.v v1, (x11)
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    for _ in 0..3 {
+        cpu.step(&mut bus);
+    }
+
+    for i in 0..16u8 {
+        assert_eq!(bus.read8(dst_addr + i as u64), i * 10);
+    }
+}
+
+#[test]
+fn test_misa_has_v_bit() {
+    let csrs = csr::CsrFile::new();
+    let misa = csrs.read(csr::MISA);
+    assert!(misa & (1 << 21) != 0, "MISA should have V bit set");
+}
+
+#[test]
+fn test_vlenb_csr() {
+    let csrs = csr::CsrFile::new();
+    assert_eq!(csrs.read(csr::VLENB), 16, "VLENB should be 16 (128/8)");
+}
+
+#[test]
+fn test_vs_dirty_after_vector_op() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    cpu.regs[1] = 4;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        opivv(0b000000, 3, 1, 2, 1),  // vadd.vv
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+
+    for _ in 0..2 {
+        cpu.step(&mut bus);
+    }
+
+    let mstatus = cpu.csrs.read(csr::MSTATUS);
+    let vs = (mstatus >> 9) & 3;
+    assert_eq!(vs, 3, "VS should be Dirty after vector arithmetic");
+}
+
+#[test]
+fn test_dtb_advertises_v() {
+    use microvm::dtb;
+    let dtb_data = dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    let dts = dtb::dtb_to_dts(&dtb_data);
+    assert!(dts.contains("\"v\""), "DTB should advertise v extension");
+    assert!(dts.contains("zvl128b"), "DTB should advertise zvl128b");
+    assert!(dts.contains("zve64d"), "DTB should advertise zve64d");
 }

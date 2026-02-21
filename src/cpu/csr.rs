@@ -71,6 +71,15 @@ pub const MCONFIGPTR: u16 = 0xF15;
 // Sstc extension — supervisor timer compare
 pub const STIMECMP: u16 = 0x14D;
 
+// Vector extension CSRs
+pub const VSTART: u16 = 0x008;
+pub const VXSAT: u16 = 0x009;
+pub const VXRM: u16 = 0x00A;
+pub const VCSR: u16 = 0x00F;
+pub const VL: u16 = 0xC20;
+pub const VTYPE: u16 = 0xC21;
+pub const VLENB: u16 = 0xC22;
+
 // MSTATUS bit masks
 pub const MSTATUS_SIE: u64 = 1 << 1;
 #[allow(dead_code)]
@@ -86,9 +95,14 @@ pub const MSTATUS_MXR: u64 = 1 << 19;
 #[allow(dead_code)]
 pub const MSTATUS_FS: u64 = 3 << 13; // Floating-point status field
 
+// VS (Vector Status) field in mstatus
+#[allow(dead_code)]
+pub const MSTATUS_VS: u64 = 3 << 9;
+
 // SSTATUS mask — bits visible to S-mode
 const SSTATUS_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR
     | MSTATUS_FS  // FP status (F/D extensions present)
+    | MSTATUS_VS  // Vector status (V extension present)
     | (3 << 32)   // UXL
     | (1 << 63); // SD
 
@@ -136,7 +150,7 @@ impl CsrFile {
             pmpaddr: [0; 16],
             mtime: 0,
         };
-        // MISA: RV64IMAFDCSU (G = IMAFD + Zicsr + Zifencei)
+        // MISA: RV64IMAFDCVSU (G = IMAFD + Zicsr + Zifencei, V = Vector)
         let misa = (2u64 << 62)  // MXL = 64-bit
             | (1 << 0)   // A - Atomic
             | (1 << 2)   // C - Compressed
@@ -145,17 +159,22 @@ impl CsrFile {
             | (1 << 8)   // I - Integer
             | (1 << 12)  // M - Multiply/Divide
             | (1 << 18)  // S - Supervisor mode
-            | (1 << 20); // U - User mode
+            | (1 << 20)  // U - User mode
+            | (1 << 21); // V - Vector
         csrs.regs[MISA as usize] = misa;
         csrs.regs[MHARTID as usize] = 0;
-        // MSTATUS: set UXL=2 (64-bit), SXL=2 (64-bit), FS=1 (Initial)
-        let mstatus = (2u64 << 32) | (2u64 << 34) | (1u64 << 13); // UXL | SXL | FS=Initial
+        // MSTATUS: set UXL=2 (64-bit), SXL=2 (64-bit), FS=1 (Initial), VS=1 (Initial)
+        let mstatus = (2u64 << 32) | (2u64 << 34) | (1u64 << 13) | (1u64 << 9); // UXL | SXL | FS=Initial | VS=Initial
         csrs.regs[MSTATUS as usize] = mstatus;
         // Enable Sstc extension: MENVCFG.STCE (bit 63)
         // Enable Svadu: MENVCFG.ADUE (bit 61) — hardware A/D bit updates
         csrs.regs[MENVCFG as usize] = (1u64 << 63) | (1u64 << 61);
         // stimecmp defaults to max (no interrupt)
         csrs.regs[STIMECMP as usize] = u64::MAX;
+        // Vector extension: VLENB = VLEN/8
+        csrs.regs[VLENB as usize] = super::vector::VLENB as u64;
+        // vtype starts as vill (no configuration set yet)
+        csrs.regs[VTYPE as usize] = 1u64 << 63;
         csrs
     }
 
@@ -241,6 +260,14 @@ impl CsrFile {
             0x323..=0x33F => 0,
             // User HPM counters (hpmcounter3-31) — shadows, all zero
             0xC03..=0xC1F => 0,
+            // Vector CSRs
+            VSTART => self.regs[VSTART as usize],
+            VXSAT => self.regs[VXSAT as usize] & 1,
+            VXRM => self.regs[VXRM as usize] & 3,
+            VCSR => (self.regs[VXRM as usize] & 3) << 1 | (self.regs[VXSAT as usize] & 1),
+            VL => self.regs[VL as usize],
+            VTYPE => self.regs[VTYPE as usize],
+            VLENB => self.regs[VLENB as usize],
             _ => self.regs[addr as usize],
         }
     }
@@ -380,9 +407,10 @@ impl CsrFile {
                 let old = self.regs[MSTATUS as usize];
                 let readonly_mask = (3u64 << 32) | (3u64 << 34); // SXL | UXL
                 let mut new_val = (val & !readonly_mask) | (old & readonly_mask);
-                // SD (bit 63) is read-only: set when FS=3 (Dirty)
+                // SD (bit 63) is read-only: set when FS=3 or VS=3 (Dirty)
                 let fs = (new_val >> 13) & 3;
-                if fs == 3 {
+                let vs = (new_val >> 9) & 3;
+                if fs == 3 || vs == 3 {
                     new_val |= 1u64 << 63;
                 } else {
                     new_val &= !(1u64 << 63);
@@ -410,7 +438,16 @@ impl CsrFile {
             }
             // HPM counters and event selectors — writable but no effect
             0xB03..=0xB1F | 0x323..=0x33F => {}
-            MENVCFGH => {} // RV64: writes ignored
+            // Vector CSRs
+            VSTART => self.regs[VSTART as usize] = val,
+            VXSAT => self.regs[VXSAT as usize] = val & 1,
+            VXRM => self.regs[VXRM as usize] = val & 3,
+            VCSR => {
+                self.regs[VXSAT as usize] = val & 1;
+                self.regs[VXRM as usize] = (val >> 1) & 3;
+            }
+            VL | VTYPE | VLENB => {} // read-only from CSR instructions
+            MENVCFGH => {}           // RV64: writes ignored
             SATP => {
                 // Accept mode 0 (Bare), 8 (Sv39), 9 (Sv48), 10 (Sv57); ignore unsupported modes
                 let mode = val >> 60;

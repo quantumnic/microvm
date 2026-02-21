@@ -855,8 +855,24 @@ pub fn mnemonic(inst: u32) -> &'static str {
             4 => "mop",
             _ => "csr?",
         },
-        0x07 => "fload",
-        0x27 => "fstore",
+        0x07 => {
+            // Could be FP load or vector load
+            match funct3 {
+                0 | 5 | 6 | 7 => "vload",
+                _ => "fload",
+            }
+        }
+        0x27 => match funct3 {
+            0 | 5 | 6 | 7 => "vstore",
+            _ => "fstore",
+        },
+        0x57 => {
+            if funct3 == 7 {
+                "vsetcfg"
+            } else {
+                "valu"
+            }
+        }
         0x43 | 0x47 | 0x4B | 0x4F => "fmadd",
         0x53 => "fpu",
         _ => "unknown",

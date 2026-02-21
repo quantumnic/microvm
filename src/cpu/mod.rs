@@ -4,10 +4,12 @@ pub mod disasm;
 pub mod execute;
 pub mod fpu;
 pub mod mmu;
+pub mod vector;
 
 use crate::memory::Bus;
 use csr::CsrFile;
 use mmu::Mmu;
+use vector::VectorRegFile;
 
 /// RISC-V privilege modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,8 @@ pub struct Cpu {
     pub last_sbi: Option<(u64, u64)>,
     /// Hart state for SBI HSM
     pub hart_state: HartState,
+    /// Vector register file (V extension)
+    pub vregs: VectorRegFile,
 }
 
 impl Default for Cpu {
@@ -93,6 +97,7 @@ impl Cpu {
             last_trap: None,
             last_sbi: None,
             hart_state: HartState::Started,
+            vregs: VectorRegFile::new(),
         }
     }
 
@@ -113,6 +118,7 @@ impl Cpu {
         self.mode = PrivilegeMode::Machine;
         self.wfi = false;
         self.cycle = 0;
+        self.vregs = VectorRegFile::new();
         // Restore mhartid after reset
         self.csrs.write_raw(csr::MHARTID, self.hart_id);
     }

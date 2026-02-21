@@ -257,12 +257,34 @@ fn clmulr(a: u64, b: u64) -> u64 {
     result
 }
 
+/// Check if a load/store instruction (opcode 0x07/0x27) is a vector load/store.
+/// Vector loads use width encodings: 0 (8-bit), 5 (16-bit), 6 (32-bit), 7 (64-bit)
+/// with mew=0. FP loads use width 2 (FLW) and 3 (FLD).
+fn is_vector_loadstore(raw: u32) -> bool {
+    let width = (raw >> 12) & 0x7;
+    let mew = (raw >> 28) & 1;
+    // Vector: width 0,5,6,7 with mew=0
+    mew == 0 && matches!(width, 0 | 5 | 6 | 7)
+}
+
 /// Execute a decoded instruction. Returns true to continue, false to halt.
 pub fn execute(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> bool {
     let inst = Instruction::decode(raw);
 
-    // Check for floating-point opcodes first
     let opcode = inst.opcode;
+
+    // Check for vector opcodes (V extension)
+    if opcode == 0x57 || ((opcode == 0x07 || opcode == 0x27) && is_vector_loadstore(raw)) {
+        if !super::vector::vector_enabled(cpu) {
+            cpu.handle_exception(2, raw as u64, bus);
+            return true;
+        }
+        if super::vector::execute_vector(cpu, bus, raw, inst_len) {
+            return true;
+        }
+    }
+
+    // Check for floating-point opcodes first
     if matches!(opcode, 0x07 | 0x27 | 0x43 | 0x47 | 0x4B | 0x4F | 0x53) {
         // FP load/store/compute — check FS != Off
         if !cpu.csrs.fp_enabled() {
