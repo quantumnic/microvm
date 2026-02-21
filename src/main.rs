@@ -24,6 +24,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect a VM snapshot file (show CPU state, CSRs, memory info)
+    Inspect {
+        /// Path to snapshot file
+        #[arg(short, long)]
+        snapshot: PathBuf,
+
+        /// Show all general-purpose registers (not just non-zero)
+        #[arg(long)]
+        all_regs: bool,
+
+        /// Show floating-point registers
+        #[arg(long)]
+        fpregs: bool,
+
+        /// Show all CSR values (verbose)
+        #[arg(long)]
+        csrs: bool,
+
+        /// Disassemble N instructions at current PC
+        #[arg(long)]
+        disasm: Option<u64>,
+    },
+
     /// Dump the generated Device Tree in DTS (source) format
     Dts {
         /// RAM size in MiB (default: 128)
@@ -108,6 +131,15 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Inspect {
+            snapshot: snap_path,
+            all_regs,
+            fpregs,
+            csrs,
+            disasm,
+        } => {
+            snapshot::inspect_snapshot(&snap_path, all_regs, fpregs, csrs, disasm);
+        }
         Commands::Dts {
             memory: mem_size,
             disk,

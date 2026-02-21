@@ -12,7 +12,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"MVSN0001";
+pub const MAGIC: &[u8; 8] = b"MVSN0001";
 
 /// Snapshot writer — collects state into a byte buffer
 struct SnapshotWriter {
@@ -365,6 +365,404 @@ fn decompress_ram(compressed: &[u8], expected_size: usize) -> io::Result<Vec<u8>
     Ok(out)
 }
 
+/// ABI register names for RISC-V
+const REG_NAMES: [&str; 32] = [
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
+    "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
+    "t5", "t6",
+];
+
+const FREG_NAMES: [&str; 32] = [
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2",
+    "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
+    "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+];
+
+/// Named CSRs worth displaying
+const NAMED_CSRS: &[(u16, &str)] = &[
+    (0x300, "mstatus"),
+    (0x301, "misa"),
+    (0x302, "medeleg"),
+    (0x303, "mideleg"),
+    (0x304, "mie"),
+    (0x305, "mtvec"),
+    (0x306, "mcounteren"),
+    (0x320, "mcountinhibit"),
+    (0x340, "mscratch"),
+    (0x341, "mepc"),
+    (0x342, "mcause"),
+    (0x343, "mtval"),
+    (0x344, "mip"),
+    (0x30A, "menvcfg"),
+    (0x3A0, "pmpcfg0"),
+    (0x3A2, "pmpcfg2"),
+    (0xF11, "mvendorid"),
+    (0xF12, "marchid"),
+    (0xF13, "mimpid"),
+    (0xF14, "mhartid"),
+    (0x100, "sstatus"),
+    (0x104, "sie"),
+    (0x105, "stvec"),
+    (0x106, "scounteren"),
+    (0x140, "sscratch"),
+    (0x141, "sepc"),
+    (0x142, "scause"),
+    (0x143, "stval"),
+    (0x144, "sip"),
+    (0x180, "satp"),
+    (0x10A, "senvcfg"),
+    (0x14D, "stimecmp"),
+    (0xB00, "mcycle"),
+    (0xB02, "minstret"),
+];
+
+/// Inspect a snapshot file and print human-readable state.
+pub fn inspect_snapshot(
+    path: &Path,
+    all_regs: bool,
+    show_fpregs: bool,
+    show_all_csrs: bool,
+    disasm_count: Option<u64>,
+) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to read snapshot: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut r = SnapshotReader::new(&data);
+
+    // Magic
+    let mut magic = [0u8; 8];
+    if r.read_exact(&mut magic).is_err() || &magic != MAGIC {
+        eprintln!(
+            "Invalid snapshot file (bad magic: {:?})",
+            std::str::from_utf8(&magic).unwrap_or("???")
+        );
+        std::process::exit(1);
+    }
+
+    // CPU registers
+    let mut regs = [0u64; 32];
+    for reg in &mut regs {
+        *reg = r.read_u64().unwrap();
+    }
+    let mut fregs = [0u64; 32];
+    for freg in &mut fregs {
+        *freg = r.read_u64().unwrap();
+    }
+    let pc = r.read_u64().unwrap();
+    let cycle = r.read_u64().unwrap();
+    let mode_byte = r.read_u8().unwrap();
+    let wfi = r.read_u8().unwrap() != 0;
+    let has_reservation = r.read_u8().unwrap();
+    let reservation = if has_reservation != 0 {
+        Some(r.read_u64().unwrap())
+    } else {
+        None
+    };
+
+    // CSR file
+    let mut csr_values = [0u64; 4096];
+    for val in &mut csr_values {
+        *val = r.read_u64().unwrap();
+    }
+    let mut pmpcfg = [0u64; 4];
+    for cfg in &mut pmpcfg {
+        *cfg = r.read_u64().unwrap();
+    }
+    let mut pmpaddr = [0u64; 16];
+    for addr in &mut pmpaddr {
+        *addr = r.read_u64().unwrap();
+    }
+    let mtime = r.read_u64().unwrap();
+
+    // CLINT
+    let clint_mtime = r.read_u64().unwrap();
+    let clint_mtimecmp = r.read_u64().unwrap();
+    let clint_msip = r.read_u32().unwrap();
+
+    // PLIC
+    let plic_data = r.read_bytes().unwrap();
+
+    // UART
+    let uart_data = r.read_bytes().unwrap();
+
+    // RAM
+    let ram_size = r.read_u64().unwrap() as usize;
+    let compressed = r.read_bytes().unwrap();
+
+    let mode_name = match mode_byte {
+        0 => "User",
+        1 => "Supervisor",
+        3 => "Machine",
+        _ => "Unknown",
+    };
+
+    // File info
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!(
+        "║  microvm snapshot: {}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!();
+    println!(
+        "  File size:    {:.1} KiB ({} bytes)",
+        data.len() as f64 / 1024.0,
+        data.len()
+    );
+    println!(
+        "  RAM:          {} MiB (compressed: {:.1} KiB, ratio: {:.1}x)",
+        ram_size / 1024 / 1024,
+        compressed.len() as f64 / 1024.0,
+        ram_size as f64 / compressed.len().max(1) as f64,
+    );
+    println!();
+
+    // CPU state
+    println!("── CPU ──────────────────────────────────────────────────");
+    println!("  PC:           {:#018x}", pc);
+    println!("  Mode:         {} ({})", mode_name, mode_byte);
+    println!("  Cycle:        {} ({:.1}M)", cycle, cycle as f64 / 1e6);
+    println!("  WFI:          {}", wfi);
+    if let Some(addr) = reservation {
+        println!("  LR/SC rsv:    {:#018x}", addr);
+    }
+    println!();
+
+    // General-purpose registers
+    println!("── Registers ───────────────────────────────────────────");
+    for i in 0..32 {
+        if all_regs || regs[i] != 0 {
+            println!(
+                "  x{:<2} ({:<4}) = {:#018x}  ({})",
+                i, REG_NAMES[i], regs[i], regs[i] as i64
+            );
+        }
+    }
+    println!();
+
+    // Floating-point registers
+    if show_fpregs {
+        println!("── FP Registers ────────────────────────────────────────");
+        for i in 0..32 {
+            if all_regs || fregs[i] != 0 {
+                let f = f64::from_bits(fregs[i]);
+                println!(
+                    "  f{:<2} ({:<5}) = {:#018x}  ({})",
+                    i, FREG_NAMES[i], fregs[i], f
+                );
+            }
+        }
+        println!();
+    }
+
+    // CSRs
+    println!("── Key CSRs ────────────────────────────────────────────");
+    for &(addr, name) in NAMED_CSRS {
+        let val = csr_values[addr as usize];
+        if val != 0 || show_all_csrs {
+            println!("  {:<16} ({:#05x}) = {:#018x}", name, addr, val);
+        }
+    }
+
+    // SATP decoding
+    let satp = csr_values[0x180];
+    if satp != 0 {
+        let satp_mode = satp >> 60;
+        let asid = (satp >> 44) & 0xFFFF;
+        let ppn = satp & ((1u64 << 44) - 1);
+        let mode_str = match satp_mode {
+            0 => "Bare",
+            8 => "Sv39",
+            9 => "Sv48",
+            10 => "Sv57",
+            _ => "Unknown",
+        };
+        println!(
+            "    → {} (ASID={}, PPN={:#x}, root={:#x})",
+            mode_str,
+            asid,
+            ppn,
+            ppn << 12
+        );
+    }
+
+    // mstatus decoding
+    let mstatus = csr_values[0x300];
+    if mstatus != 0 {
+        let sie = (mstatus >> 1) & 1;
+        let mie = (mstatus >> 3) & 1;
+        let spie = (mstatus >> 5) & 1;
+        let mpie = (mstatus >> 7) & 1;
+        let spp = (mstatus >> 8) & 1;
+        let mpp = (mstatus >> 11) & 3;
+        let fs = (mstatus >> 13) & 3;
+        let sum = (mstatus >> 18) & 1;
+        let mxr = (mstatus >> 19) & 1;
+        let fs_str = match fs {
+            0 => "Off",
+            1 => "Initial",
+            2 => "Clean",
+            3 => "Dirty",
+            _ => "?",
+        };
+        println!(
+            "    → SIE={} MIE={} SPIE={} MPIE={} SPP={} MPP={} FS={} ({}) SUM={} MXR={}",
+            sie, mie, spie, mpie, spp, mpp, fs, fs_str, sum, mxr
+        );
+    }
+
+    if show_all_csrs {
+        println!();
+        println!("── All Non-Zero CSRs ───────────────────────────────────");
+        for addr in 0..4096u16 {
+            let val = csr_values[addr as usize];
+            if val != 0 {
+                // Skip already-shown named CSRs
+                if NAMED_CSRS.iter().any(|&(a, _)| a == addr) {
+                    continue;
+                }
+                println!("  CSR {:#05x} = {:#018x}", addr, val);
+            }
+        }
+    }
+    println!();
+
+    // PMP
+    let any_pmp = pmpcfg.iter().any(|&v| v != 0) || pmpaddr.iter().any(|&v| v != 0);
+    if any_pmp {
+        println!("── PMP ─────────────────────────────────────────────────");
+        for (i, &addr_val) in pmpaddr.iter().enumerate() {
+            let cfg_reg = i / 8;
+            let cfg_byte = (pmpcfg[cfg_reg] >> ((i % 8) * 8)) as u8;
+            let a_field = (cfg_byte >> 3) & 3;
+            if a_field != 0 || addr_val != 0 {
+                let locked = if cfg_byte & 0x80 != 0 { "L" } else { " " };
+                let r = if cfg_byte & 0x01 != 0 { "R" } else { "-" };
+                let w = if cfg_byte & 0x02 != 0 { "W" } else { "-" };
+                let x = if cfg_byte & 0x04 != 0 { "X" } else { "-" };
+                let a_str = match a_field {
+                    0 => "OFF  ",
+                    1 => "TOR  ",
+                    2 => "NA4  ",
+                    3 => "NAPOT",
+                    _ => "?    ",
+                };
+                println!(
+                    "  pmp{:<2}: {} {}{}{} {} addr={:#018x}",
+                    i, a_str, r, w, x, locked, addr_val
+                );
+            }
+        }
+        println!();
+    }
+
+    // Devices
+    println!("── Devices ─────────────────────────────────────────────");
+    println!(
+        "  CLINT: mtime={} mtimecmp={} msip={}",
+        clint_mtime, clint_mtimecmp, clint_msip
+    );
+    let timer_pending = clint_mtime >= clint_mtimecmp;
+    println!(
+        "    → timer {}",
+        if timer_pending { "PENDING" } else { "idle" }
+    );
+    println!("  PLIC:  {} bytes state", plic_data.len());
+    println!("  UART:  {} bytes state", uart_data.len());
+    println!();
+
+    // RAM analysis
+    println!("── RAM Analysis ────────────────────────────────────────");
+    let decompressed = decompress_ram(&compressed, ram_size).unwrap();
+    let page_size = 4096usize;
+    let total_pages = ram_size / page_size;
+    let zero_pages = decompressed
+        .chunks(page_size)
+        .filter(|p| p.iter().all(|&b| b == 0))
+        .count();
+    let used_pages = total_pages - zero_pages;
+    println!(
+        "  Total:    {} pages ({} MiB)",
+        total_pages,
+        ram_size / 1024 / 1024
+    );
+    println!(
+        "  Used:     {} pages ({:.1} MiB, {:.1}%)",
+        used_pages,
+        used_pages as f64 * 4.0 / 1024.0,
+        used_pages as f64 / total_pages as f64 * 100.0
+    );
+    println!(
+        "  Free:     {} pages ({:.1} MiB)",
+        zero_pages,
+        zero_pages as f64 * 4.0 / 1024.0
+    );
+
+    // Disassemble at PC
+    if let Some(count) = disasm_count {
+        let count = count.min(100); // Cap at 100
+        println!();
+        println!(
+            "── Disassembly at PC={:#x} ─────────────────────────────",
+            pc
+        );
+
+        // Translate PC through page table if SATP is set
+        let phys_pc = if satp >> 60 != 0 {
+            // We'd need full MMU translation — for now just try direct mapping
+            // Check if PC is in the DRAM range
+            pc // Simplified: user should use physical addresses in snapshot
+        } else {
+            pc
+        };
+
+        let dram_base = crate::memory::DRAM_BASE;
+        if phys_pc >= dram_base && phys_pc < dram_base + ram_size as u64 {
+            let mut addr = phys_pc;
+            for _ in 0..count {
+                let offset = (addr - dram_base) as usize;
+                if offset + 4 > ram_size {
+                    break;
+                }
+                let raw16 = u16::from_le_bytes([decompressed[offset], decompressed[offset + 1]]);
+                let (inst, size) = if raw16 & 0x03 != 0x03 {
+                    // Compressed
+                    let expanded = crate::cpu::decode::expand_compressed(raw16 as u32);
+                    (expanded, 2u64)
+                } else {
+                    let raw32 = u32::from_le_bytes([
+                        decompressed[offset],
+                        decompressed[offset + 1],
+                        decompressed[offset + 2],
+                        decompressed[offset + 3],
+                    ]);
+                    (raw32, 4u64)
+                };
+                let disasm_str = crate::cpu::disasm::disassemble(inst, addr);
+                if size == 2 {
+                    println!("  {:#010x}:  {:04x}       {}", addr, raw16, disasm_str);
+                } else {
+                    println!("  {:#010x}:  {:08x}   {}", addr, inst, disasm_str);
+                }
+                addr += size;
+            }
+        } else {
+            println!(
+                "  PC {:#x} is outside DRAM range ({:#x}..)",
+                phys_pc, dram_base
+            );
+        }
+    }
+
+    println!();
+    println!("  mtime: {}", mtime);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +784,38 @@ mod tests {
         assert_eq!(compressed.len(), 1 + 4096 + 1); // tag+data + tag
         let decompressed = decompress_ram(&compressed, 8192).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_and_inspect() {
+        // Create a VM, save snapshot, then verify inspect can parse it
+        use crate::cpu::Cpu;
+        use crate::memory::Bus;
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x8020_0000;
+        cpu.regs[1] = 0xDEAD_BEEF; // ra
+        cpu.regs[2] = 0x8080_0000; // sp
+        cpu.cycle = 42_000;
+        let mut bus = Bus::new(4 * 1024 * 1024); // 4 MiB
+                                                 // Write some data to RAM
+        bus.write32(crate::memory::DRAM_BASE, 0x0000_0013); // nop (addi x0,x0,0)
+
+        let tmp = std::env::temp_dir().join("microvm_test_inspect.snap");
+        save_snapshot(&tmp, &cpu, &mut bus).unwrap();
+
+        // Verify we can load it back
+        let mut cpu2 = Cpu::new();
+        let mut bus2 = Bus::new(4 * 1024 * 1024);
+        load_snapshot(&tmp, &mut cpu2, &mut bus2).unwrap();
+        assert_eq!(cpu2.pc, 0x8020_0000);
+        assert_eq!(cpu2.regs[1], 0xDEAD_BEEF);
+        assert_eq!(cpu2.regs[2], 0x8080_0000);
+        assert_eq!(cpu2.cycle, 42_000);
+
+        // Verify inspect doesn't panic (just exercise the code path)
+        inspect_snapshot(&tmp, true, true, true, Some(4));
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
