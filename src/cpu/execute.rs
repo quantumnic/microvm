@@ -4,6 +4,226 @@ use super::mmu::AccessType;
 use super::{Cpu, PrivilegeMode};
 use crate::memory::Bus;
 
+// ============================================================================
+// Scalar Crypto Extensions (Zkn = Zbkb + Zbkc + Zbkx + Zknd + Zkne + Zknh)
+// ============================================================================
+
+/// AES forward S-box
+const AES_SBOX: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+/// AES inverse S-box
+const AES_INV_SBOX: [u8; 256] = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+];
+
+/// AES round constants
+const AES_RCON: [u8; 11] = [
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36,
+];
+
+/// GF(2^8) multiply by 2 (xtime)
+fn gf_mul2(x: u8) -> u8 {
+    let r = (x as u16) << 1;
+    if r & 0x100 != 0 {
+        (r ^ 0x11b) as u8
+    } else {
+        r as u8
+    }
+}
+
+/// GF(2^8) multiply
+fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut result = 0u8;
+    for _ in 0..8 {
+        if b & 1 != 0 {
+            result ^= a;
+        }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    result
+}
+
+/// AES MixColumns on a single 32-bit column
+fn aes_mixcolumn(col: u32) -> u32 {
+    let b0 = col as u8;
+    let b1 = (col >> 8) as u8;
+    let b2 = (col >> 16) as u8;
+    let b3 = (col >> 24) as u8;
+    let r0 = gf_mul2(b0) ^ gf_mul(b1, 3) ^ b2 ^ b3;
+    let r1 = b0 ^ gf_mul2(b1) ^ gf_mul(b2, 3) ^ b3;
+    let r2 = b0 ^ b1 ^ gf_mul2(b2) ^ gf_mul(b3, 3);
+    let r3 = gf_mul(b0, 3) ^ b1 ^ b2 ^ gf_mul2(b3);
+    r0 as u32 | (r1 as u32) << 8 | (r2 as u32) << 16 | (r3 as u32) << 24
+}
+
+/// AES InvMixColumns on a single 32-bit column
+fn aes_inv_mixcolumn(col: u32) -> u32 {
+    let b0 = col as u8;
+    let b1 = (col >> 8) as u8;
+    let b2 = (col >> 16) as u8;
+    let b3 = (col >> 24) as u8;
+    let r0 = gf_mul(b0, 14) ^ gf_mul(b1, 11) ^ gf_mul(b2, 13) ^ gf_mul(b3, 9);
+    let r1 = gf_mul(b0, 9) ^ gf_mul(b1, 14) ^ gf_mul(b2, 11) ^ gf_mul(b3, 13);
+    let r2 = gf_mul(b0, 13) ^ gf_mul(b1, 9) ^ gf_mul(b2, 14) ^ gf_mul(b3, 11);
+    let r3 = gf_mul(b0, 11) ^ gf_mul(b1, 13) ^ gf_mul(b2, 9) ^ gf_mul(b3, 14);
+    r0 as u32 | (r1 as u32) << 8 | (r2 as u32) << 16 | (r3 as u32) << 24
+}
+
+/// Extract byte i from a u64
+fn byte_of(val: u64, i: usize) -> u8 {
+    (val >> (i * 8)) as u8
+}
+
+/// AES64 forward ShiftRows selection (for computing low 64 bits)
+/// rs1 = state[63:0], rs2 = state[127:64]
+fn aes64_shiftrows_fwd(rs1: u64, rs2: u64) -> u64 {
+    // After ShiftRows, columns 0-1 contain:
+    // col0: state[0], state[5], state[10], state[15]
+    // col1: state[4], state[9], state[14], state[3]
+    let b0 = byte_of(rs1, 0); // state byte 0
+    let b1 = byte_of(rs1, 5); // state byte 5
+    let b2 = byte_of(rs2, 2); // state byte 10
+    let b3 = byte_of(rs2, 7); // state byte 15
+    let b4 = byte_of(rs1, 4); // state byte 4
+    let b5 = byte_of(rs2, 1); // state byte 9
+    let b6 = byte_of(rs2, 6); // state byte 14
+    let b7 = byte_of(rs1, 3); // state byte 3
+    (b0 as u64)
+        | (b1 as u64) << 8
+        | (b2 as u64) << 16
+        | (b3 as u64) << 24
+        | (b4 as u64) << 32
+        | (b5 as u64) << 40
+        | (b6 as u64) << 48
+        | (b7 as u64) << 56
+}
+
+/// AES64 inverse ShiftRows selection (for computing low 64 bits)
+fn aes64_shiftrows_inv(rs1: u64, rs2: u64) -> u64 {
+    // After InvShiftRows, columns 0-1 contain:
+    // col0: state[0], state[13], state[10], state[7]
+    // col1: state[4], state[1], state[14], state[11]
+    let b0 = byte_of(rs1, 0); // state byte 0
+    let b1 = byte_of(rs2, 5); // state byte 13
+    let b2 = byte_of(rs2, 2); // state byte 10
+    let b3 = byte_of(rs1, 7); // state byte 7
+    let b4 = byte_of(rs1, 4); // state byte 4
+    let b5 = byte_of(rs1, 1); // state byte 1
+    let b6 = byte_of(rs2, 6); // state byte 14
+    let b7 = byte_of(rs2, 3); // state byte 11
+    (b0 as u64)
+        | (b1 as u64) << 8
+        | (b2 as u64) << 16
+        | (b3 as u64) << 24
+        | (b4 as u64) << 32
+        | (b5 as u64) << 40
+        | (b6 as u64) << 48
+        | (b7 as u64) << 56
+}
+
+/// Apply AES forward S-box to each byte of a u64
+fn aes_sbox_fwd_u64(val: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..8 {
+        let b = (val >> (i * 8)) as u8;
+        result |= (AES_SBOX[b as usize] as u64) << (i * 8);
+    }
+    result
+}
+
+/// Apply AES inverse S-box to each byte of a u64
+fn aes_sbox_inv_u64(val: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..8 {
+        let b = (val >> (i * 8)) as u8;
+        result |= (AES_INV_SBOX[b as usize] as u64) << (i * 8);
+    }
+    result
+}
+
+/// Apply AES forward S-box to each byte of a u32
+fn aes_sbox_fwd_u32(val: u32) -> u32 {
+    let b0 = AES_SBOX[val as u8 as usize] as u32;
+    let b1 = AES_SBOX[(val >> 8) as u8 as usize] as u32;
+    let b2 = AES_SBOX[(val >> 16) as u8 as usize] as u32;
+    let b3 = AES_SBOX[(val >> 24) as u8 as usize] as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+/// Reverse bits within each byte of a u64 (brev8)
+fn brev8(val: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..8 {
+        let mut byte = (val >> (i * 8)) as u8;
+        byte = (byte & 0xF0) >> 4 | (byte & 0x0F) << 4;
+        byte = (byte & 0xCC) >> 2 | (byte & 0x33) << 2;
+        byte = (byte & 0xAA) >> 1 | (byte & 0x55) << 1;
+        result |= (byte as u64) << (i * 8);
+    }
+    result
+}
+
+/// xperm8: byte-wise lookup permutation
+fn xperm8(rs1: u64, rs2: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..8 {
+        let idx = (rs2 >> (i * 8)) as u8;
+        if idx < 8 {
+            result |= ((rs1 >> (idx as u32 * 8)) & 0xFF) << (i * 8);
+        }
+    }
+    result
+}
+
+/// xperm4: nibble-wise lookup permutation
+fn xperm4(rs1: u64, rs2: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..16 {
+        let idx = (rs2 >> (i * 4)) & 0xF;
+        if idx < 16 {
+            result |= ((rs1 >> (idx * 4)) & 0xF) << (i * 4);
+        }
+    }
+    result
+}
+
 /// Carry-less multiply (lower 64 bits) — Zbc extension
 fn clmul(a: u64, b: u64) -> u64 {
     let mut result = 0u64;
@@ -319,7 +539,7 @@ fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
     let val = match inst.funct3 {
         0 => rs1.wrapping_add(imm), // ADDI
         1 => {
-            // SLLI, Zbb count instructions, Zbs immediate instructions
+            // SLLI, Zbb count instructions, Zbs immediate instructions, Zkn crypto
             let top6 = (inst.raw >> 26) & 0x3F;
             match (funct7, inst.rs2) {
                 (0x30, 0x00) => rs1.leading_zeros() as u64,        // CLZ
@@ -327,6 +547,67 @@ fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
                 (0x30, 0x02) => rs1.count_ones() as u64,           // CPOP
                 (0x30, 0x04) => (rs1 as u8 as i8) as i64 as u64,   // SEXT.B
                 (0x30, 0x05) => (rs1 as u16 as i16) as i64 as u64, // SEXT.H
+                // Zknh: SHA-256 instructions (funct7=0x08)
+                (0x08, 0x00) => {
+                    // SHA256SUM0
+                    let x = rs1 as u32;
+                    (x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)) as i32 as i64
+                        as u64
+                }
+                (0x08, 0x01) => {
+                    // SHA256SUM1
+                    let x = rs1 as u32;
+                    (x.rotate_right(6) ^ x.rotate_right(11) ^ x.rotate_right(25)) as i32 as i64
+                        as u64
+                }
+                (0x08, 0x02) => {
+                    // SHA256SIG0
+                    let x = rs1 as u32;
+                    (x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)) as i32 as i64 as u64
+                }
+                (0x08, 0x03) => {
+                    // SHA256SIG1
+                    let x = rs1 as u32;
+                    (x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)) as i32 as i64 as u64
+                }
+                // Zknh: SHA-512 instructions (funct7=0x08)
+                (0x08, 0x04) => {
+                    // SHA512SUM0
+                    rs1.rotate_right(28) ^ rs1.rotate_right(34) ^ rs1.rotate_right(39)
+                }
+                (0x08, 0x05) => {
+                    // SHA512SUM1
+                    rs1.rotate_right(14) ^ rs1.rotate_right(18) ^ rs1.rotate_right(41)
+                }
+                (0x08, 0x06) => {
+                    // SHA512SIG0
+                    rs1.rotate_right(1) ^ rs1.rotate_right(8) ^ (rs1 >> 7)
+                }
+                (0x08, 0x07) => {
+                    // SHA512SIG1
+                    rs1.rotate_right(19) ^ rs1.rotate_right(61) ^ (rs1 >> 6)
+                }
+                // Zknd: AES64IM (InvMixColumns for key schedule)
+                (0x18, 0x00) => {
+                    // AES64IM rd, rs1
+                    let lo = aes_inv_mixcolumn(rs1 as u32);
+                    let hi = aes_inv_mixcolumn((rs1 >> 32) as u32);
+                    lo as u64 | (hi as u64) << 32
+                }
+                (0x18, rs2_val) if rs2_val & 0x10 != 0 => {
+                    // AES64KS1I rd, rs1, rnum — key schedule constant
+                    let rnum = rs2_val & 0xF;
+                    let w = (rs1 >> 32) as u32; // high 32 bits of rs1
+                    let sub = if rnum < 10 {
+                        // RotWord + SubWord + rcon
+                        let rotated = w.rotate_right(8);
+                        aes_sbox_fwd_u32(rotated) ^ (AES_RCON[rnum + 1] as u32)
+                    } else {
+                        // rnum == 10: SubWord only (no rotate, no rcon)
+                        aes_sbox_fwd_u32(w)
+                    };
+                    sub as u64 | (sub as u64) << 32
+                }
                 _ => match top6 {
                     0x09 => rs1 & !(1u64 << shamt), // BCLRI (Zbs)
                     0x05 => rs1 | (1u64 << shamt),  // BSETI (Zbs)
@@ -352,6 +633,7 @@ fn op_imm(cpu: &mut Cpu, inst: &Instruction, len: u64) {
                     let funct12 = (inst.raw >> 20) & 0xFFF;
                     match funct12 {
                         0x6B8 => rs1.swap_bytes(), // REV8 (Zbb, RV64)
+                        0x687 => brev8(rs1),       // BREV8 (Zbkb)
                         0x287 => {
                             // ORC.B (Zbb)
                             let mut result = 0u64;
@@ -495,6 +777,47 @@ fn op_reg(cpu: &mut Cpu, inst: &Instruction, len: u64) {
             (1, 0x05) => clmul(rs1, rs2),  // CLMUL
             (3, 0x05) => clmulh(rs1, rs2), // CLMULH
             (2, 0x05) => clmulr(rs1, rs2), // CLMULR
+            // Zbkb: pack instructions
+            (4, 0x04) => (rs1 & 0xFFFF_FFFF) | (rs2 << 32), // PACK
+            (7, 0x04) => (rs1 & 0xFF) | ((rs2 & 0xFF) << 8), // PACKH
+            // Zbkx: crossbar permutations
+            (2, 0x14) => xperm4(rs1, rs2), // XPERM4
+            (4, 0x14) => xperm8(rs1, rs2), // XPERM8
+            // Zkne: AES encrypt
+            (0, 0x19) => {
+                // AES64ES — SubBytes after ShiftRows
+                let sr = aes64_shiftrows_fwd(rs1, rs2);
+                aes_sbox_fwd_u64(sr)
+            }
+            (0, 0x1B) => {
+                // AES64ESM — SubBytes + MixColumns after ShiftRows
+                let sr = aes64_shiftrows_fwd(rs1, rs2);
+                let sb = aes_sbox_fwd_u64(sr);
+                let lo = aes_mixcolumn(sb as u32);
+                let hi = aes_mixcolumn((sb >> 32) as u32);
+                lo as u64 | (hi as u64) << 32
+            }
+            // Zknd: AES decrypt
+            (0, 0x1D) => {
+                // AES64DS — InvSubBytes after InvShiftRows
+                let sr = aes64_shiftrows_inv(rs1, rs2);
+                aes_sbox_inv_u64(sr)
+            }
+            (0, 0x1F) => {
+                // AES64DSM — InvSubBytes + InvMixColumns after InvShiftRows
+                let sr = aes64_shiftrows_inv(rs1, rs2);
+                let sb = aes_sbox_inv_u64(sr);
+                let lo = aes_inv_mixcolumn(sb as u32);
+                let hi = aes_inv_mixcolumn((sb >> 32) as u32);
+                lo as u64 | (hi as u64) << 32
+            }
+            // Zkne/Zknd: AES key schedule
+            (0, 0x3F) => {
+                // AES64KS2 rd, rs1, rs2
+                let lo = (rs1 as u32) ^ (rs2 >> 32) as u32;
+                let hi = lo ^ (rs1 >> 32) as u32;
+                lo as u64 | (hi as u64) << 32
+            }
             // Zicond: conditional operations
             (5, 0x07) => {
                 if rs2 == 0 {
@@ -583,8 +906,10 @@ fn op_reg32(cpu: &mut Cpu, inst: &Instruction, len: u64) {
             // Zbb: 32-bit rotate
             (1, 0x30) => rs1.rotate_left(rs2 & 0x1F) as i32 as i64 as u64, // ROLW
             (5, 0x30) => rs1.rotate_right(rs2 & 0x1F) as i32 as i64 as u64, // RORW
-            // Zbb: ZEXT.H (pack rd = rs1[15:0], zero-extended) encoded as funct7=0x04,funct3=4 in OP-32
-            (4, 0x04) => rs1 as u16 as u64, // ZEXT.H
+            // Zbkb: PACKW — pack low 16 bits of each source into 32-bit result
+            (4, 0x04) => ((rs1 & 0xFFFF) | ((rs2 & 0xFFFF) << 16)) as i32 as i64 as u64,
+            // Note: Zbb ZEXT.H is the same encoding (funct7=0x04, funct3=4, rs2=0)
+            // When rs2=0, PACKW produces rs1[15:0] sign-extended — equivalent to ZEXT.H
             _ => 0,
         }
     };

@@ -1,5 +1,5 @@
 //! RISC-V instruction disassembler for trace output.
-//! Supports RV64GC (IMAFDCSU) + Zba/Zbb/Zbs/Zbc extensions.
+//! Supports RV64GC (IMAFDCSU) + Zba/Zbb/Zbs/Zbc/Zbkb/Zbkx/Zknd/Zkne/Zknh extensions.
 
 const REG_NAMES: [&str; 32] = [
     "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
@@ -249,6 +249,22 @@ fn disasm_op_imm(raw: u32, rd: usize, rs1: usize, funct3: u32, funct7: u32, imm:
                     2 => format!("cpop    {}, {}", r(rd), r(rs1)),
                     _ => format!("zbb?    {}, {}, {}", r(rd), r(rs1), shamt),
                 },
+                // Zknh: SHA-256
+                0x04 if shamt == 0 => format!("sha256sum0 {}, {}", r(rd), r(rs1)),
+                0x04 if shamt == 1 => format!("sha256sum1 {}, {}", r(rd), r(rs1)),
+                0x04 if shamt == 2 => format!("sha256sig0 {}, {}", r(rd), r(rs1)),
+                0x04 if shamt == 3 => format!("sha256sig1 {}, {}", r(rd), r(rs1)),
+                // Zknh: SHA-512
+                0x04 if shamt == 4 => format!("sha512sum0 {}, {}", r(rd), r(rs1)),
+                0x04 if shamt == 5 => format!("sha512sum1 {}, {}", r(rd), r(rs1)),
+                0x04 if shamt == 6 => format!("sha512sig0 {}, {}", r(rd), r(rs1)),
+                0x04 if shamt == 7 => format!("sha512sig1 {}, {}", r(rd), r(rs1)),
+                // Zknd: AES64IM
+                0x0C if shamt == 0 => format!("aes64im {}, {}", r(rd), r(rs1)),
+                // Zkne: AES64KS1I
+                0x0C if shamt & 0x10 != 0 => {
+                    format!("aes64ks1i {}, {}, {}", r(rd), r(rs1), shamt & 0xF)
+                }
                 _ => format!("slli?   {}, {}, {}", r(rd), r(rs1), shamt),
             }
         }
@@ -280,6 +296,8 @@ fn disasm_op_imm(raw: u32, rd: usize, rs1: usize, funct3: u32, funct7: u32, imm:
                 let funct12 = (raw >> 20) & 0xFFF;
                 if funct12 == 0x287 {
                     format!("orc.b   {}, {}", r(rd), r(rs1)) // Zbb
+                } else if funct12 == 0x687 {
+                    format!("brev8   {}, {}", r(rd), r(rs1)) // Zbkb
                 } else if funct12 == 0x6B8 {
                     format!("rev8    {}, {}", r(rd), r(rs1)) // Zbb
                 } else {
@@ -386,6 +404,20 @@ fn disasm_op(rd: usize, rs1: usize, rs2: usize, funct3: u32, funct7: u32) -> Str
         (1, 0x05) => format!("clmul   {}, {}, {}", r(rd), r(rs1), r(rs2)),
         (3, 0x05) => format!("clmulh  {}, {}, {}", r(rd), r(rs1), r(rs2)),
         (2, 0x05) => format!("clmulr  {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        // Zbkb
+        (4, 0x04) => format!("pack    {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        (7, 0x04) => format!("packh   {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        // Zbkx
+        (2, 0x14) => format!("xperm4  {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        (4, 0x14) => format!("xperm8  {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        // Zkne
+        (0, 0x19) => format!("aes64es {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        (0, 0x1B) => format!("aes64esm {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        // Zknd
+        (0, 0x1D) => format!("aes64ds {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        (0, 0x1F) => format!("aes64dsm {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        // Zkne/Zknd
+        (0, 0x3F) => format!("aes64ks2 {}, {}, {}", r(rd), r(rs1), r(rs2)),
         // Zicond
         (5, 0x07) => format!("czero.eqz {}, {}, {}", r(rd), r(rs1), r(rs2)),
         (7, 0x07) => format!("czero.nez {}, {}, {}", r(rd), r(rs1), r(rs2)),
@@ -413,6 +445,8 @@ fn disasm_op_w(rd: usize, rs1: usize, rs2: usize, funct3: u32, funct7: u32) -> S
         // Zbb
         (1, 0x30) => format!("rolw    {}, {}, {}", r(rd), r(rs1), r(rs2)),
         (5, 0x30) => format!("rorw    {}, {}, {}", r(rd), r(rs1), r(rs2)),
+        // Zbkb
+        (4, 0x04) => format!("packw   {}, {}, {}", r(rd), r(rs1), r(rs2)),
         _ => format!("opw?    funct3={}, funct7={:#x}", funct3, funct7),
     }
 }

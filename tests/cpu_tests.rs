@@ -5781,3 +5781,178 @@ fn test_dtb_advertises_zimop_zcmop() {
         "DTB should advertise zcmop extension"
     );
 }
+
+// ============== Scalar Crypto Extensions (Zkn) ==============
+
+// --- Zknh: SHA-256 ---
+
+#[test]
+fn test_sha256sum0() {
+    // sha256sum0 rd, rs1: opcode=0x13, funct3=1, funct7=0x08, rs2=0x00
+    // encoding: 0b000_0100_00000_rs1_001_rd_0010011
+    // rs1=x1, rd=x2 → 0x10009113
+    let input: u64 = 0x6a09e667;
+    let x = input as u32;
+    let expected =
+        (x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)) as i32 as i64 as u64;
+    let (cpu, _) = run_program_with_regs(&[0x10009113], 1, &[(1, input)]);
+    assert_eq!(cpu.regs[2], expected, "sha256sum0");
+}
+
+#[test]
+fn test_sha256sig0() {
+    // sha256sig0: funct7=0x08, rs2=0x02
+    // encoding: 0b000_0100_00010_rs1_001_rd_0010011
+    // rs1=x1, rd=x2 → 0x10209113
+    let input: u64 = 0xbb67ae85;
+    let x = input as u32;
+    let expected = (x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)) as i32 as i64 as u64;
+    let (cpu, _) = run_program_with_regs(&[0x10209113], 1, &[(1, input)]);
+    assert_eq!(cpu.regs[2], expected, "sha256sig0");
+}
+
+// --- Zknh: SHA-512 ---
+
+#[test]
+fn test_sha512sum0() {
+    // sha512sum0: funct7=0x08, rs2=0x04
+    // encoding: 0x10409113
+    let input: u64 = 0x6a09e667f3bcc908;
+    let expected = input.rotate_right(28) ^ input.rotate_right(34) ^ input.rotate_right(39);
+    let (cpu, _) = run_program_with_regs(&[0x10409113], 1, &[(1, input)]);
+    assert_eq!(cpu.regs[2], expected, "sha512sum0");
+}
+
+#[test]
+fn test_sha512sig1() {
+    // sha512sig1: funct7=0x08, rs2=0x07
+    // encoding: 0x10709113
+    let input: u64 = 0xbb67ae8584caa73b;
+    let expected = input.rotate_right(19) ^ input.rotate_right(61) ^ (input >> 6);
+    let (cpu, _) = run_program_with_regs(&[0x10709113], 1, &[(1, input)]);
+    assert_eq!(cpu.regs[2], expected, "sha512sig1");
+}
+
+// --- Zbkb: brev8, pack, packh ---
+
+#[test]
+fn test_brev8() {
+    // brev8: OP-IMM funct3=5, imm=0x687
+    // encoding: 0x6870D113 (rd=x2, rs1=x1)
+    let input: u64 = 0x0102040810204080;
+    // Each byte reversed: 0x01→0x80, 0x02→0x40, 0x04→0x20, 0x08→0x10, etc.
+    let expected: u64 = 0x8040201008040201;
+    let (cpu, _) = run_program_with_regs(&[0x6870D113], 1, &[(1, input)]);
+    assert_eq!(cpu.regs[2], expected, "brev8");
+}
+
+#[test]
+fn test_pack() {
+    // pack rd, rs1, rs2: opcode=0x33, funct3=4, funct7=0x04
+    // encoding: 0x080C4133 (rd=x2, rs1=x1, rs2=x8)
+    // Wait, let me compute: funct7=0x04=0b0000100, rs2=x8=0b01000, rs1=x1=0b00001, funct3=4=0b100, rd=x2=0b00010
+    // 0000100_01000_00001_100_00010_0110011 = 0x0880C133
+    let (cpu, _) = run_program_with_regs(
+        &[0x0880C133],
+        1,
+        &[(1, 0xAAAABBBBCCCCDDDD), (8, 0x1111222233334444)],
+    );
+    assert_eq!(cpu.regs[2], 0x33334444CCCCDDDD_u64, "pack");
+}
+
+#[test]
+fn test_packh() {
+    // packh rd, rs1, rs2: opcode=0x33, funct3=7, funct7=0x04
+    // 0000100_01000_00001_111_00010_0110011 = 0x0880F133
+    let (cpu, _) = run_program_with_regs(&[0x0880F133], 1, &[(1, 0xAA), (8, 0xBB)]);
+    assert_eq!(cpu.regs[2], 0xBB_AA, "packh");
+}
+
+// --- Zbkx: xperm4, xperm8 ---
+
+#[test]
+fn test_xperm8() {
+    // xperm8: funct7=0x14, funct3=4
+    // 0010100_01000_00001_100_00010_0110011 = 0x2880C133
+    // rs1 = lookup table, rs2 = indices
+    let rs1: u64 = 0x0706050403020100; // identity table
+    let rs2: u64 = 0x0001020304050607; // reversed indices
+    let expected: u64 = 0x0001020304050607; // should give reversed
+    let (cpu, _) = run_program_with_regs(&[0x2880C133], 1, &[(1, rs1), (8, rs2)]);
+    assert_eq!(cpu.regs[2], expected, "xperm8");
+}
+
+#[test]
+fn test_xperm4() {
+    // xperm4: funct7=0x14, funct3=2
+    // 0010100_01000_00001_010_00010_0110011 = 0x2880A133
+    let rs1: u64 = 0xFEDCBA9876543210; // nibble lookup table (identity)
+    let rs2: u64 = 0x0000000000000003; // index 3
+    let expected: u64 = 0x0000000000000003;
+    let (cpu, _) = run_program_with_regs(&[0x2880A133], 1, &[(1, rs1), (8, rs2)]);
+    assert_eq!(cpu.regs[2], expected, "xperm4");
+}
+
+// --- Zkne/Zknd: AES ---
+
+#[test]
+fn test_aes64ks1i() {
+    // aes64ks1i rd, rs1, rnum=0: funct7=0x18, rs2=0x10, funct3=1
+    // encoding: 0b0011000_10000_00001_001_00010_0010011 = 0x31009113
+    let rs1: u64 = 0x0c0d0e0f_08090a0b;
+    let (cpu, _) = run_program_with_regs(&[0x31009113], 1, &[(1, rs1)]);
+    let result = cpu.regs[2];
+    // Result should be duplicated (low32 == high32) per spec
+    assert_eq!(
+        result as u32,
+        (result >> 32) as u32,
+        "aes64ks1i result should be duplicated"
+    );
+    // The result should NOT be the input (SubBytes + RotWord changes it)
+    assert_ne!(result, rs1, "aes64ks1i should transform the input");
+}
+
+#[test]
+fn test_aes64ks2() {
+    // aes64ks2: funct7=0x3F, funct3=0, opcode=0x33
+    // 0111111_01000_00001_000_00010_0110011 = 0x7E808133
+    let rs1: u64 = 0xAAAAAAAA_55555555;
+    let rs2: u64 = 0xBBBBBBBB_CCCCCCCC;
+    let lo = (rs1 as u32) ^ (rs2 >> 32) as u32; // 0x55555555 ^ 0xBBBBBBBB = 0xEEEEEEEE
+    let hi = lo ^ (rs1 >> 32) as u32; // 0xEEEEEEEE ^ 0xAAAAAAAA = 0x44444444
+    let expected = lo as u64 | (hi as u64) << 32;
+    let (cpu, _) = run_program_with_regs(&[0x7E808133], 1, &[(1, rs1), (8, rs2)]);
+    assert_eq!(cpu.regs[2], expected, "aes64ks2");
+}
+
+#[test]
+fn test_aes64es_aes64ds_roundtrip() {
+    // Test that encrypt then decrypt is identity (for SubBytes+ShiftRows part)
+    // aes64es rd, rs1, rs2: funct7=0x19, funct3=0 → 0x3280_0133 (rd=x2, rs1=x1, rs2=x8)
+    // Wait: 0011001_01000_00001_000_00010_0110011 = 0x32808133
+    // aes64ds rd, rs1, rs2: funct7=0x1D, funct3=0 → 0x3A808133
+    // We need to test the low half: encrypt(rs1_lo, rs2_hi) then decrypt
+    let state_lo: u64 = 0x0001020304050607;
+    let state_hi: u64 = 0x08090a0b0c0d0e0f;
+    // Encrypt low half
+    let (cpu_enc, _) = run_program_with_regs(&[0x32808133], 1, &[(1, state_lo), (8, state_hi)]);
+    let enc_lo = cpu_enc.regs[2];
+    // Encrypt high half
+    let (cpu_enc2, _) = run_program_with_regs(&[0x32808133], 1, &[(1, state_hi), (8, state_lo)]);
+    let enc_hi = cpu_enc2.regs[2];
+    // Decrypt low half
+    let (cpu_dec, _) = run_program_with_regs(&[0x3A808133], 1, &[(1, enc_lo), (8, enc_hi)]);
+    let dec_lo = cpu_dec.regs[2];
+    assert_eq!(dec_lo, state_lo, "aes64es/aes64ds roundtrip (low half)");
+}
+
+#[test]
+fn test_dtb_advertises_zkn() {
+    use microvm::dtb;
+    let dtb_data = dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dts = dtb::dtb_to_dts(&dtb_data);
+    assert!(dts.contains("zbkb"), "DTB should advertise zbkb extension");
+    assert!(dts.contains("zknd"), "DTB should advertise zknd extension");
+    assert!(dts.contains("zkne"), "DTB should advertise zkne extension");
+    assert!(dts.contains("zknh"), "DTB should advertise zknh extension");
+}
