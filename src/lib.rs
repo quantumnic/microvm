@@ -4,6 +4,7 @@ pub mod dtb;
 pub mod gdb;
 pub mod loader;
 pub mod memory;
+pub mod monitor;
 pub mod profile;
 pub mod snapshot;
 pub mod vm;

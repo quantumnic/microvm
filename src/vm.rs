@@ -8,6 +8,7 @@ use crate::gdb::{GdbAction, GdbServer};
 use crate::loader;
 use crate::memory::rom::BootRom;
 use crate::memory::{Bus, DRAM_BASE};
+use crate::monitor::Monitor;
 use crate::profile::Profile;
 use crate::snapshot;
 
@@ -165,7 +166,7 @@ impl Vm {
             }
         }
 
-        log::info!("Starting emulation...");
+        log::info!("Starting emulation... (Ctrl-A h for monitor help)");
 
         // Wall-clock timeout support
         let start_time = std::time::Instant::now();
@@ -177,6 +178,9 @@ impl Vm {
         } else {
             None
         };
+
+        // Interactive debug monitor
+        let mut monitor = Monitor::new();
 
         // Main execution loop
         let mut insn_count: u64 = 0;
@@ -385,7 +389,13 @@ impl Vm {
 
             // Periodic tasks (every 1024 instructions)
             if insn_count & 0x3FF == 0 {
-                poll_stdin(&mut self.bus.uart);
+                poll_stdin_monitor(&mut self.bus, &self.cpu, &mut monitor);
+
+                // Check if monitor requested quit
+                if monitor.quit_requested {
+                    log::info!("Monitor quit after {} instructions", insn_count);
+                    break;
+                }
 
                 // Process VirtIO block queue
                 if self.bus.virtio_blk.needs_processing() {
@@ -444,7 +454,7 @@ impl Vm {
     }
 }
 
-fn poll_stdin(uart: &mut crate::devices::uart::Uart) {
+fn poll_stdin_monitor(bus: &mut Bus, cpu: &Cpu, monitor: &mut Monitor) {
     use std::io::Read;
     let mut buf = [0u8; 1];
     unsafe {
@@ -458,7 +468,9 @@ fn poll_stdin(uart: &mut crate::devices::uart::Uart) {
             && fds.revents & libc::POLLIN != 0
             && std::io::stdin().read(&mut buf).unwrap_or(0) == 1
         {
-            uart.push_byte(buf[0]);
+            if let Some(byte) = monitor.process_byte(buf[0], cpu, bus) {
+                bus.uart.push_byte(byte);
+            }
         }
     }
 }

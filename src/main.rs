@@ -7,6 +7,7 @@ mod dtb;
 mod gdb;
 mod loader;
 mod memory;
+mod monitor;
 mod profile;
 mod snapshot;
 mod vm;

@@ -232,6 +232,31 @@ microvm run --example minimal-kernel
 - [x] GDB server (`--gdb <port>`)
 - [x] Instruction tracing (`--trace`)
 - [x] Snapshot/restore (`--save-snapshot`, `--load-snapshot`)
+- [x] Interactive debug monitor (`Ctrl-A c` — QEMU-style)
+
+---
+
+## 🖥️ Debug Monitor
+
+Inspect your VM at runtime with a QEMU-style interactive monitor:
+
+```
+Ctrl-A h  — help (show escape keys)
+Ctrl-A c  — toggle monitor console
+Ctrl-A x  — quit emulator
+Ctrl-A a  — send Ctrl-A to guest
+```
+
+In the monitor console:
+```
+(monitor) info regs       # CPU registers
+(monitor) info csrs       # Key CSRs
+(monitor) info mem        # Memory map
+(monitor) x 0x80000000 8  # Examine 8 words at address
+(monitor) disasm 10       # Disassemble 10 instructions at PC
+(monitor) pc              # Show program counter + mode
+(monitor) quit            # Exit emulator
+```
 
 ---
 
