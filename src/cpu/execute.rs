@@ -595,6 +595,13 @@ fn op_reg32(cpu: &mut Cpu, inst: &Instruction, len: u64) {
 fn op_atomic(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
     let funct5 = inst.funct7 >> 2;
     let addr = cpu.regs[inst.rs1];
+
+    // Zabha: byte (funct3=0) and halfword (funct3=1) atomics
+    if inst.funct3 == 0 || inst.funct3 == 1 {
+        op_atomic_bh(cpu, bus, inst, len, funct5, addr);
+        return;
+    }
+
     let is_word = inst.funct3 == 2; // funct3=2 → 32-bit, funct3=3 → 64-bit
 
     let phys = match cpu
@@ -643,6 +650,32 @@ fn op_atomic(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
             }
             cpu.reservation = None;
         }
+        0x05 => {
+            // AMOCAS (Zacas) — atomic compare-and-swap
+            let old = if is_word {
+                bus.read32(phys) as i32 as i64 as u64
+            } else {
+                bus.read64(phys)
+            };
+            let compare = if is_word {
+                cpu.regs[inst.rd] as u32 as u64
+            } else {
+                cpu.regs[inst.rd]
+            };
+            if old == compare {
+                let swap = cpu.regs[inst.rs2];
+                if is_word {
+                    bus.write32(phys, swap as u32);
+                } else {
+                    bus.write64(phys, swap);
+                }
+            }
+            cpu.regs[inst.rd] = if is_word {
+                old as i32 as i64 as u64
+            } else {
+                old
+            };
+        }
         _ => {
             // AMO instructions
             let old = if is_word {
@@ -671,6 +704,111 @@ fn op_atomic(cpu: &mut Cpu, bus: &mut Bus, inst: &Instruction, len: u64) {
             cpu.regs[inst.rd] = old;
         }
     }
+    cpu.pc += len;
+}
+
+/// Zabha: byte and halfword atomic operations
+fn op_atomic_bh(
+    cpu: &mut Cpu,
+    bus: &mut Bus,
+    inst: &Instruction,
+    len: u64,
+    funct5: u32,
+    addr: u64,
+) {
+    let is_byte = inst.funct3 == 0;
+
+    let phys = match cpu
+        .mmu
+        .translate(addr, AccessType::Write, cpu.mode, &cpu.csrs, bus)
+    {
+        Ok(a) => a,
+        Err(e) => {
+            cpu.handle_exception(e, addr, bus);
+            return;
+        }
+    };
+
+    let old: u64 = if is_byte {
+        bus.read8(phys) as u64
+    } else {
+        bus.read16(phys) as u64
+    };
+
+    // Sign-extend for rd
+    let old_sext: u64 = if is_byte {
+        old as u8 as i8 as i64 as u64
+    } else {
+        old as u16 as i16 as i64 as u64
+    };
+
+    match funct5 {
+        0x05 => {
+            // AMOCAS.B / AMOCAS.H (Zacas + Zabha)
+            let compare = if is_byte {
+                cpu.regs[inst.rd] as u8 as u64
+            } else {
+                cpu.regs[inst.rd] as u16 as u64
+            };
+            if old == compare {
+                let swap = cpu.regs[inst.rs2];
+                if is_byte {
+                    bus.write8(phys, swap as u8);
+                } else {
+                    bus.write16(phys, swap as u16);
+                }
+            }
+        }
+        _ => {
+            let src = cpu.regs[inst.rs2];
+            let result = match funct5 {
+                0x01 => src,                   // AMOSWAP
+                0x00 => old.wrapping_add(src), // AMOADD
+                0x04 => old ^ src,             // AMOXOR
+                0x0C => old & src,             // AMOAND
+                0x08 => old | src,             // AMOOR
+                0x10 => {
+                    // AMOMIN (signed)
+                    if is_byte {
+                        std::cmp::min(old as u8 as i8, src as i8) as u8 as u64
+                    } else {
+                        std::cmp::min(old as u16 as i16, src as i16) as u16 as u64
+                    }
+                }
+                0x14 => {
+                    // AMOMAX (signed)
+                    if is_byte {
+                        std::cmp::max(old as u8 as i8, src as i8) as u8 as u64
+                    } else {
+                        std::cmp::max(old as u16 as i16, src as i16) as u16 as u64
+                    }
+                }
+                0x18 => {
+                    // AMOMINU (unsigned)
+                    if is_byte {
+                        std::cmp::min(old as u8, src as u8) as u64
+                    } else {
+                        std::cmp::min(old as u16, src as u16) as u64
+                    }
+                }
+                0x1C => {
+                    // AMOMAXU (unsigned)
+                    if is_byte {
+                        std::cmp::max(old as u8, src as u8) as u64
+                    } else {
+                        std::cmp::max(old as u16, src as u16) as u64
+                    }
+                }
+                _ => old,
+            };
+            if is_byte {
+                bus.write8(phys, result as u8);
+            } else {
+                bus.write16(phys, result as u16);
+            }
+        }
+    }
+    cpu.regs[inst.rd] = old_sext;
     cpu.pc += len;
 }
 

@@ -5220,3 +5220,225 @@ fn test_dtb_smp_single_hart_compat() {
     assert!(dts.contains("cpu@0"));
     assert!(!dts.contains("cpu@1"));
 }
+
+// ==================== Zacas: Atomic Compare-And-Swap ====================
+
+#[test]
+fn test_amocas_w_match() {
+    // AMOCAS.W: if mem[addr] == rd, write rs2 to mem. rd gets old value.
+    // funct5=0x05, funct3=2 (word), opcode=0x2F
+    let mut bus = Bus::new(64 * 1024);
+    bus.write32(DRAM_BASE + 0x100, 42);
+    // amocas.w x10, x12, (x11) — funct7 = 0x05<<2 = 0x14
+    let inst = (0b00101u32 << 27) | (12 << 20) | (11 << 15) | (0b010 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[10] = 42; // compare value (matches memory)
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 99; // swap value
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10] as i32, 42, "rd should have old value");
+    assert_eq!(
+        bus.ram.read32(0x100),
+        99,
+        "memory should have swap value after match"
+    );
+}
+
+#[test]
+fn test_amocas_w_no_match() {
+    // AMOCAS.W: if mem[addr] != rd, don't write. rd gets old value.
+    let mut bus = Bus::new(64 * 1024);
+    bus.write32(DRAM_BASE + 0x100, 42);
+    let inst = (0b00101u32 << 27) | (12 << 20) | (11 << 15) | (0b010 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[10] = 99; // compare value (does NOT match memory=42)
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 77; // swap value (should not be written)
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10] as i32, 42, "rd should have old value");
+    assert_eq!(
+        bus.ram.read32(0x100),
+        42,
+        "memory should be unchanged on mismatch"
+    );
+}
+
+#[test]
+fn test_amocas_d_match() {
+    // AMOCAS.D: 64-bit compare-and-swap
+    let mut bus = Bus::new(64 * 1024);
+    let addr_off = 0x100u64;
+    bus.write64(DRAM_BASE + addr_off, 0xDEAD_BEEF_CAFE_BABE);
+    // amocas.d x10, x12, (x11) — funct3=3
+    let inst = (0b00101u32 << 27) | (12 << 20) | (11 << 15) | (0b011 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[10] = 0xDEAD_BEEF_CAFE_BABE; // matches
+    cpu.regs[11] = DRAM_BASE + addr_off;
+    cpu.regs[12] = 0x1234_5678_9ABC_DEF0;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0xDEAD_BEEF_CAFE_BABE, "rd gets old value");
+    assert_eq!(
+        bus.ram.read64(addr_off),
+        0x1234_5678_9ABC_DEF0,
+        "memory swapped"
+    );
+}
+
+#[test]
+fn test_amocas_d_no_match() {
+    let mut bus = Bus::new(64 * 1024);
+    bus.write64(DRAM_BASE + 0x100, 0xAAAA_BBBB_CCCC_DDDD);
+    let inst = (0b00101u32 << 27) | (12 << 20) | (11 << 15) | (0b011 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[10] = 0x1111_2222_3333_4444; // does not match
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 0xFFFF;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0xAAAA_BBBB_CCCC_DDDD, "rd gets old value");
+    assert_eq!(
+        bus.ram.read64(0x100),
+        0xAAAA_BBBB_CCCC_DDDD,
+        "memory unchanged"
+    );
+}
+
+// ==================== Zabha: Byte/Halfword Atomics ====================
+
+#[test]
+fn test_amoswap_b() {
+    // AMOSWAP.B: funct5=0x01, funct3=0 (byte)
+    let mut bus = Bus::new(64 * 1024);
+    bus.write8(DRAM_BASE + 0x100, 0xAB);
+    let inst = (0b00001u32 << 27) | (12 << 20) | (11 << 15) | (0b000 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 0x42;
+    cpu.step(&mut bus);
+    // 0xAB sign-extended as i8 = -85 → sign-extended to u64
+    assert_eq!(
+        cpu.regs[10], 0xABu8 as i8 as i64 as u64,
+        "rd gets sign-extended old byte"
+    );
+    assert_eq!(bus.ram.read8(0x100), 0x42, "memory has new value");
+}
+
+#[test]
+fn test_amoswap_h() {
+    // AMOSWAP.H: funct5=0x01, funct3=1 (halfword)
+    let mut bus = Bus::new(64 * 1024);
+    bus.write16(DRAM_BASE + 0x100, 0xBEEF);
+    let inst = (0b00001u32 << 27) | (12 << 20) | (11 << 15) | (0b001 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 0x1234;
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs[10], 0xBEEFu16 as i16 as i64 as u64,
+        "rd gets sign-extended old halfword"
+    );
+    assert_eq!(bus.ram.read16(0x100), 0x1234, "memory has new value");
+}
+
+#[test]
+fn test_amoadd_b() {
+    let mut bus = Bus::new(64 * 1024);
+    bus.write8(DRAM_BASE + 0x100, 10);
+    let inst = (0b00000u32 << 27) | (12 << 20) | (11 << 15) | (0b000 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 5;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 10, "rd gets old value");
+    assert_eq!(bus.ram.read8(0x100), 15, "memory has 10+5=15");
+}
+
+#[test]
+fn test_amocas_b_match() {
+    // AMOCAS.B: funct5=0x05, funct3=0 (byte)
+    let mut bus = Bus::new(64 * 1024);
+    bus.write8(DRAM_BASE + 0x100, 42);
+    let inst = (0b00101u32 << 27) | (12 << 20) | (11 << 15) | (0b000 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[10] = 42; // matches
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 99;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 42, "rd gets old value");
+    assert_eq!(bus.ram.read8(0x100), 99, "memory swapped");
+}
+
+#[test]
+fn test_amocas_h_no_match() {
+    // AMOCAS.H: funct5=0x05, funct3=1 (halfword), no match
+    let mut bus = Bus::new(64 * 1024);
+    bus.write16(DRAM_BASE + 0x100, 0x1234);
+    let inst = (0b00101u32 << 27) | (12 << 20) | (11 << 15) | (0b001 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[10] = 0xFFFF; // does not match 0x1234
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 0xAAAA;
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs[10], 0x1234u16 as i16 as i64 as u64,
+        "rd gets sign-extended old value"
+    );
+    assert_eq!(bus.ram.read16(0x100), 0x1234, "memory unchanged");
+}
+
+#[test]
+fn test_amomin_b_signed() {
+    // AMOMIN.B: signed byte min
+    let mut bus = Bus::new(64 * 1024);
+    bus.write8(DRAM_BASE + 0x100, 0xF0); // -16 as i8
+    let inst = (0b10000u32 << 27) | (12 << 20) | (11 << 15) | (0b000 << 12) | (10 << 7) | 0x2F;
+    bus.load_binary(&inst.to_le_bytes(), 0);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.regs[11] = DRAM_BASE + 0x100;
+    cpu.regs[12] = 5; // 5 as i8
+    cpu.step(&mut bus);
+    assert_eq!(bus.ram.read8(0x100), 0xF0, "min(-16, 5) = -16 = 0xF0");
+}
+
+#[test]
+fn test_dtb_advertises_zacas_zabha() {
+    use microvm::dtb;
+    let dtb_data = dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dts = dtb::dtb_to_dts(&dtb_data);
+    assert!(
+        dts.contains("zacas"),
+        "DTB should advertise zacas extension"
+    );
+    assert!(
+        dts.contains("zabha"),
+        "DTB should advertise zabha extension"
+    );
+}

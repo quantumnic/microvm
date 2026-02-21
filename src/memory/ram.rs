@@ -23,6 +23,16 @@ impl Ram {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn read16(&self, offset: u64) -> u16 {
+        let idx = offset as usize;
+        if idx + 1 < self.data.len() {
+            u16::from_le_bytes([self.data[idx], self.data[idx + 1]])
+        } else {
+            0
+        }
+    }
+
     pub fn read32(&self, offset: u64) -> u32 {
         let idx = offset as usize;
         if idx + 3 < self.data.len() {
@@ -59,6 +69,15 @@ impl Ram {
         let idx = offset as usize;
         if idx < self.data.len() {
             self.data[idx] = val;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn write16(&mut self, offset: u64, val: u16) {
+        let idx = offset as usize;
+        if idx + 1 < self.data.len() {
+            let bytes = val.to_le_bytes();
+            self.data[idx..idx + 2].copy_from_slice(&bytes);
         }
     }
 

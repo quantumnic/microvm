@@ -485,11 +485,18 @@ fn disasm_fp(raw: u32, rd: usize, rs1: usize, rs2: usize, funct7: u32) -> String
 }
 
 fn disasm_atomic(_raw: u32, rd: usize, rs1: usize, rs2: usize, funct3: u32, funct7: u32) -> String {
-    let suffix = if funct3 == 2 { ".w" } else { ".d" };
+    let suffix = match funct3 {
+        0 => ".b",
+        1 => ".h",
+        2 => ".w",
+        3 => ".d",
+        _ => ".?",
+    };
     let funct5 = funct7 >> 2;
     match funct5 {
         0x02 => format!("lr{}    {}, ({})", suffix, r(rd), r(rs1)),
         0x03 => format!("sc{}    {}, {}, ({})", suffix, r(rd), r(rs2), r(rs1)),
+        0x05 => format!("amocas{} {}, {}, ({})", suffix, r(rd), r(rs2), r(rs1)),
         0x01 => format!("amoswap{} {}, {}, ({})", suffix, r(rd), r(rs2), r(rs1)),
         0x00 => format!("amoadd{} {}, {}, ({})", suffix, r(rd), r(rs2), r(rs1)),
         0x04 => format!("amoxor{} {}, {}, ({})", suffix, r(rd), r(rs2), r(rs1)),

@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.44.0 — Zacas & Zabha Extensions (Atomic CAS + Byte/Halfword Atomics)
+
+### Major Features
+- **Zacas extension**: Atomic compare-and-swap instructions for RISC-V
+  - `amocas.w` (32-bit): Compare rd with memory word, swap rs2 if equal, rd gets old value
+  - `amocas.d` (64-bit): Same for doubleword operands
+  - `amocas.b` / `amocas.h`: Byte and halfword CAS (combined Zacas + Zabha)
+  - Critical for SMP Linux kernels — enables efficient lock-free algorithms and `cmpxchg()`
+- **Zabha extension**: Byte and halfword atomic memory operations
+  - All AMO operations now support `funct3=0` (byte) and `funct3=1` (halfword) widths
+  - `amoswap.b/h`, `amoadd.b/h`, `amoxor.b/h`, `amoand.b/h`, `amoor.b/h`
+  - `amomin.b/h`, `amomax.b/h`, `amominu.b/h`, `amomaxu.b/h` with proper signed/unsigned semantics
+  - Sign-extends byte/halfword results into rd (matching RISC-V spec)
+- **Disassembler updated**: Recognizes `.b` and `.h` suffixes for byte/halfword atomics and `amocas` mnemonic
+- **DTB updated**: ISA string and `riscv,isa-extensions` now advertise `zacas` and `zabha`
+
+### New Tests
+- `test_amocas_w_match`: 32-bit CAS with matching compare value
+- `test_amocas_w_no_match`: 32-bit CAS with non-matching compare (no swap)
+- `test_amocas_d_match`: 64-bit CAS successful swap
+- `test_amocas_d_no_match`: 64-bit CAS failed compare
+- `test_amoswap_b`: Byte atomic swap with sign extension
+- `test_amoswap_h`: Halfword atomic swap with sign extension
+- `test_amoadd_b`: Byte atomic add
+- `test_amocas_b_match`: Byte CAS match
+- `test_amocas_h_no_match`: Halfword CAS mismatch with sign extension
+- `test_amomin_b_signed`: Byte signed minimum (negative values)
+- `test_dtb_advertises_zacas_zabha`: DTB extension advertisement
+
+### Stats
+- 246 integration tests, all passing
+- 0 clippy warnings
+
 ## v0.38.0 — Execution Profiler (`--profile`)
 
 ### Major Features
