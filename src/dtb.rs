@@ -408,7 +408,7 @@ pub fn generate_dtb_smp(
     let plic_phandle = num_harts as u32 + 1;
     let syscon_phandle = num_harts as u32 + 2;
 
-    let isa_str = "rv64imafdcvsu_zicsr_zifencei_zicbom_zicboz_zicbop_zicond_zihintpause_zawrs_zacas_zabha_zfa_zimop_zcmop_zba_zbb_zbs_zbc_zbkb_zbkc_zbkx_zknd_zkne_zknh_zve32f_zve64f_zve64d_zvl128b_sstc_zicntr_svinval_svnapot_svpbmt_svadu_smstateen_ssstateen";
+    let isa_str = "rv64imafdcvsu_zicsr_zifencei_zicbom_zicboz_zicbop_zicond_zihintpause_zawrs_zacas_zabha_zfa_zimop_zcmop_zba_zbb_zbs_zbc_zbkb_zbkc_zbkx_zknd_zkne_zknh_zve32f_zve64f_zve64d_zvl128b_sstc_zicntr_svinval_svnapot_svpbmt_svadu_smstateen_ssstateen_sscofpmf";
     let isa_extensions: &[&str] = &[
         "i",
         "m",
@@ -453,6 +453,7 @@ pub fn generate_dtb_smp(
         "svadu",
         "smstateen",
         "ssstateen",
+        "sscofpmf",
     ];
 
     for hart in 0..num_harts {

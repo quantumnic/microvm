@@ -1902,17 +1902,18 @@ fn test_bus_mmio_32bit_plic_read() {
 }
 
 #[test]
-fn test_hpm_event_selector_writes_ignored() {
-    // Writing to HPM event selectors should not crash
+fn test_hpm_event_selector_writes_stored() {
+    // Sscofpmf: HPM event selectors are writable (privilege filtering bits)
     let mut cpu = Cpu::new();
     setup_pmp_allow_all(&mut cpu);
     for addr in 0x323u16..=0x33F {
         cpu.csrs.write(addr, 0xDEAD);
         assert_eq!(
             cpu.csrs.read(addr),
-            0,
-            "HPM event selector writes should be ignored"
+            0xDEAD,
+            "HPM event selector writes should be stored (Sscofpmf)"
         );
+        cpu.csrs.write(addr, 0); // reset
     }
 }
 
@@ -10133,5 +10134,374 @@ fn test_dtb_advertises_smstateen() {
     assert!(
         dtb_str.contains("ssstateen"),
         "DTB should advertise ssstateen"
+    );
+}
+
+// ===== Additional CLINT device tests =====
+
+#[test]
+fn test_clint_msip_read_write_detailed() {
+    let mut clint = microvm::devices::clint::Clint::new();
+    assert_eq!(clint.read(0x0000), 0);
+    clint.write(0x0000, 1);
+    assert_eq!(clint.read(0x0000), 1);
+    assert!(clint.software_interrupt());
+    clint.write(0x0000, 0);
+    assert!(!clint.software_interrupt());
+}
+
+#[test]
+fn test_clint_msip_only_bit0() {
+    let mut clint = microvm::devices::clint::Clint::new();
+    clint.write(0x0000, 0xFF);
+    assert_eq!(clint.read(0x0000), 1);
+}
+
+#[test]
+fn test_clint_mtimecmp_write_read() {
+    let mut clint = microvm::devices::clint::Clint::new();
+    clint.write(0x4000, 0xDEADBEEF);
+    assert_eq!(clint.read(0x4000), 0xDEADBEEF);
+    clint.write(0x4004, 0xCAFEBABE);
+    assert_eq!(clint.read(0x4004), 0xCAFEBABE);
+    assert_eq!(clint.mtimecmp(), 0xCAFEBABE_DEADBEEF);
+}
+
+#[test]
+fn test_clint_multi_hart_mtimecmp() {
+    let mut clint = microvm::devices::clint::Clint::with_harts(4);
+    clint.write(0x4010, 0x12345678);
+    clint.write(0x4014, 0x9ABCDEF0);
+    assert_eq!(clint.mtimecmp_hart(2), 0x9ABCDEF0_12345678);
+    assert_eq!(clint.mtimecmp_hart(0), u64::MAX);
+}
+
+#[test]
+fn test_clint_mtime_advances() {
+    let clint = microvm::devices::clint::Clint::new();
+    let t1 = clint.mtime();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let t2 = clint.mtime();
+    assert!(t2 > t1, "mtime should advance over time");
+}
+
+#[test]
+fn test_clint_mtime_read_offset() {
+    let clint = microvm::devices::clint::Clint::new();
+    let low = clint.read(0xBFF8);
+    let high = clint.read(0xBFFC);
+    let mtime = clint.mtime();
+    assert!(low <= mtime);
+    let reconstructed = (high << 32) | (low & 0xFFFFFFFF);
+    assert!(reconstructed <= mtime + 10000);
+}
+
+#[test]
+fn test_clint_timer_interrupt_immediate() {
+    let mut clint = microvm::devices::clint::Clint::new();
+    clint.write(0x4000, 0);
+    clint.write(0x4004, 0);
+    assert!(clint.timer_interrupt_hart(0));
+    clint.write(0x4000, 0xFFFFFFFF);
+    clint.write(0x4004, 0xFFFFFFFF);
+    assert!(!clint.timer_interrupt_hart(0));
+}
+
+#[test]
+fn test_clint_restore_state() {
+    let mut clint = microvm::devices::clint::Clint::new();
+    clint.restore_state(0, 42, true);
+    assert_eq!(clint.mtimecmp(), 42);
+    assert!(clint.software_interrupt());
+}
+
+#[test]
+fn test_clint_out_of_range_hart() {
+    let clint = microvm::devices::clint::Clint::new();
+    assert!(!clint.software_interrupt_hart(100));
+    assert!(!clint.timer_interrupt_hart(100));
+    assert_eq!(clint.mtimecmp_hart(100), u64::MAX);
+}
+
+#[test]
+fn test_clint_out_of_range_offset() {
+    let clint = microvm::devices::clint::Clint::new();
+    assert_eq!(clint.read(0xFFFF), 0);
+}
+
+// ===== Additional PLIC device tests =====
+
+#[test]
+fn test_plic_priority_read_write() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.write(0x000004, 7);
+    assert_eq!(plic.read(0x000004), 7);
+}
+
+#[test]
+fn test_plic_pending_after_set() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.set_pending(1);
+    assert_eq!(plic.read(0x001000) & 0x2, 0x2);
+}
+
+#[test]
+fn test_plic_enable_and_has_interrupt() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.write(0x000004, 5);
+    plic.write(0x002080, 0x2);
+    plic.write(0x201000, 0);
+    plic.set_pending(1);
+    assert!(plic.has_interrupt(1));
+    assert!(!plic.has_interrupt(0));
+}
+
+#[test]
+fn test_plic_threshold_filters_interrupt() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.write(0x000004, 3);
+    plic.write(0x002080, 0x2);
+    plic.write(0x201000, 5);
+    plic.set_pending(1);
+    assert!(!plic.has_interrupt(1));
+}
+
+#[test]
+fn test_plic_claim_highest_priority() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.write(0x000004, 3);
+    plic.write(0x000008, 7);
+    plic.write(0x002080, 0x6);
+    plic.write(0x201000, 0);
+    plic.set_pending(1);
+    plic.set_pending(2);
+    let claimed = plic.read(0x201004);
+    assert_eq!(claimed, 2);
+}
+
+#[test]
+fn test_plic_no_interrupt_when_disabled() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.write(0x000004, 5);
+    plic.set_pending(1);
+    assert!(!plic.has_interrupt(0));
+    assert!(!plic.has_interrupt(1));
+}
+
+#[test]
+fn test_plic_multi_hart_isolation() {
+    let mut plic = microvm::devices::plic::Plic::with_harts(4);
+    plic.write(0x000004, 5);
+    plic.write(0x002180, 0x2); // context 3
+    plic.write(0x203000, 0);
+    plic.set_pending(1);
+    assert!(plic.has_interrupt(3));
+    assert!(!plic.has_interrupt(0));
+    assert!(!plic.has_interrupt(1));
+    assert!(!plic.has_interrupt(2));
+}
+
+#[test]
+fn test_plic_save_restore() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.write(0x000004, 5);
+    plic.set_pending(1);
+    plic.write(0x002000, 0x2);
+    plic.write(0x200000, 3);
+    let state = plic.save_state();
+    let mut plic2 = microvm::devices::plic::Plic::new();
+    plic2.restore_state(&state).unwrap();
+    assert_eq!(plic2.read(0x000004), 5);
+    assert_eq!(plic2.read(0x001000) & 0x2, 0x2);
+}
+
+#[test]
+fn test_plic_set_pending_irq0_ignored() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.set_pending(0); // IRQ 0 is reserved
+    assert_eq!(plic.read(0x001000) & 0x1, 0);
+}
+
+#[test]
+fn test_plic_set_pending_out_of_range() {
+    let mut plic = microvm::devices::plic::Plic::new();
+    plic.set_pending(64); // Out of range
+    assert_eq!(plic.read(0x001000), 0);
+}
+
+#[test]
+fn test_plic_out_of_range_context() {
+    let plic = microvm::devices::plic::Plic::new();
+    assert!(!plic.has_interrupt(10)); // Only 2 contexts for 1 hart
+}
+
+// ===== Additional UART device tests =====
+
+#[test]
+fn test_uart_initial_lsr() {
+    let uart = microvm::devices::uart::Uart::new();
+    let lsr = uart.read(5);
+    assert_eq!(lsr & 0x60, 0x60);
+}
+
+#[test]
+fn test_uart_push_byte_and_read() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.push_byte(b'A');
+    assert_ne!(uart.read(5) & 0x01, 0);
+    let ch = uart.read_mut(0);
+    assert_eq!(ch, b'A' as u64);
+    assert_eq!(uart.read(5) & 0x01, 0);
+}
+
+#[test]
+fn test_uart_multiple_bytes_fifo_order() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.push_byte(b'H');
+    uart.push_byte(b'i');
+    assert_eq!(uart.read_mut(0), b'H' as u64);
+    assert_eq!(uart.read_mut(0), b'i' as u64);
+    assert_eq!(uart.read(5) & 0x01, 0);
+}
+
+#[test]
+fn test_uart_dlab_divisor_latch() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.write(3, 0x80);
+    uart.write(0, 0x0C);
+    uart.write(1, 0x00);
+    assert_eq!(uart.read(0), 0x0C);
+    assert_eq!(uart.read(1), 0x00);
+    uart.write(3, 0x03);
+}
+
+#[test]
+fn test_uart_ier_read_write() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.write(1, 0x03);
+    assert_eq!(uart.read(1), 0x03);
+}
+
+#[test]
+fn test_uart_scratch_register() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.write(7, 0x42);
+    assert_eq!(uart.read(7), 0x42);
+}
+
+#[test]
+fn test_uart_rda_interrupt() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.write(1, 0x01);
+    assert!(!uart.has_interrupt());
+    uart.push_byte(b'X');
+    assert!(uart.has_interrupt());
+}
+
+#[test]
+fn test_uart_save_restore_roundtrip() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.push_byte(b'T');
+    uart.write(1, 0x03);
+    uart.write(7, 0xAB);
+    let state = uart.save_state();
+    let mut uart2 = microvm::devices::uart::Uart::new();
+    uart2.restore_state(&state).unwrap();
+    assert_eq!(uart2.read_mut(0), b'T' as u64);
+    assert_eq!(uart2.read(1), 0x03);
+    assert_eq!(uart2.read(7), 0xAB);
+}
+
+#[test]
+fn test_uart_iir_no_interrupt_pending() {
+    let uart = microvm::devices::uart::Uart::new();
+    let iir = uart.read(2);
+    assert_eq!(iir & 0x01, 0x01);
+}
+
+#[test]
+fn test_uart_empty_read_returns_zero() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    assert_eq!(uart.read_mut(0), 0);
+}
+
+#[test]
+fn test_uart_lcr_write_read() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.write(3, 0x1B); // 8N1 + break
+    assert_eq!(uart.read(3), 0x1B);
+}
+
+#[test]
+fn test_uart_mcr_write_read() {
+    let mut uart = microvm::devices::uart::Uart::new();
+    uart.write(4, 0x0B);
+    assert_eq!(uart.read(4), 0x0B);
+}
+
+// ===== Sscofpmf extension tests =====
+
+#[test]
+fn test_sscofpmf_scountovf_reads_zero() {
+    // scountovf (0xDA0) should return 0 — no real HPM events to overflow
+    let (cpu, _bus) = run_program(&[], 0);
+    let val = cpu.csrs.read(microvm::cpu::csr::SCOUNTOVF);
+    assert_eq!(val, 0);
+}
+
+#[test]
+fn test_sscofpmf_mhpmevent_write_read() {
+    // mhpmevent3 (0x323) should be writable and readable
+    let (mut cpu, _bus) = run_program(&[], 0);
+    // Write privilege filtering bits (bits 62:58) + event selector
+    let val = (1u64 << 62) | (1u64 << 59) | 0x42; // OF=1, SINH=1, event=0x42
+    cpu.csrs.write(0x323, val);
+    assert_eq!(cpu.csrs.read(0x323), val);
+}
+
+#[test]
+fn test_sscofpmf_mhpmevent_range() {
+    // All mhpmevent3-31 (0x323-0x33F) should be writable
+    let (mut cpu, _bus) = run_program(&[], 0);
+    for addr in 0x323u16..=0x33F {
+        cpu.csrs.write(addr, 0xBEEF);
+        assert_eq!(cpu.csrs.read(addr), 0xBEEF, "mhpmevent at 0x{addr:03X}");
+    }
+}
+
+#[test]
+fn test_sscofpmf_lcofip_in_mip() {
+    // LCOFIP is bit 13 in mip — should be writable
+    let (mut cpu, _bus) = run_program(&[], 0);
+    let old_mip = cpu.csrs.read(microvm::cpu::csr::MIP);
+    cpu.csrs.write(
+        microvm::cpu::csr::MIP,
+        old_mip | microvm::cpu::csr::LCOFIP_BIT,
+    );
+    assert_ne!(
+        cpu.csrs.read(microvm::cpu::csr::MIP) & microvm::cpu::csr::LCOFIP_BIT,
+        0
+    );
+}
+
+#[test]
+fn test_sscofpmf_lcofip_in_mie() {
+    // LCOFIP bit 13 in mie — should be writable to enable overflow interrupts
+    let (mut cpu, _bus) = run_program(&[], 0);
+    cpu.csrs
+        .write(microvm::cpu::csr::MIE, microvm::cpu::csr::LCOFIP_BIT);
+    assert_ne!(
+        cpu.csrs.read(microvm::cpu::csr::MIE) & microvm::cpu::csr::LCOFIP_BIT,
+        0
+    );
+}
+
+#[test]
+fn test_dtb_advertises_sscofpmf() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    let dtb_str = String::from_utf8_lossy(&dtb);
+    assert!(
+        dtb_str.contains("sscofpmf"),
+        "DTB should advertise sscofpmf"
     );
 }

@@ -61,6 +61,13 @@ pub const MCOUNTINHIBIT: u16 = 0x320;
 // User-level HPM counters (0xC03-0xC1F) — shadows of above
 // Machine HPM event selectors (0x323-0x33F)
 
+// Sscofpmf extension — Supervisor-level Count Overflow and Privilege Mode Filtering
+// scountovf: read-only bitmap of counters that have overflowed (bits 31:3 for hpmcounter3-31)
+pub const SCOUNTOVF: u16 = 0xDA0;
+// LCOFIP (Local Counter Overflow Interrupt Pending) — bit 13 in mip/mie
+#[allow(dead_code)]
+pub const LCOFIP_BIT: u64 = 1 << 13;
+
 // Machine environment config high (RV64: reads as 0)
 pub const MENVCFGH: u16 = 0x31A;
 
@@ -301,8 +308,10 @@ impl CsrFile {
             MCOUNTINHIBIT => self.regs[MCOUNTINHIBIT as usize],
             // Machine HPM counters (mhpmcounter3-31) — all zero
             0xB03..=0xB1F => 0,
-            // Machine HPM event selectors (mhpmevent3-31) — all zero
-            0x323..=0x33F => 0,
+            // Machine HPM event selectors (mhpmevent3-31)
+            0x323..=0x33F => self.regs[addr as usize],
+            // Sscofpmf: scountovf — read-only overflow bitmap (always 0, no real HPM events)
+            SCOUNTOVF => 0,
             // User HPM counters (hpmcounter3-31) — shadows, all zero
             0xC03..=0xC1F => 0,
             // Smstateen CSRs
@@ -490,8 +499,12 @@ impl CsrFile {
             FCSR => {
                 self.regs[FCSR as usize] = val & 0xFF;
             }
-            // HPM counters and event selectors — writable but no effect
-            0xB03..=0xB1F | 0x323..=0x33F => {}
+            // HPM counters — writable but no effect
+            0xB03..=0xB1F => {}
+            // HPM event selectors — store for Sscofpmf privilege filtering bits
+            0x323..=0x33F => {
+                self.regs[addr as usize] = val;
+            }
             // Smstateen CSRs
             MSTATEEN0 | MSTATEEN1 | MSTATEEN2 | MSTATEEN3 => {
                 self.regs[addr as usize] = val;
