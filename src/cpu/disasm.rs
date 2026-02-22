@@ -873,6 +873,8 @@ pub fn mnemonic(inst: u32) -> &'static str {
                 "vwfpu"
             } else if funct3 == 1 || funct3 == 5 {
                 "vfpu"
+            } else if funct3 == 0 && funct7 >> 1 == 0b100111 && (funct7 & 1) == 1 {
+                "vmove" // vmvNr.v (whole-register move)
             } else if (funct3 == 0 || funct3 == 3 || funct3 == 4)
                 && matches!(
                     funct7 >> 1,

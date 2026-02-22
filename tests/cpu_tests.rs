@@ -8794,12 +8794,12 @@ fn test_vsmul_vv() {
     cpu.csrs.write_raw(csr::VXRM, 0);
 
     // v2[0] = 0x40000000 (0.5 in Q31 format)
-    // v3[0] = 0x40000000 (0.5 in Q31 format)
+    // v5[0] = 0x40000000 (0.5 in Q31 format)
     // Expected: 0.5 * 0.5 = 0.25 → 0x20000000
     cpu.vregs.write_elem(2, 32, 0, 0x40000000);
-    cpu.vregs.write_elem(3, 32, 0, 0x40000000);
+    cpu.vregs.write_elem(5, 32, 0, 0x40000000);
 
-    let inst = opivv(0b100111, 4, 3, 2, 1); // vsmul.vv v4, v2, v3
+    let inst = opivv(0b100111, 4, 5, 2, 1); // vsmul.vv v4, v2, v5
     bus.write32(DRAM_BASE + 4, inst);
     cpu.step(&mut bus);
 
@@ -8823,9 +8823,9 @@ fn test_vsmul_saturation() {
 
     // 0x80000000 = INT32_MIN, multiply by itself should saturate
     cpu.vregs.write_elem(2, 32, 0, 0x80000000);
-    cpu.vregs.write_elem(3, 32, 0, 0x80000000);
+    cpu.vregs.write_elem(5, 32, 0, 0x80000000);
 
-    let inst = opivv(0b100111, 4, 3, 2, 1);
+    let inst = opivv(0b100111, 4, 5, 2, 1);
     bus.write32(DRAM_BASE + 4, inst);
     cpu.step(&mut bus);
 
@@ -9295,9 +9295,9 @@ fn test_vfncvt_x_f() {
 
 #[test]
 fn test_disasm_vfixpt() {
-    // Test that vsmul is classified as "vfixpt"
+    // Test that vsmul is classified as "vfixpt" (vm=0 → masked vsmul)
     use microvm::cpu::disasm::mnemonic;
-    let inst = opivv(0b100111, 4, 3, 2, 1); // vsmul.vv
+    let inst = opivv(0b100111, 4, 3, 2, 0); // vsmul.vv (vm=0)
     assert_eq!(mnemonic(inst), "vfixpt");
 }
 
@@ -9307,4 +9307,370 @@ fn test_disasm_vwfpu() {
     use microvm::cpu::disasm::mnemonic;
     let inst = opfvv(0b110000, 4, 3, 2, 1); // vfwadd.vv
     assert_eq!(mnemonic(inst), "vwfpu");
+}
+
+// ============================================================================
+// Whole-register move: vmv1r.v, vmv2r.v, vmv4r.v, vmv8r.v
+// ============================================================================
+
+#[test]
+fn test_vmv1r_v() {
+    // vmv1r.v v4, v2 — copy 1 register
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    // Fill v2 with known data
+    for b in 0..16 {
+        cpu.vregs.data[2][b] = (b as u8) + 0xA0;
+    }
+
+    // vmv1r.v: funct6=100111, vm=1, vs1=0 (nr-1=0), vd=4, vs2=2
+    let inst = opivv(0b100111, 4, 0, 2, 1);
+    bus.write32(DRAM_BASE, inst);
+    cpu.step(&mut bus);
+
+    assert_eq!(
+        cpu.vregs.data[4], cpu.vregs.data[2],
+        "vmv1r.v: v4 should equal v2"
+    );
+}
+
+#[test]
+fn test_vmv2r_v() {
+    // vmv2r.v v4, v2 — copy 2 registers (v2,v3 → v4,v5)
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    for b in 0..16 {
+        cpu.vregs.data[2][b] = (b as u8) + 0x10;
+        cpu.vregs.data[3][b] = (b as u8) + 0x20;
+    }
+
+    // vmv2r.v: vs1=1 (nr-1=1)
+    let inst = opivv(0b100111, 4, 1, 2, 1);
+    bus.write32(DRAM_BASE, inst);
+    cpu.step(&mut bus);
+
+    assert_eq!(
+        cpu.vregs.data[4], cpu.vregs.data[2],
+        "vmv2r.v: v4 should equal v2"
+    );
+    assert_eq!(
+        cpu.vregs.data[5], cpu.vregs.data[3],
+        "vmv2r.v: v5 should equal v3"
+    );
+}
+
+#[test]
+fn test_vmv4r_v() {
+    // vmv4r.v v8, v4 — copy 4 registers
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    for r in 0..4 {
+        for b in 0..16 {
+            cpu.vregs.data[4 + r][b] = ((r * 16 + b) as u8) ^ 0xFF;
+        }
+    }
+
+    // vmv4r.v: vs1=3 (nr-1=3)
+    let inst = opivv(0b100111, 8, 3, 4, 1);
+    bus.write32(DRAM_BASE, inst);
+    cpu.step(&mut bus);
+
+    for r in 0..4 {
+        assert_eq!(
+            cpu.vregs.data[8 + r],
+            cpu.vregs.data[4 + r],
+            "vmv4r.v: v{} should equal v{}",
+            8 + r,
+            4 + r
+        );
+    }
+}
+
+#[test]
+fn test_vmv8r_v() {
+    // vmv8r.v v16, v8 — copy 8 registers
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    for r in 0..8 {
+        for b in 0..16 {
+            cpu.vregs.data[8 + r][b] = ((r * 16 + b) as u8).wrapping_mul(7);
+        }
+    }
+
+    // vmv8r.v: vs1=7 (nr-1=7)
+    let inst = opivv(0b100111, 16, 7, 8, 1);
+    bus.write32(DRAM_BASE, inst);
+    cpu.step(&mut bus);
+
+    for r in 0..8 {
+        assert_eq!(
+            cpu.vregs.data[16 + r],
+            cpu.vregs.data[8 + r],
+            "vmv8r.v: v{} should equal v{}",
+            16 + r,
+            8 + r
+        );
+    }
+}
+
+#[test]
+fn test_vmvnr_works_with_vill() {
+    // vmvNr.v should work even when vtype.vill is set (no valid SEW/LMUL needed)
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    // Set vill by writing invalid vtype
+    use microvm::cpu::csr;
+    cpu.csrs.write_raw(csr::VTYPE, 1u64 << 63); // vill bit set
+
+    for b in 0..16 {
+        cpu.vregs.data[2][b] = 0xBB;
+    }
+
+    let inst = opivv(0b100111, 6, 0, 2, 1); // vmv1r.v v6, v2
+    bus.write32(DRAM_BASE, inst);
+    cpu.step(&mut bus);
+
+    assert_eq!(
+        cpu.vregs.data[6], cpu.vregs.data[2],
+        "vmvNr.v should work with vill set"
+    );
+}
+
+#[test]
+fn test_disasm_vmove() {
+    // vmv1r.v should be classified as "vmove"
+    use microvm::cpu::disasm::mnemonic;
+    let inst = opivv(0b100111, 4, 0, 2, 1); // vmv1r.v v4, v2
+    assert_eq!(mnemonic(inst), "vmove");
+    let inst2 = opivv(0b100111, 8, 3, 4, 1); // vmv4r.v
+    assert_eq!(mnemonic(inst2), "vmove");
+    let inst3 = opivv(0b100111, 16, 7, 8, 1); // vmv8r.v
+    assert_eq!(mnemonic(inst3), "vmove");
+}
+
+// ============================================================================
+// Segment loads/stores (vlseg/vsseg)
+// ============================================================================
+
+/// Helper: encode segment load vlsegNe<eew>.v with nf fields
+fn vlseg(nf: u32, eew: u32, vd: u32, rs1: u32, vm: u32) -> u32 {
+    let width = match eew {
+        8 => 0,
+        16 => 5,
+        32 => 6,
+        64 => 7,
+        _ => 0,
+    };
+    ((nf & 0x7) << 29)
+        | ((vm & 1) << 25)
+        | ((rs1 & 0x1F) << 15)
+        | (width << 12)
+        | ((vd & 0x1F) << 7)
+        | 0x07
+}
+
+/// Helper: encode segment store vssegNe<eew>.v with nf fields
+fn vsseg(nf: u32, eew: u32, vs3: u32, rs1: u32, vm: u32) -> u32 {
+    let width = match eew {
+        8 => 0,
+        16 => 5,
+        32 => 6,
+        64 => 7,
+        _ => 0,
+    };
+    ((nf & 0x7) << 29)
+        | ((vm & 1) << 25)
+        | ((rs1 & 0x1F) << 15)
+        | (width << 12)
+        | ((vs3 & 0x1F) << 7)
+        | 0x27
+}
+
+#[test]
+fn test_vlseg2e32() {
+    // vlseg2e32.v v2, (x10) — load 2 fields of 32-bit each per element
+    // Memory layout: [f0_e0, f1_e0, f0_e1, f1_e1, ...]
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    // Store interleaved data in memory
+    let data_addr = DRAM_BASE + 0x100;
+    bus.write32(data_addr, 0xAAAA0000); // field 0, elem 0
+    bus.write32(data_addr + 4, 0xBBBB0000); // field 1, elem 0
+    bus.write32(data_addr + 8, 0xAAAA0001); // field 0, elem 1
+    bus.write32(data_addr + 12, 0xBBBB0001); // field 1, elem 1
+
+    cpu.regs[1] = 2; // vl = 2
+    cpu.regs[10] = data_addr;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32, m1
+        vlseg(1, 32, 2, 10, 1),       // vlseg2e32.v v2, (x10) — nf=1 means 2 fields
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+
+    // v2 should have field 0 values, v3 should have field 1 values
+    assert_eq!(
+        cpu.vregs.read_elem(2, 32, 0),
+        0xAAAA0000,
+        "v2[0] = field0, elem0"
+    );
+    assert_eq!(
+        cpu.vregs.read_elem(2, 32, 1),
+        0xAAAA0001,
+        "v2[1] = field0, elem1"
+    );
+    assert_eq!(
+        cpu.vregs.read_elem(3, 32, 0),
+        0xBBBB0000,
+        "v3[0] = field1, elem0"
+    );
+    assert_eq!(
+        cpu.vregs.read_elem(3, 32, 1),
+        0xBBBB0001,
+        "v3[1] = field1, elem1"
+    );
+}
+
+#[test]
+fn test_vsseg2e32() {
+    // vsseg2e32.v v4, (x10) — store 2 fields per element
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    cpu.regs[1] = 2;
+    let data_addr = DRAM_BASE + 0x100;
+    cpu.regs[10] = data_addr;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32, m1
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    // Set up v4 (field 0) and v5 (field 1)
+    cpu.vregs.write_elem(4, 32, 0, 0x11110000);
+    cpu.vregs.write_elem(4, 32, 1, 0x11110001);
+    cpu.vregs.write_elem(5, 32, 0, 0x22220000);
+    cpu.vregs.write_elem(5, 32, 1, 0x22220001);
+
+    let inst = vsseg(1, 32, 4, 10, 1); // vsseg2e32.v v4, (x10)
+    bus.write32(DRAM_BASE + 4, inst);
+    cpu.step(&mut bus);
+
+    // Memory should be interleaved: [f0_e0, f1_e0, f0_e1, f1_e1]
+    assert_eq!(bus.read32(data_addr), 0x11110000, "mem[0] = v4[0]");
+    assert_eq!(bus.read32(data_addr + 4), 0x22220000, "mem[1] = v5[0]");
+    assert_eq!(bus.read32(data_addr + 8), 0x11110001, "mem[2] = v4[1]");
+    assert_eq!(bus.read32(data_addr + 12), 0x22220001, "mem[3] = v5[1]");
+}
+
+#[test]
+fn test_vlseg3e8() {
+    // vlseg3e8.v v8, (x10) — 3 byte fields (e.g., RGB pixel data)
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let data_addr = DRAM_BASE + 0x200;
+    // RGB data: [R0, G0, B0, R1, G1, B1]
+    bus.write8(data_addr, 0xFF); // R0
+    bus.write8(data_addr + 1, 0x00); // G0
+    bus.write8(data_addr + 2, 0x80); // B0
+    bus.write8(data_addr + 3, 0x10); // R1
+    bus.write8(data_addr + 4, 0x20); // G1
+    bus.write8(data_addr + 5, 0x30); // B1
+
+    cpu.regs[1] = 2;
+    cpu.regs[10] = data_addr;
+    let prog = [
+        vsetvli(0, 1, 0b0_0_000_000), // e8, m1
+        vlseg(2, 8, 8, 10, 1),        // vlseg3e8.v v8, (x10) — nf=2 means 3 fields
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+
+    // v8 = R channel, v9 = G channel, v10 = B channel
+    assert_eq!(cpu.vregs.read_elem(8, 8, 0), 0xFF, "R0");
+    assert_eq!(cpu.vregs.read_elem(8, 8, 1), 0x10, "R1");
+    assert_eq!(cpu.vregs.read_elem(9, 8, 0), 0x00, "G0");
+    assert_eq!(cpu.vregs.read_elem(9, 8, 1), 0x20, "G1");
+    assert_eq!(cpu.vregs.read_elem(10, 8, 0), 0x80, "B0");
+    assert_eq!(cpu.vregs.read_elem(10, 8, 1), 0x30, "B1");
+}
+
+#[test]
+fn test_vlseg_vsseg_roundtrip() {
+    // Store segments then load them back
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    cpu.regs[1] = 4; // vl = 4
+    let data_addr = DRAM_BASE + 0x300;
+    cpu.regs[10] = data_addr;
+
+    let prog = [vsetvli(0, 1, 0b0_0_001_000)]; // e16, m1
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    // Fill v2 and v3 with data (2 fields × 4 elements)
+    for i in 0..4u64 {
+        cpu.vregs.write_elem(2, 16, i as usize, 0x1000 + i);
+        cpu.vregs.write_elem(3, 16, i as usize, 0x2000 + i);
+    }
+
+    // Store: vsseg2e16.v v2, (x10)
+    let store_inst = vsseg(1, 16, 2, 10, 1);
+    bus.write32(DRAM_BASE + 4, store_inst);
+    cpu.step(&mut bus);
+
+    // Clear v6, v7
+    cpu.vregs.data[6] = [0u8; 16];
+    cpu.vregs.data[7] = [0u8; 16];
+
+    // Load back into v6: vlseg2e16.v v6, (x10)
+    let load_inst = vlseg(1, 16, 6, 10, 1);
+    bus.write32(DRAM_BASE + 8, load_inst);
+    cpu.step(&mut bus);
+
+    for i in 0..4 {
+        assert_eq!(
+            cpu.vregs.read_elem(6, 16, i),
+            0x1000 + i as u64,
+            "field0 elem{i}"
+        );
+        assert_eq!(
+            cpu.vregs.read_elem(7, 16, i),
+            0x2000 + i as u64,
+            "field1 elem{i}"
+        );
+    }
 }

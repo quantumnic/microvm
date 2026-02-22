@@ -282,6 +282,20 @@ fn execute_v_arith(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> boo
         return true;
     }
 
+    // Whole-register move: vmv<nr>r.v — doesn't need valid vtype
+    // funct3=0 (OPIVV), funct6=0b100111, vm=1, vs1 encodes (nr-1)
+    if funct3 == 0 && funct6 == 0b100111 && vm == 1 {
+        let nr = rs1 + 1; // vs1 field = nr-1
+        if matches!(nr, 1 | 2 | 4 | 8) {
+            set_vs_dirty(cpu);
+            for r in 0..nr {
+                cpu.vregs.data[rd + r] = cpu.vregs.data[rs2 + r];
+            }
+            cpu.pc += inst_len;
+            return true;
+        }
+    }
+
     let vtype = current_vtype(cpu);
     if vtype.vill {
         cpu.handle_exception(2, raw as u64, bus);
@@ -3253,59 +3267,72 @@ fn execute_v_load(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> bool
             }
         }
         0 => {
-            // Unit-stride load
+            // Unit-stride load (with optional segment: nf+1 fields)
             let vl = current_vl(cpu);
             let eew_bytes = eew as u64 / 8;
+            let nfields = nf + 1;
             for i in 0..vl as usize {
                 if !elem_active(cpu, vm, i) {
                     continue;
                 }
-                let addr = base + (i as u64) * eew_bytes;
-                match v_load_elem(cpu, bus, addr, eew) {
-                    Ok(val) => cpu.vregs.write_elem(vd, eew, i, val),
-                    Err(e) => {
-                        cpu.handle_exception(e, addr, bus);
-                        return true;
+                for f in 0..nfields {
+                    let addr = base + (i * nfields + f) as u64 * eew_bytes;
+                    match v_load_elem(cpu, bus, addr, eew) {
+                        Ok(val) => cpu.vregs.write_elem(vd + f, eew, i, val),
+                        Err(e) => {
+                            cpu.handle_exception(e, addr, bus);
+                            return true;
+                        }
                     }
                 }
             }
         }
         2 => {
-            // Strided load: rs2 = stride
+            // Strided load: rs2 = stride (with optional segment)
             let rs2 = ((raw >> 20) & 0x1F) as usize;
             let stride = cpu.regs[rs2] as i64;
             let vl = current_vl(cpu);
+            let eew_bytes = eew as u64 / 8;
+            let nfields = nf + 1;
             for i in 0..vl as usize {
                 if !elem_active(cpu, vm, i) {
                     continue;
                 }
-                let addr = (base as i64 + (i as i64) * stride) as u64;
-                match v_load_elem(cpu, bus, addr, eew) {
-                    Ok(val) => cpu.vregs.write_elem(vd, eew, i, val),
-                    Err(e) => {
-                        cpu.handle_exception(e, addr, bus);
-                        return true;
+                let seg_base = (base as i64 + (i as i64) * stride) as u64;
+                for f in 0..nfields {
+                    let addr = seg_base + f as u64 * eew_bytes;
+                    match v_load_elem(cpu, bus, addr, eew) {
+                        Ok(val) => cpu.vregs.write_elem(vd + f, eew, i, val),
+                        Err(e) => {
+                            cpu.handle_exception(e, addr, bus);
+                            return true;
+                        }
                     }
                 }
             }
         }
         1 | 3 => {
-            // Indexed load: vs2 contains indices
+            // Indexed load: vs2 contains indices (with optional segment)
             let vs2_reg = ((raw >> 20) & 0x1F) as usize;
             let vl = current_vl(cpu);
-            let idx_sew = eew; // unordered(1) / ordered(3) use same logic
+            let idx_sew = eew;
+            let data_sew = vtype.sew;
+            let data_bytes = data_sew as u64 / 8;
+            let nfields = nf + 1;
             for i in 0..vl as usize {
                 if !elem_active(cpu, vm, i) {
                     continue;
                 }
                 let offset = cpu.vregs.read_elem(vs2_reg, idx_sew, i);
-                let addr = base.wrapping_add(offset);
-                let data_sew = vtype.sew;
-                match v_load_elem(cpu, bus, addr, data_sew) {
-                    Ok(val) => cpu.vregs.write_elem(vd, data_sew, i, val),
-                    Err(e) => {
-                        cpu.handle_exception(e, addr, bus);
-                        return true;
+                let seg_base = base.wrapping_add(offset);
+                for f in 0..nfields {
+                    let addr = seg_base + f as u64 * data_bytes;
+                    match v_load_elem(cpu, bus, addr, data_sew) {
+                        Ok(val) => cpu.vregs.write_elem(vd + f, data_sew, i, val),
+                        Err(e) => {
+                            cpu.handle_exception(e, addr, bus);
+                            return true;
+                        }
                     }
                 }
             }
@@ -3387,54 +3414,67 @@ fn execute_v_store(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> boo
             }
         }
         0 => {
-            // Unit-stride store
+            // Unit-stride store (with optional segment: nf+1 fields)
             let vl = current_vl(cpu);
             let eew_bytes = eew as u64 / 8;
+            let nfields = nf + 1;
             for i in 0..vl as usize {
                 if !elem_active(cpu, vm, i) {
                     continue;
                 }
-                let addr = base + (i as u64) * eew_bytes;
-                let val = cpu.vregs.read_elem(vs3, eew, i);
-                if let Err(e) = v_store_elem(cpu, bus, addr, eew, val) {
-                    cpu.handle_exception(e, addr, bus);
-                    return true;
+                for f in 0..nfields {
+                    let addr = base + (i * nfields + f) as u64 * eew_bytes;
+                    let val = cpu.vregs.read_elem(vs3 + f, eew, i);
+                    if let Err(e) = v_store_elem(cpu, bus, addr, eew, val) {
+                        cpu.handle_exception(e, addr, bus);
+                        return true;
+                    }
                 }
             }
         }
         2 => {
-            // Strided store
+            // Strided store (with optional segment)
             let rs2 = ((raw >> 20) & 0x1F) as usize;
             let stride = cpu.regs[rs2] as i64;
             let vl = current_vl(cpu);
+            let eew_bytes = eew as u64 / 8;
+            let nfields = nf + 1;
             for i in 0..vl as usize {
                 if !elem_active(cpu, vm, i) {
                     continue;
                 }
-                let addr = (base as i64 + (i as i64) * stride) as u64;
-                let val = cpu.vregs.read_elem(vs3, eew, i);
-                if let Err(e) = v_store_elem(cpu, bus, addr, eew, val) {
-                    cpu.handle_exception(e, addr, bus);
-                    return true;
+                let seg_base = (base as i64 + (i as i64) * stride) as u64;
+                for f in 0..nfields {
+                    let addr = seg_base + f as u64 * eew_bytes;
+                    let val = cpu.vregs.read_elem(vs3 + f, eew, i);
+                    if let Err(e) = v_store_elem(cpu, bus, addr, eew, val) {
+                        cpu.handle_exception(e, addr, bus);
+                        return true;
+                    }
                 }
             }
         }
         1 | 3 => {
-            // Indexed store
+            // Indexed store (with optional segment)
             let vs2_reg = ((raw >> 20) & 0x1F) as usize;
             let vl = current_vl(cpu);
             let idx_sew = eew;
             let data_sew = vtype.sew;
+            let data_bytes = data_sew as u64 / 8;
+            let nfields = nf + 1;
             for i in 0..vl as usize {
                 if !elem_active(cpu, vm, i) {
                     continue;
                 }
                 let offset = cpu.vregs.read_elem(vs2_reg, idx_sew, i);
-                let addr = base.wrapping_add(offset);
-                let val = cpu.vregs.read_elem(vs3, data_sew, i);
-                if let Err(e) = v_store_elem(cpu, bus, addr, data_sew, val) {
-                    cpu.handle_exception(e, addr, bus);
-                    return true;
+                let seg_base = base.wrapping_add(offset);
+                for f in 0..nfields {
+                    let addr = seg_base + f as u64 * data_bytes;
+                    let val = cpu.vregs.read_elem(vs3 + f, data_sew, i);
+                    if let Err(e) = v_store_elem(cpu, bus, addr, data_sew, val) {
+                        cpu.handle_exception(e, addr, bus);
+                        return true;
+                    }
                 }
             }
         }
