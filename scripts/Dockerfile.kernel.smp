@@ -1,0 +1,66 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+    bc bison flex libssl-dev make libelf-dev \
+    wget xz-utils cpio && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+ARG KERNEL_VERSION=6.12.5
+
+# Download kernel
+RUN wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz" -O linux.tar.xz && \
+    tar xf linux.tar.xz && \
+    mv linux-${KERNEL_VERSION} linux && \
+    rm linux.tar.xz
+
+# Build minimal initramfs with a static init binary
+COPY init.c /build/initramfs_src/init.c
+RUN mkdir -p /build/initramfs/bin /build/initramfs/dev /build/initramfs/proc /build/initramfs/sys /build/initramfs/etc && \
+    mknod /build/initramfs/dev/console c 5 1 && \
+    mknod /build/initramfs/dev/ttyS0 c 4 64 && \
+    riscv64-linux-gnu-gcc -static -O2 -o /build/initramfs/bin/init /build/initramfs_src/init.c && \
+    ln -s bin/init /build/initramfs/init && \
+    cd /build/initramfs && find . | cpio -o -H newc > /build/initramfs.cpio
+
+# Configure and build SMP kernel
+RUN cd /build/linux && \
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- defconfig && \
+    scripts/config --enable CONFIG_SMP && \
+    scripts/config --set-val CONFIG_NR_CPUS 8 && \
+    scripts/config --disable CONFIG_MODULES && \
+    scripts/config --disable CONFIG_NUMA && \
+    scripts/config --disable CONFIG_AUDIT && \
+    scripts/config --disable CONFIG_CGROUPS && \
+    scripts/config --disable CONFIG_NET && \
+    scripts/config --disable CONFIG_WIRELESS && \
+    scripts/config --disable CONFIG_BT && \
+    scripts/config --disable CONFIG_SOUND && \
+    scripts/config --disable CONFIG_USB && \
+    scripts/config --disable CONFIG_DRM && \
+    scripts/config --disable CONFIG_FB && \
+    scripts/config --disable CONFIG_INPUT && \
+    scripts/config --disable CONFIG_SERIO && \
+    scripts/config --disable CONFIG_HID && \
+    scripts/config --disable CONFIG_EFI && \
+    scripts/config --disable CONFIG_KEXEC && \
+    scripts/config --disable CONFIG_SECURITY && \
+    scripts/config --disable CONFIG_DEBUG_INFO && \
+    scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT && \
+    scripts/config --enable CONFIG_PRINTK && \
+    scripts/config --enable CONFIG_SERIAL_8250 && \
+    scripts/config --enable CONFIG_SERIAL_8250_CONSOLE && \
+    scripts/config --enable CONFIG_SERIAL_EARLYCON && \
+    scripts/config --enable CONFIG_BLK_DEV_INITRD && \
+    scripts/config --enable CONFIG_DEVTMPFS && \
+    scripts/config --enable CONFIG_DEVTMPFS_MOUNT && \
+    scripts/config --enable CONFIG_VIRTIO && \
+    scripts/config --enable CONFIG_VIRTIO_MMIO && \
+    scripts/config --enable CONFIG_RISCV_SBI && \
+    scripts/config --set-str CONFIG_INITRAMFS_SOURCE "/build/initramfs.cpio" && \
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- olddefconfig && \
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) Image
+
+CMD ["cp", "/build/linux/arch/riscv/boot/Image", "/output/Image"]

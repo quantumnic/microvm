@@ -398,6 +398,34 @@ impl Vm {
                     let target = &mut self.cpus[req.hart_id];
                     if target.hart_state == crate::cpu::HartState::Stopped {
                         target.reset(req.start_addr);
+                        // Set up CSRs same as boot ROM firmware
+                        // PMP: allow all access
+                        target.csrs.write(csr::PMPADDR0, u64::MAX);
+                        target.csrs.write(csr::PMPCFG0, 0x0F); // TOR, RWX
+                                                               // Delegate exceptions/interrupts to S-mode
+                        target.csrs.write(csr::MEDELEG, 0xB1FF);
+                        target
+                            .csrs
+                            .write(csr::MIDELEG, (1 << 1) | (1 << 5) | (1 << 9));
+                        // Counter access
+                        target.csrs.write(csr::MCOUNTEREN, 7);
+                        target.csrs.write(csr::SCOUNTEREN, 7);
+                        // Enable Sstc + Svadu
+                        target.csrs.write(csr::MENVCFG, (1u64 << 63) | (1u64 << 61));
+                        // mtvec: point to boot ROM trap handler (MRET at DRAM_BASE+0x100)
+                        target
+                            .csrs
+                            .write(csr::MTVEC, crate::memory::DRAM_BASE + 0x100);
+                        // Set up mstatus: SXL=2, UXL=2, MPP=S(01), MPIE=1, FS/VS=Initial
+                        // Must use write_raw to set SXL/UXL since write() treats them as readonly
+                        let mstatus = (2u64 << 34)   // SXL=2 (64-bit)
+                            | (2u64 << 32)            // UXL=2 (64-bit)
+                            | (1u64 << 13)            // FS=Initial
+                            | (1u64 << 11)            // MPP=S
+                            | (1u64 << 9)             // VS=Initial
+                            | (1u64 << 7); // MPIE
+                        target.csrs.write_raw(csr::MSTATUS, mstatus);
+                        // Enter S-mode
                         target.mode = crate::cpu::PrivilegeMode::Supervisor;
                         target.regs[10] = req.hart_id as u64; // a0 = hart_id
                         target.regs[11] = req.opaque; // a1 = opaque

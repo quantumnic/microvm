@@ -35,10 +35,16 @@ impl VectorRegFile {
         }
     }
 
-    /// Read element `idx` of register `reg` as the given SEW width
+    /// Read element `idx` of register group starting at `reg` as the given SEW width.
+    /// Handles LMUL>1 by spanning across consecutive registers.
     pub fn read_elem(&self, reg: usize, sew: u32, idx: usize) -> u64 {
-        let off = idx * (sew as usize / 8);
-        let b = &self.data[reg];
+        let byte_off = idx * (sew as usize / 8);
+        let r = reg + byte_off / VLENB;
+        let off = byte_off % VLENB;
+        if r >= 32 {
+            return 0;
+        }
+        let b = &self.data[r];
         match sew {
             8 => b[off] as u64,
             16 => u16::from_le_bytes([b[off], b[off + 1]]) as u64,
@@ -57,10 +63,16 @@ impl VectorRegFile {
         }
     }
 
-    /// Write element `idx` of register `reg` as the given SEW width
+    /// Write element `idx` of register group starting at `reg` as the given SEW width.
+    /// Handles LMUL>1 by spanning across consecutive registers.
     pub fn write_elem(&mut self, reg: usize, sew: u32, idx: usize, val: u64) {
-        let off = idx * (sew as usize / 8);
-        let b = &mut self.data[reg];
+        let byte_off = idx * (sew as usize / 8);
+        let r = reg + byte_off / VLENB;
+        let off = byte_off % VLENB;
+        if r >= 32 {
+            return;
+        }
+        let b = &mut self.data[r];
         match sew {
             8 => b[off] = val as u8,
             16 => {
