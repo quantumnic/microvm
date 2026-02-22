@@ -6,3 +6,4 @@ Cargo.lock
 .DS_Store
 tests/boot-sim/boot-sim.elf
 linux/
+linux-smp/
