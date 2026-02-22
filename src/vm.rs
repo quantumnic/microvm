@@ -43,6 +43,9 @@ impl Vm {
         bus.clint = crate::devices::clint::Clint::with_harts(num_harts);
         bus.plic = crate::devices::plic::Plic::with_harts(num_harts);
         bus.num_harts = num_harts;
+        // hart_states: 0=STARTED, 1=STOPPED, 2=START_PENDING, 3=STOP_PENDING, 4=SUSPENDED, 5=SUSPEND_PENDING, 6=RESUME_PENDING
+        bus.hart_states = vec![1u64; num_harts]; // all STOPPED initially
+        bus.hart_states[0] = 0; // hart 0 is STARTED
 
         let mut cpus = Vec::with_capacity(num_harts);
         for i in 0..num_harts {
@@ -440,24 +443,52 @@ impl Vm {
                 }
             }
 
-            // Handle IPI: CLINT MSIP sets SSIP for S-mode software interrupts
-            // Linux uses SBI send_ipi which writes CLINT msip, and expects SSIP
+            // Handle IPI: CLINT MSIP → set SSIP then clear MSIP (mimics OpenSBI M-mode handler)
+            // Linux clears SSIP via CSR; we must not re-set it from a stale MSIP
             for hart_id in 0..num_harts {
                 if self.bus.clint.msip[hart_id] & 1 != 0 {
                     let cpu = &mut self.cpus[hart_id];
                     // Set SSIP (bit 1) — S-mode software interrupt pending
                     let mip = cpu.csrs.read(csr::MIP);
                     cpu.csrs.write(csr::MIP, mip | (1 << 1));
+                    // Clear MSIP after propagation (like OpenSBI's M-mode IPI handler)
+                    self.bus.clint.msip[hart_id] = 0;
                     // Wake from WFI if suspended
                     if cpu.hart_state == crate::cpu::HartState::Suspended {
                         cpu.hart_state = crate::cpu::HartState::Started;
                         cpu.wfi = false;
                     }
-                } else {
-                    // Clear SSIP when MSIP is cleared
-                    let cpu = &mut self.cpus[hart_id];
-                    let mip = cpu.csrs.read(csr::MIP);
-                    cpu.csrs.write(csr::MIP, mip & !(1 << 1));
+                }
+            }
+
+            // Sync hart states to bus for SBI hart_get_status visibility
+            for h in 0..num_harts {
+                self.bus.hart_states[h] = match self.cpus[h].hart_state {
+                    crate::cpu::HartState::Started => 0,
+                    crate::cpu::HartState::Stopped => 1,
+                    crate::cpu::HartState::StartPending => 2,
+                    crate::cpu::HartState::Suspended => 4,
+                };
+            }
+
+            // Process remote TLB flush requests from SBI RFENCE
+            while let Some(req) = self.bus.tlb_flush_queue.pop() {
+                if req.hart_id < num_harts {
+                    let target_cpu = &mut self.cpus[req.hart_id];
+                    match req.start_addr {
+                        None => target_cpu.mmu.flush_tlb(),
+                        Some(start) => {
+                            let end = start.saturating_add(req.size);
+                            let mut addr = start & !0xFFF;
+                            while addr < end {
+                                target_cpu.mmu.flush_tlb_vaddr(addr);
+                                addr = addr.saturating_add(4096);
+                                if addr == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

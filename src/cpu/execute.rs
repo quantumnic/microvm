@@ -1600,16 +1600,12 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                     if target_hart >= bus.num_harts {
                         cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
                     } else if target_hart == cpu.hart_id as usize {
-                        // Asking about ourselves — we're running
                         cpu.regs[10] = 0; // SBI_SUCCESS
                         cpu.regs[11] = 0; // STARTED
                     } else {
-                        // For other harts, we can't see their state from here.
-                        // Return STARTED if they have pending start, STOPPED otherwise.
-                        // The VM loop will set the actual state.
-                        // For now, report STOPPED — the VM loop handles accuracy.
+                        // Read actual hart state from bus (synced by VM loop)
                         cpu.regs[10] = 0; // SBI_SUCCESS
-                        cpu.regs[11] = 1; // STOPPED (best guess; VM loop corrects)
+                        cpu.regs[11] = bus.hart_states[target_hart];
                     }
                     true
                 }
@@ -1630,54 +1626,46 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
         }
         0x52464E43 => {
             // RFENCE extension — remote fence operations
-            // On a single-hart system these are all no-ops that succeed
+            // Queue TLB flush requests for target harts (processed by VM loop)
             match fid {
                 0 => {
-                    // remote_fence_i — icache flush (nop on single-hart)
+                    // remote_fence_i — icache flush (nop, we don't cache decoded insns)
                     cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true
                 }
-                1 => {
-                    // remote_sfence_vma
+                1 | 2 => {
+                    // remote_sfence_vma / remote_sfence_vma_asid
                     // a0 = hart_mask, a1 = hart_mask_base, a2 = start_addr, a3 = size
+                    let hart_mask = cpu.regs[10];
+                    let hart_mask_base = cpu.regs[11];
                     let start_addr = cpu.regs[12];
                     let size = cpu.regs[13];
-                    if size == 0 || size == u64::MAX {
-                        cpu.mmu.flush_tlb();
+                    let base = if hart_mask_base == u64::MAX {
+                        0usize
                     } else {
-                        // Flush specific pages
-                        let end = start_addr.saturating_add(size);
-                        let mut addr = start_addr & !0xFFF;
-                        while addr < end {
-                            cpu.mmu.flush_tlb_vaddr(addr);
-                            addr = addr.saturating_add(4096);
-                            if addr == 0 {
-                                break;
+                        hart_mask_base as usize
+                    };
+                    // Queue flush for each targeted hart
+                    for bit in 0..64usize {
+                        if hart_mask & (1u64 << bit) != 0 {
+                            let target = base + bit;
+                            if target < bus.num_harts {
+                                let req = crate::memory::TlbFlushRequest {
+                                    hart_id: target,
+                                    start_addr: if size == 0 || size == u64::MAX {
+                                        None
+                                    } else {
+                                        Some(start_addr)
+                                    },
+                                    size,
+                                };
+                                bus.tlb_flush_queue.push(req);
                             }
                         }
                     }
-                    cpu.regs[10] = 0;
-                    cpu.regs[11] = 0;
-                    true
-                }
-                2 => {
-                    // remote_sfence_vma_asid — same as above (single ASID)
-                    let start_addr = cpu.regs[12];
-                    let size = cpu.regs[13];
-                    if size == 0 || size == u64::MAX {
-                        cpu.mmu.flush_tlb();
-                    } else {
-                        let end = start_addr.saturating_add(size);
-                        let mut addr = start_addr & !0xFFF;
-                        while addr < end {
-                            cpu.mmu.flush_tlb_vaddr(addr);
-                            addr = addr.saturating_add(4096);
-                            if addr == 0 {
-                                break;
-                            }
-                        }
-                    }
+                    // Also flush calling hart's TLB (caller may be in the mask)
+                    cpu.mmu.flush_tlb();
                     cpu.regs[10] = 0;
                     cpu.regs[11] = 0;
                     true

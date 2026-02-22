@@ -9674,3 +9674,99 @@ fn test_vlseg_vsseg_roundtrip() {
         );
     }
 }
+
+#[test]
+fn test_tlb_flush_queue() {
+    // Test that TlbFlushRequest can be pushed and popped from bus
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    bus.num_harts = 2;
+    bus.tlb_flush_queue.push(microvm::memory::TlbFlushRequest {
+        hart_id: 1,
+        start_addr: None,
+        size: 0,
+    });
+    assert_eq!(bus.tlb_flush_queue.len(), 1);
+    let req = bus.tlb_flush_queue.pop().unwrap();
+    assert_eq!(req.hart_id, 1);
+    assert!(req.start_addr.is_none());
+}
+
+#[test]
+fn test_tlb_flush_queue_page_range() {
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    bus.num_harts = 4;
+    bus.tlb_flush_queue.push(microvm::memory::TlbFlushRequest {
+        hart_id: 2,
+        start_addr: Some(0x8020_0000),
+        size: 0x3000,
+    });
+    let req = bus.tlb_flush_queue.pop().unwrap();
+    assert_eq!(req.hart_id, 2);
+    assert_eq!(req.start_addr, Some(0x8020_0000));
+    assert_eq!(req.size, 0x3000);
+}
+
+#[test]
+fn test_hart_states_on_bus() {
+    // Test that hart_states vector can be used for SBI hart_get_status
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    bus.num_harts = 4;
+    bus.hart_states = vec![0, 1, 1, 1]; // hart 0 started, rest stopped
+    assert_eq!(bus.hart_states[0], 0); // STARTED
+    assert_eq!(bus.hart_states[1], 1); // STOPPED
+    bus.hart_states[1] = 0; // Mark hart 1 as STARTED
+    assert_eq!(bus.hart_states[1], 0);
+}
+
+#[test]
+fn test_hart_get_status_reads_bus() {
+    // SBI HSM hart_get_status should read from bus.hart_states
+    let kernel = vec![
+        0x00200813_u32, // li a6, 2 (fid=hart_get_status)
+        0x00100513,     // li a0, 1 (query hart 1)
+        0x00000073,     // ecall
+        0x00000013,     // nop
+    ];
+
+    let mut bus = Bus::new(128 * 1024 * 1024);
+    bus.num_harts = 2;
+    bus.hart_states = vec![0, 0]; // Both harts STARTED
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let kernel_entry = DRAM_BASE + 0x200000;
+
+    let kernel_bytes: Vec<u8> = kernel.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&kernel_bytes, 0x200000);
+
+    let dtb_data = microvm::dtb::generate_dtb(128 * 1024 * 1024, "console=ttyS0", false, None);
+    let dtb_addr = DRAM_BASE + 128 * 1024 * 1024 - ((dtb_data.len() as u64 + 0xFFF) & !0xFFF);
+    bus.load_binary(&dtb_data, dtb_addr - DRAM_BASE);
+
+    let boot_code = microvm::memory::rom::BootRom::generate(kernel_entry, dtb_addr);
+    bus.load_binary(&boot_code, 0);
+
+    cpu.reset(DRAM_BASE);
+
+    let mut reached_smode = false;
+    for _ in 0..300 {
+        cpu.csrs.mtime = bus.clint.mtime();
+        if !reached_smode
+            && cpu.pc == kernel_entry
+            && cpu.mode == microvm::cpu::PrivilegeMode::Supervisor
+        {
+            cpu.regs[17] = 0x48534D; // a7 = HSM extension ID
+            reached_smode = true;
+        }
+        if !cpu.step(&mut bus) {
+            break;
+        }
+        // Check if ecall was processed (PC advanced past ecall)
+        if reached_smode && cpu.pc >= kernel_entry + 12 {
+            break;
+        }
+    }
+    assert!(reached_smode);
+    // hart_get_status for hart 1 should return 0 (STARTED) since bus.hart_states[1] = 0
+    assert_eq!(cpu.regs[10], 0, "SBI_SUCCESS");
+    assert_eq!(cpu.regs[11], 0, "hart 1 should be STARTED");
+}

@@ -14,6 +14,14 @@ pub struct HartStartRequest {
     pub opaque: u64,
 }
 
+/// Remote TLB flush request from SBI RFENCE
+#[derive(Debug, Clone)]
+pub struct TlbFlushRequest {
+    pub hart_id: usize,
+    pub start_addr: Option<u64>, // None = flush all
+    pub size: u64,
+}
+
 // Memory map
 pub const UART_BASE: u64 = 0x1000_0000;
 pub const UART_SIZE: u64 = 0x100;
@@ -49,6 +57,10 @@ pub struct Bus {
     pub syscon: Syscon,
     /// Pending hart start requests from SBI HSM
     pub hart_start_queue: Vec<HartStartRequest>,
+    /// Pending remote TLB flush requests from SBI RFENCE
+    pub tlb_flush_queue: Vec<TlbFlushRequest>,
+    /// Hart states visible to SBI hart_get_status (synced by VM loop)
+    pub hart_states: Vec<u64>,
     /// Number of harts in the system (for SBI validation)
     pub num_harts: usize,
 }
@@ -67,6 +79,8 @@ impl Bus {
             rtc: GoldfishRtc::new(),
             syscon: Syscon::new(),
             hart_start_queue: Vec::new(),
+            tlb_flush_queue: Vec::new(),
+            hart_states: Vec::new(),
             num_harts: 1,
         }
     }
