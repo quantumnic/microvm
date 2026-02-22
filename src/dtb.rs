@@ -532,7 +532,7 @@ pub fn generate_dtb_smp(
         }
         b.prop_u32_array("interrupts-extended", &plic_ext);
     }
-    b.prop_u32("riscv,ndev", 31);
+    b.prop_u32("riscv,ndev", 95);
     b.prop_u32("phandle", plic_phandle);
     b.end_node();
 

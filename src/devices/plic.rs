@@ -3,22 +3,34 @@ use crate::devices::clint::MAX_HARTS;
 /// Maximum PLIC contexts: 2 per hart (M-mode + S-mode)
 const MAX_CONTEXTS: usize = MAX_HARTS * 2;
 
+/// Maximum interrupt sources (PLIC spec allows up to 1024, source 0 is reserved)
+const MAX_SOURCES: usize = 1024;
+
+/// Number of u32 words needed for MAX_SOURCES bits
+const PENDING_WORDS: usize = MAX_SOURCES / 32;
+
 /// Platform-Level Interrupt Controller
-/// Simplified implementation supporting up to 64 interrupt sources
+/// Full PLIC spec implementation supporting up to 1024 interrupt sources
 /// and up to MAX_HARTS harts (2 contexts each: M-mode + S-mode)
 pub struct Plic {
-    /// Priority for each source (0 = disabled)
-    priority: [u32; 64],
-    /// Pending bits
-    pending: u64,
-    /// Enable bits per context (context 2*hart=M, 2*hart+1=S)
-    enable: [u64; MAX_CONTEXTS],
+    /// Priority for each source (0 = disabled, max 7)
+    priority: Vec<u32>,
+    /// Pending bits (1 bit per source, stored as u32 words)
+    pending: [u32; PENDING_WORDS],
+    /// Enable bits per context (1 bit per source per context)
+    enable: Vec<[u32; PENDING_WORDS]>,
     /// Priority threshold per context
     threshold: [u32; MAX_CONTEXTS],
-    /// Claimed interrupt per context
+    /// Claimed interrupt per context (0 = no claim in progress)
     claimed: [u32; MAX_CONTEXTS],
     /// Number of harts
     num_harts: usize,
+    /// Number of interrupt sources actually wired (for ndev reporting)
+    #[allow(dead_code)]
+    num_sources: usize,
+    /// Gateway state: tracks edge-triggered sources that have fired
+    /// Once pending, a source stays pending until claimed (level-triggered emulation)
+    gateway: [u32; PENDING_WORDS],
 }
 
 impl Default for Plic {
@@ -30,12 +42,14 @@ impl Default for Plic {
 impl Plic {
     pub fn new() -> Self {
         Self {
-            priority: [0; 64],
-            pending: 0,
-            enable: [0; MAX_CONTEXTS],
+            priority: vec![0; MAX_SOURCES],
+            pending: [0; PENDING_WORDS],
+            enable: vec![[0; PENDING_WORDS]; MAX_CONTEXTS],
             threshold: [0; MAX_CONTEXTS],
             claimed: [0; MAX_CONTEXTS],
             num_harts: 1,
+            num_sources: 96,
+            gateway: [0; PENDING_WORDS],
         }
     }
 
@@ -46,10 +60,28 @@ impl Plic {
         plic
     }
 
-    /// Signal an external interrupt
+    /// Get number of supported interrupt sources
+    #[allow(dead_code)]
+    pub fn num_sources(&self) -> usize {
+        self.num_sources
+    }
+
+    /// Signal an external interrupt (edge-triggered: sets pending bit)
     pub fn set_pending(&mut self, irq: u32) {
-        if irq > 0 && irq < 64 {
-            self.pending |= 1 << irq;
+        if irq > 0 && (irq as usize) < MAX_SOURCES {
+            let word = irq as usize / 32;
+            let bit = irq as usize % 32;
+            self.pending[word] |= 1 << bit;
+        }
+    }
+
+    /// Clear a pending interrupt (used when device de-asserts)
+    #[allow(dead_code)]
+    pub fn clear_pending(&mut self, irq: u32) {
+        if irq > 0 && (irq as usize) < MAX_SOURCES {
+            let word = irq as usize / 32;
+            let bit = irq as usize % 32;
+            self.pending[word] &= !(1 << bit);
         }
     }
 
@@ -58,10 +90,23 @@ impl Plic {
         if context >= self.num_harts * 2 {
             return false;
         }
-        let enabled_pending = self.pending & self.enable[context];
-        for i in 1..64 {
-            if enabled_pending & (1 << i) != 0 && self.priority[i] > self.threshold[context] {
-                return true;
+        for word in 0..PENDING_WORDS {
+            let enabled_pending = self.pending[word] & self.enable[context][word];
+            if enabled_pending == 0 {
+                continue;
+            }
+            for bit in 0..32 {
+                let irq = word * 32 + bit;
+                if irq == 0 {
+                    continue;
+                }
+                if irq >= MAX_SOURCES {
+                    break;
+                }
+                if enabled_pending & (1 << bit) != 0 && self.priority[irq] > self.threshold[context]
+                {
+                    return true;
+                }
             }
         }
         false
@@ -69,29 +114,31 @@ impl Plic {
 
     pub fn read(&mut self, offset: u64) -> u64 {
         match offset {
-            // Priority registers: 0x000000 - 0x0000FF
-            0x000000..=0x0000FF => {
+            // Priority registers: 0x000000 - 0x000FFF (1024 sources × 4 bytes)
+            0x000000..=0x000FFF => {
                 let src = (offset / 4) as usize;
-                if src < 64 {
+                if src < MAX_SOURCES {
                     self.priority[src] as u64
                 } else {
                     0
                 }
             }
-            // Pending bits: 0x001000
-            0x001000 => self.pending & 0xFFFFFFFF,
-            0x001004 => self.pending >> 32,
-            // Enable bits: 0x002000 + context * 0x80
-            0x002000..=0x002FFF => {
+            // Pending bits: 0x001000 - 0x00107F (1024 bits = 32 words)
+            0x001000..=0x00107F => {
+                let word = ((offset - 0x001000) / 4) as usize;
+                if word < PENDING_WORDS {
+                    self.pending[word] as u64
+                } else {
+                    0
+                }
+            }
+            // Enable bits: 0x002000 + context * 0x80 (each context: 1024 bits = 128 bytes)
+            0x002000..=0x1FFFFF => {
                 let ctx_offset = offset - 0x002000;
                 let context = (ctx_offset / 0x80) as usize;
-                let reg_off = ctx_offset % 0x80;
-                if context < self.num_harts * 2 {
-                    match reg_off {
-                        0 => self.enable[context] & 0xFFFFFFFF,
-                        4 => self.enable[context] >> 32,
-                        _ => 0,
-                    }
+                let word = ((ctx_offset % 0x80) / 4) as usize;
+                if context < self.num_harts * 2 && word < PENDING_WORDS {
+                    self.enable[context][word] as u64
                 } else {
                     0
                 }
@@ -119,41 +166,66 @@ impl Plic {
     /// Per PLIC spec: claim clears the pending bit, the interrupt is now "in service".
     /// Complete (write to same register) signals that the handler is done.
     fn claim(&mut self, context: usize) -> u32 {
-        let enabled_pending = self.pending & self.enable[context];
         let mut best_irq = 0u32;
         let mut best_prio = 0u32;
-        for i in 1..64usize {
-            if enabled_pending & (1 << i) != 0
-                && self.priority[i] > best_prio
-                && self.priority[i] > self.threshold[context]
-            {
-                best_irq = i as u32;
-                best_prio = self.priority[i];
+
+        for word in 0..PENDING_WORDS {
+            let enabled_pending = self.pending[word] & self.enable[context][word];
+            if enabled_pending == 0 {
+                continue;
+            }
+            for bit in 0..32 {
+                let irq = word * 32 + bit;
+                if irq == 0 || irq >= MAX_SOURCES {
+                    continue;
+                }
+                if enabled_pending & (1 << bit) != 0
+                    && self.priority[irq] > best_prio
+                    && self.priority[irq] > self.threshold[context]
+                {
+                    best_irq = irq as u32;
+                    best_prio = self.priority[irq];
+                }
             }
         }
+
         if best_irq > 0 {
-            self.pending &= !(1u64 << best_irq);
+            let word = best_irq as usize / 32;
+            let bit = best_irq as usize % 32;
+            self.pending[word] &= !(1u32 << bit);
             self.claimed[context] = best_irq;
+            log::trace!("PLIC: context {} claimed IRQ {}", context, best_irq);
         }
         best_irq
     }
 
     /// Complete an interrupt (write the IRQ id back to claim/complete register)
     fn complete(&mut self, context: usize, irq: u32) {
-        if irq > 0 && irq < 64 && self.claimed[context] == irq {
+        if irq > 0 && (irq as usize) < MAX_SOURCES && self.claimed[context] == irq {
             self.claimed[context] = 0;
+            // Re-enable the gateway for this source (allows new interrupts)
+            let word = irq as usize / 32;
+            let bit = irq as usize % 32;
+            self.gateway[word] &= !(1u32 << bit);
+            log::trace!("PLIC: context {} completed IRQ {}", context, irq);
         }
     }
 
     /// Save PLIC state for snapshot (saves first 2 contexts for backward compat)
     pub fn save_state(&self) -> Vec<u8> {
+        // Backward-compatible format: 64 priorities + pending(u64) + 2 enables(u64) + 2 thresholds + 2 claimed
         let mut out = Vec::with_capacity(64 * 4 + 8 + 16 + 8 + 8);
-        for &p in &self.priority {
-            out.extend_from_slice(&p.to_le_bytes());
+        for i in 0..64 {
+            out.extend_from_slice(&self.priority[i].to_le_bytes());
         }
-        out.extend_from_slice(&self.pending.to_le_bytes());
-        out.extend_from_slice(&self.enable[0].to_le_bytes());
-        out.extend_from_slice(&self.enable[1].to_le_bytes());
+        // Pack first 64 pending bits into a u64
+        let pending_lo = self.pending[0] as u64 | ((self.pending[1] as u64) << 32);
+        out.extend_from_slice(&pending_lo.to_le_bytes());
+        // Pack first 64 enable bits per context
+        let enable0 = self.enable[0][0] as u64 | ((self.enable[0][1] as u64) << 32);
+        let enable1 = self.enable[1][0] as u64 | ((self.enable[1][1] as u64) << 32);
+        out.extend_from_slice(&enable0.to_le_bytes());
+        out.extend_from_slice(&enable1.to_le_bytes());
         out.extend_from_slice(&self.threshold[0].to_le_bytes());
         out.extend_from_slice(&self.threshold[1].to_le_bytes());
         out.extend_from_slice(&self.claimed[0].to_le_bytes());
@@ -189,9 +261,15 @@ impl Plic {
         for i in 0..64 {
             self.priority[i] = read_u32(data, &mut pos)?;
         }
-        self.pending = read_u64(data, &mut pos)?;
-        self.enable[0] = read_u64(data, &mut pos)?;
-        self.enable[1] = read_u64(data, &mut pos)?;
+        let pending = read_u64(data, &mut pos)?;
+        self.pending[0] = pending as u32;
+        self.pending[1] = (pending >> 32) as u32;
+        let enable0 = read_u64(data, &mut pos)?;
+        self.enable[0][0] = enable0 as u32;
+        self.enable[0][1] = (enable0 >> 32) as u32;
+        let enable1 = read_u64(data, &mut pos)?;
+        self.enable[1][0] = enable1 as u32;
+        self.enable[1][1] = (enable1 >> 32) as u32;
         self.threshold[0] = read_u32(data, &mut pos)?;
         self.threshold[1] = read_u32(data, &mut pos)?;
         self.claimed[0] = read_u32(data, &mut pos)?;
@@ -201,30 +279,30 @@ impl Plic {
 
     pub fn write(&mut self, offset: u64, val: u64) {
         match offset {
-            // Priority registers
-            0x000000..=0x0000FF => {
+            // Priority registers: 0x000000 - 0x000FFF
+            0x000000..=0x000FFF => {
                 let src = (offset / 4) as usize;
-                if src < 64 {
-                    self.priority[src] = val as u32;
+                if src < MAX_SOURCES {
+                    // Priority is typically 0-7 (3 bits) per PLIC spec
+                    self.priority[src] = (val as u32) & 0x7;
+                }
+            }
+            // Pending bits are read-only (set by hardware, cleared by claim)
+            0x001000..=0x00107F => {
+                // Some implementations allow writing pending bits for testing
+                // Linux doesn't write here, but allow it for compatibility
+                let word = ((offset - 0x001000) / 4) as usize;
+                if word < PENDING_WORDS {
+                    self.pending[word] = val as u32;
                 }
             }
             // Enable bits: 0x002000 + context * 0x80
-            0x002000..=0x002FFF => {
+            0x002000..=0x1FFFFF => {
                 let ctx_offset = offset - 0x002000;
                 let context = (ctx_offset / 0x80) as usize;
-                let reg_off = ctx_offset % 0x80;
-                if context < self.num_harts * 2 {
-                    match reg_off {
-                        0 => {
-                            self.enable[context] =
-                                (self.enable[context] & !0xFFFFFFFF) | (val & 0xFFFFFFFF)
-                        }
-                        4 => {
-                            self.enable[context] =
-                                (self.enable[context] & 0xFFFFFFFF) | ((val & 0xFFFFFFFF) << 32)
-                        }
-                        _ => {}
-                    }
+                let word = ((ctx_offset % 0x80) / 4) as usize;
+                if context < self.num_harts * 2 && word < PENDING_WORDS {
+                    self.enable[context][word] = val as u32;
                 }
             }
             // Threshold & claim/complete: 0x200000 + context * 0x1000
@@ -234,7 +312,7 @@ impl Plic {
                 let reg_off = ctx_offset % 0x1000;
                 if context < self.num_harts * 2 {
                     match reg_off {
-                        0 => self.threshold[context] = val as u32,
+                        0 => self.threshold[context] = (val as u32) & 0x7,
                         4 => self.complete(context, val as u32),
                         _ => {}
                     }

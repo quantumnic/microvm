@@ -85,8 +85,10 @@ impl BootRom {
                                                     // csrc mstatus, t1  (clear MPP bits)
         code.push(0x30033073); // csrrc x0, mstatus, t1
                                // li t1, (1 << 11) | (1 << 7) = 0x880
-        Self::emit_load_imm(&mut code, 6, (1 << 11) | (1 << 7)); // t1 = 0x880
-                                                                 // csrs mstatus, t1  (set MPP=S, MPIE=1)
+                               // Set MPP=S(bit11), MPIE(bit7), FS=Initial(bit13), VS=Initial(bit9)
+                               // 0x2A80 = (1<<13) | (1<<11) | (1<<9) | (1<<7)
+        Self::emit_load_imm(&mut code, 6, (1 << 13) | (1 << 11) | (1 << 9) | (1 << 7)); // t1 = 0x2A80
+                                                                                        // csrs mstatus, t1  (set MPP=S, MPIE=1, FS=Initial, VS=Initial)
         code.push(0x30032073); // csrrs x0, mstatus, t1
 
         // ===== Set mepc = kernel_entry =====

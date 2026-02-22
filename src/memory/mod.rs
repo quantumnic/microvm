@@ -139,7 +139,10 @@ impl Bus {
             (7, off) => self.virtio_net.read(off) as u8,
             (8, off) => self.rtc.read(off) as u8,
             (9, off) => self.syscon.read(off) as u8,
-            _ => 0,
+            _ => {
+                log::trace!("Bus: unmapped read8 at {:#010x}", addr);
+                0
+            }
         }
     }
 
@@ -170,7 +173,10 @@ impl Bus {
             (7, off) => self.virtio_net.read(off),
             (8, off) => self.rtc.read(off),
             (9, off) => self.syscon.read(off),
-            _ => 0,
+            _ => {
+                log::trace!("Bus: unmapped read32 at {:#010x}", addr);
+                0
+            }
         }
     }
 
@@ -198,7 +204,9 @@ impl Bus {
             (7, off) => self.virtio_net.write(off, val as u64),
             (8, off) => self.rtc.write(off, val as u64),
             (9, off) => self.syscon.write(off, val as u64),
-            _ => {}
+            _ => {
+                log::trace!("Bus: unmapped write8 at {:#010x} val={:#04x}", addr, val);
+            }
         }
     }
 
@@ -227,7 +235,9 @@ impl Bus {
             (7, off) => self.virtio_net.write(off, val as u64),
             (8, off) => self.rtc.write(off, val as u64),
             (9, off) => self.syscon.write(off, val as u64),
-            _ => {}
+            _ => {
+                log::trace!("Bus: unmapped write32 at {:#010x} val={:#010x}", addr, val);
+            }
         }
     }
 

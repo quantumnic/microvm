@@ -1038,7 +1038,8 @@ fn test_sbi_probe_srst() {
 #[test]
 fn test_uart_thre_interrupt() {
     let mut uart = microvm::devices::uart::Uart::new();
-    // Enable THRE interrupt
+    uart.write(4, 0x08); // MCR: OUT2=1 (master interrupt enable)
+                         // Enable THRE interrupt
     uart.write(1, 0x02); // IER = THRE
                          // UART starts with THRE set, so interrupt should be pending
     assert!(
@@ -2050,6 +2051,7 @@ fn test_misaligned_load_doubleword() {
 fn test_uart_thre_cleared_on_iir_read() {
     use microvm::devices::uart::Uart;
     let mut uart = Uart::new();
+    uart.write(4, 0x08); // MCR: OUT2=1 (master interrupt enable)
 
     // Enable THRE interrupt
     uart.write(1, 0x02); // IER = THRE enabled
@@ -2079,6 +2081,7 @@ fn test_uart_thre_cleared_on_iir_read() {
 fn test_uart_ier_enable_triggers_thre() {
     use microvm::devices::uart::Uart;
     let mut uart = Uart::new();
+    uart.write(4, 0x08); // MCR: OUT2=1 (master interrupt enable)
 
     // Clear THRE pending by reading IIR first with THRE enabled
     uart.write(1, 0x02);
@@ -4934,7 +4937,8 @@ fn test_plic_context_ordering_in_dtb() {
     bus.plic.write(0x000028, 1); // priority[10] = 1
     bus.plic.write(0x002080, 1 << 10); // enable[1] bit 10
     bus.plic.write(0x201000, 0); // threshold[1] = 0
-                                 // Enable THRE interrupt on UART
+                                 // Enable THRE interrupt on UART (OUT2 required for interrupt delivery)
+    bus.uart.write(4, 0x08); // MCR: OUT2=1
     bus.uart.write(1, 0x02); // IER = THRE
     assert!(bus.uart.has_interrupt());
     bus.plic.set_pending(10);
@@ -10392,6 +10396,7 @@ fn test_uart_scratch_register() {
 #[test]
 fn test_uart_rda_interrupt() {
     let mut uart = microvm::devices::uart::Uart::new();
+    uart.write(4, 0x08); // MCR: OUT2=1 (master interrupt enable)
     uart.write(1, 0x01);
     assert!(!uart.has_interrupt());
     uart.push_byte(b'X');
