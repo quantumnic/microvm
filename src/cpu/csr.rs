@@ -68,6 +68,12 @@ pub const SCOUNTOVF: u16 = 0xDA0;
 #[allow(dead_code)]
 pub const LCOFIP_BIT: u64 = 1 << 13;
 
+// Zkr extension — Entropy Source (seed CSR)
+// M-mode only; each read returns 16 bits of entropy with ES16 status
+pub const SEED: u16 = 0x015;
+// seed optype values (bits [31:30])
+pub const SEED_OPTYPE_ES16: u64 = 2 << 30; // 16 bits of entropy available in [15:0]
+
 // Machine environment config high (RV64: reads as 0)
 pub const MENVCFGH: u16 = 0x31A;
 
@@ -374,6 +380,15 @@ impl CsrFile {
                 // In practice, real overflow requires OF bit in mhpmevent which we don't track yet
                 0
             }
+            // Zkr: seed CSR — returns 16 bits of entropy with ES16 status
+            SEED => {
+                use std::io::Read;
+                let mut buf = [0u8; 2];
+                if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                    let _ = f.read_exact(&mut buf);
+                }
+                SEED_OPTYPE_ES16 | u64::from(u16::from_le_bytes(buf))
+            }
             // User HPM counters (hpmcounter3-31) — shadows of machine counters
             0xC03..=0xC1F => self.hpm_counters[(addr - 0xC03) as usize],
             // Smstateen CSRs
@@ -510,7 +525,7 @@ impl CsrFile {
 
     pub fn write(&mut self, addr: u16, val: u64) {
         match addr {
-            MISA | MHARTID | MVENDORID | MARCHID | MIMPID => {} // Read-only
+            MISA | MHARTID | MVENDORID | MARCHID | MIMPID | SEED => {} // Read-only
             SSTATUS => {
                 let mstatus = self.regs[MSTATUS as usize];
                 self.regs[MSTATUS as usize] = (mstatus & !SSTATUS_MASK) | (val & SSTATUS_MASK);

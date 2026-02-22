@@ -10729,3 +10729,52 @@ fn test_hpm_all_event_types() {
         assert_eq!(cpu.csrs.read(ctr_addr), 1, "Event {:?} should count", event);
     }
 }
+
+#[test]
+fn test_zkr_seed_csr_returns_es16() {
+    let (cpu, _bus) = run_program(&[], 0);
+    // Reading the seed CSR should return ES16 status (bits [31:30] = 2)
+    let val = cpu.csrs.read(csr::SEED);
+    let optype = (val >> 30) & 3;
+    assert_eq!(optype, 2, "seed CSR should return ES16 optype");
+    // Entropy is in bits [15:0]
+    assert_eq!(val & !0xFFFF_FFFF, 0, "seed CSR upper 32 bits should be 0");
+}
+
+#[test]
+fn test_zkr_seed_csr_is_read_only() {
+    let (mut cpu, _bus) = run_program(&[], 0);
+    cpu.csrs.write(csr::SEED, 0xDEAD_BEEF);
+    // Write should be ignored; read should still return valid ES16
+    let val = cpu.csrs.read(csr::SEED);
+    let optype = (val >> 30) & 3;
+    assert_eq!(
+        optype, 2,
+        "seed CSR should still return ES16 after write attempt"
+    );
+}
+
+#[test]
+fn test_zkr_seed_csr_produces_varying_entropy() {
+    let (cpu, _bus) = run_program(&[], 0);
+    // Read seed multiple times; at least one pair should differ
+    let mut values = Vec::new();
+    for _ in 0..10 {
+        values.push(cpu.csrs.read(csr::SEED) & 0xFFFF);
+    }
+    let all_same = values.iter().all(|v| *v == values[0]);
+    assert!(
+        !all_same,
+        "seed CSR should produce varying entropy across reads"
+    );
+}
+
+#[test]
+fn test_zkr_in_isa_string() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    let dtb_str = String::from_utf8_lossy(&dtb);
+    assert!(
+        dtb_str.contains("zkr"),
+        "DTB should advertise zkr extension"
+    );
+}

@@ -37,6 +37,7 @@ fn csr_name(addr: u16) -> &'static str {
         0x142 => "scause",
         0x143 => "stval",
         0x144 => "sip",
+        0x015 => "seed",
         0x14D => "stimecmp",
         0x180 => "satp",
         0x300 => "mstatus",
