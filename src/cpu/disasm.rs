@@ -871,6 +871,13 @@ pub fn mnemonic(inst: u32) -> &'static str {
                 "vsetcfg"
             } else if funct3 == 1 || funct3 == 5 {
                 "vfpu"
+            } else if (funct3 == 2 || funct3 == 6)
+                && funct7 >> 1 >= 0b10000
+                && funct7 >> 1 <= 0b10011
+            {
+                "vmuldiv"
+            } else if (funct3 == 2 || funct3 == 6) && funct7 >> 1 >= 0b11000 {
+                "vwide"
             } else {
                 "valu"
             }

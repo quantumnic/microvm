@@ -1050,11 +1050,27 @@ fn execute_vv_int(cpu: &mut Cpu, ctx: &VCtx) {
             0b011011 => u64::from(sext_sew(a, sew) < sext_sew(b, sew)),
             0b011100 => u64::from(a <= b),
             0b011101 => u64::from(sext_sew(a, sew) <= sext_sew(b, sew)),
+            // Narrowing shifts (vs2 is 2*SEW, vs1 is SEW shift amount, result is SEW)
+            0b101100 => {
+                // vnsrl.wv: narrow shift right logical
+                let wide = cpu.vregs.read_elem(vs2, sew * 2, i);
+                let shift = cpu.vregs.read_elem(vs1, sew, i) & ((sew * 2 - 1) as u64);
+                trunc_sew(trunc_sew(wide, sew * 2) >> shift, sew)
+            }
+            0b101101 => {
+                // vnsra.wv: narrow shift right arithmetic
+                let wide = cpu.vregs.read_elem(vs2, sew * 2, i);
+                let shift = cpu.vregs.read_elem(vs1, sew, i) & ((sew * 2 - 1) as u64);
+                trunc_sew((sext_sew(wide, sew * 2) >> shift) as u64, sew)
+            }
             _ => continue,
         };
 
         if is_cmp {
             cpu.vregs.set_mask_bit(vd, i, result != 0);
+        } else if matches!(funct6, 0b101100 | 0b101101) {
+            // Narrowing: write at SEW width
+            cpu.vregs.write_elem(vd, sew, i, result);
         } else {
             cpu.vregs.write_elem(vd, sew, i, result);
         }
@@ -1104,6 +1120,19 @@ fn execute_vxi_int(cpu: &mut Cpu, ctx: &VCtx, scalar: u64) {
             0b011101 => u64::from(sext_sew(a, sew) <= sext_sew(b, sew)),
             0b011110 => u64::from(a > b),
             0b011111 => u64::from(sext_sew(a, sew) > sext_sew(b, sew)),
+            // Narrowing shifts with scalar/immediate shift amount
+            0b101100 => {
+                // vnsrl.wx / vnsrl.wi
+                let wide = cpu.vregs.read_elem(vs2, sew * 2, i);
+                let shift = b & ((sew * 2 - 1) as u64);
+                trunc_sew(trunc_sew(wide, sew * 2) >> shift, sew)
+            }
+            0b101101 => {
+                // vnsra.wx / vnsra.wi
+                let wide = cpu.vregs.read_elem(vs2, sew * 2, i);
+                let shift = b & ((sew * 2 - 1) as u64);
+                trunc_sew((sext_sew(wide, sew * 2) >> shift) as u64, sew)
+            }
             _ => continue,
         };
 
@@ -1116,7 +1145,163 @@ fn execute_vxi_int(cpu: &mut Cpu, ctx: &VCtx, scalar: u64) {
 }
 
 // ============================================================================
-// OPMVV (funct3=2): reductions
+// Integer multiply helpers (full-width multiply for upper-half)
+// ============================================================================
+
+/// Unsigned full multiply, return high half
+fn mulhu_sew(a: u64, b: u64, sew: u32) -> u64 {
+    match sew {
+        8 => ((a as u8 as u16).wrapping_mul(b as u8 as u16) >> 8) as u64,
+        16 => ((a as u16 as u32).wrapping_mul(b as u16 as u32) >> 16) as u64,
+        32 => u64::from(a as u32).wrapping_mul(u64::from(b as u32)) >> 32,
+        _ => ((a as u128).wrapping_mul(b as u128) >> 64) as u64,
+    }
+}
+
+/// Signed full multiply, return high half
+fn mulh_sew(a: u64, b: u64, sew: u32) -> u64 {
+    match sew {
+        8 => ((sext_sew(a, 8) as i16).wrapping_mul(sext_sew(b, 8) as i16) >> 8) as u64,
+        16 => ((sext_sew(a, 16) as i32).wrapping_mul(sext_sew(b, 16) as i32) >> 16) as u64,
+        32 => {
+            let sa = sext_sew(a, 32) as i128;
+            let sb = sext_sew(b, 32) as i128;
+            (sa.wrapping_mul(sb) >> 32) as u64
+        }
+        _ => ((sext_sew(a, 64) as i128).wrapping_mul(sext_sew(b, 64) as i128) >> 64) as u64,
+    }
+}
+
+/// Signed×unsigned multiply, return high half (rs2 signed, rs1 unsigned)
+fn mulhsu_sew(a: u64, b: u64, sew: u32) -> u64 {
+    // a = vs2 (signed), b = vs1 (unsigned)
+    match sew {
+        8 => ((sext_sew(a, 8) as i16).wrapping_mul(b as u8 as i16) >> 8) as u64,
+        16 => ((sext_sew(a, 16) as i32).wrapping_mul(b as u16 as i32) >> 16) as u64,
+        32 => {
+            let sa = sext_sew(a, 32) as i128;
+            let ub = u64::from(b as u32) as i128;
+            (sa.wrapping_mul(ub) >> 32) as u64
+        }
+        _ => ((sext_sew(a, 64) as i128).wrapping_mul(b as i128) >> 64) as u64,
+    }
+}
+
+/// Signed division with RISC-V overflow/div-by-zero semantics
+fn div_sew(a: u64, b: u64, sew: u32) -> u64 {
+    let sa = sext_sew(a, sew);
+    let sb = sext_sew(b, sew);
+    if sb == 0 {
+        // Division by zero → all ones
+        u64::MAX
+    } else if sa == sext_sew(1u64 << (sew - 1), sew) && sb == -1 {
+        // Overflow: min_signed / -1 → min_signed
+        trunc_sew(a, sew)
+    } else {
+        trunc_sew(sa.wrapping_div(sb) as u64, sew)
+    }
+}
+
+fn divu_sew(a: u64, b: u64, sew: u32) -> u64 {
+    let ua = trunc_sew(a, sew);
+    let ub = trunc_sew(b, sew);
+    if ub == 0 {
+        trunc_sew(u64::MAX, sew)
+    } else {
+        trunc_sew(ua / ub, sew)
+    }
+}
+
+fn rem_sew(a: u64, b: u64, sew: u32) -> u64 {
+    let sa = sext_sew(a, sew);
+    let sb = sext_sew(b, sew);
+    if sb == 0 {
+        trunc_sew(a, sew)
+    } else if sa == sext_sew(1u64 << (sew - 1), sew) && sb == -1 {
+        0
+    } else {
+        trunc_sew(sa.wrapping_rem(sb) as u64, sew)
+    }
+}
+
+fn remu_sew(a: u64, b: u64, sew: u32) -> u64 {
+    let ua = trunc_sew(a, sew);
+    let ub = trunc_sew(b, sew);
+    if ub == 0 {
+        trunc_sew(a, sew)
+    } else {
+        trunc_sew(ua % ub, sew)
+    }
+}
+
+// ============================================================================
+// Widening helpers: operate on SEW-width elements, produce 2*SEW results
+// ============================================================================
+
+/// Unsigned widen: zero-extend to 2*SEW, add
+fn wop_addu(a: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(trunc_sew(a, sew).wrapping_add(trunc_sew(b, sew)), sew * 2)
+}
+fn wop_add(a: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(
+        sext_sew(a, sew).wrapping_add(sext_sew(b, sew)) as u64,
+        sew * 2,
+    )
+}
+fn wop_subu(a: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(trunc_sew(a, sew).wrapping_sub(trunc_sew(b, sew)), sew * 2)
+}
+fn wop_sub(a: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(
+        sext_sew(a, sew).wrapping_sub(sext_sew(b, sew)) as u64,
+        sew * 2,
+    )
+}
+/// .wv variants: vs2 is already 2*SEW, vs1 is SEW
+fn wop_waddu(a2w: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(
+        trunc_sew(a2w, sew * 2).wrapping_add(trunc_sew(b, sew)),
+        sew * 2,
+    )
+}
+fn wop_wadd(a2w: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(
+        (sext_sew(a2w, sew * 2)).wrapping_add(sext_sew(b, sew)) as u64,
+        sew * 2,
+    )
+}
+fn wop_wsubu(a2w: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(
+        trunc_sew(a2w, sew * 2).wrapping_sub(trunc_sew(b, sew)),
+        sew * 2,
+    )
+}
+fn wop_wsub(a2w: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(
+        (sext_sew(a2w, sew * 2)).wrapping_sub(sext_sew(b, sew)) as u64,
+        sew * 2,
+    )
+}
+
+fn wmul_uu(a: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(trunc_sew(a, sew).wrapping_mul(trunc_sew(b, sew)), sew * 2)
+}
+fn wmul_ss(a: u64, b: u64, sew: u32) -> u64 {
+    trunc_sew(
+        (sext_sew(a, sew)).wrapping_mul(sext_sew(b, sew)) as u64,
+        sew * 2,
+    )
+}
+fn wmul_su(a: u64, b: u64, sew: u32) -> u64 {
+    // a signed, b unsigned
+    trunc_sew(
+        (sext_sew(a, sew)).wrapping_mul(trunc_sew(b, sew) as i64) as u64,
+        sew * 2,
+    )
+}
+
+// ============================================================================
+// OPMVV (funct3=2): reductions, multiply, divide, widening, extensions
 // ============================================================================
 fn execute_mvv(cpu: &mut Cpu, ctx: &VCtx) {
     let VCtx {
@@ -1130,6 +1315,7 @@ fn execute_mvv(cpu: &mut Cpu, ctx: &VCtx) {
     } = *ctx;
 
     match funct6 {
+        // --- Reductions ---
         0b000000 => {
             // vredsum
             let mut acc = cpu.vregs.read_elem(vs1, sew, 0);
@@ -1210,18 +1396,760 @@ fn execute_mvv(cpu: &mut Cpu, ctx: &VCtx) {
             }
             cpu.vregs.write_elem(vd, sew, 0, trunc_sew(acc as u64, sew));
         }
+
+        // --- vzext / vsext (funct6=0b010010, vs1 encodes variant) ---
+        0b010010 => {
+            // vs1 field selects the extension:
+            // 00010 = vzext.vf8, 00011 = vsext.vf8
+            // 00100 = vzext.vf4, 00101 = vsext.vf4
+            // 00110 = vzext.vf2, 00111 = vsext.vf2
+            let src_sew = match vs1 {
+                0b00010 | 0b00011 => sew / 8,
+                0b00100 | 0b00101 => sew / 4,
+                0b00110 | 0b00111 => sew / 2,
+                _ => return,
+            };
+            if src_sew < 8 {
+                return;
+            }
+            let signed = vs1 & 1 != 0;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let val = cpu.vregs.read_elem(vs2, src_sew, i);
+                let result = if signed {
+                    trunc_sew(sext_sew(val, src_sew) as u64, sew)
+                } else {
+                    trunc_sew(val, sew)
+                };
+                cpu.vregs.write_elem(vd, sew, i, result);
+            }
+        }
+
+        // --- Integer multiply ---
+        0b100100 => {
+            // vmulhu.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(mulhu_sew(a, b, sew), sew));
+            }
+        }
+        0b100101 => {
+            // vmul.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(a.wrapping_mul(b), sew));
+            }
+        }
+        0b100110 => {
+            // vmulhsu.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(mulhsu_sew(a, b, sew), sew));
+            }
+        }
+        0b100111 => {
+            // vmulh.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(mulh_sew(a, b, sew), sew));
+            }
+        }
+
+        // --- Integer divide ---
+        0b100000 => {
+            // vdivu.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, divu_sew(a, b, sew));
+            }
+        }
+        0b100001 => {
+            // vdiv.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, div_sew(a, b, sew));
+            }
+        }
+        0b100010 => {
+            // vremu.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, remu_sew(a, b, sew));
+            }
+        }
+        0b100011 => {
+            // vrem.vv
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, rem_sew(a, b, sew));
+            }
+        }
+
+        // --- Vector multiply-add (accumulate into vd) ---
+        0b101101 => {
+            // vmacc.vv: vd[i] = (vs1[i] * vs2[i]) + vd[i]
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs1, sew, i);
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(a.wrapping_mul(b).wrapping_add(d), sew),
+                );
+            }
+        }
+        0b101111 => {
+            // vnmsac.vv: vd[i] = -(vs1[i] * vs2[i]) + vd[i]
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs1, sew, i);
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(d.wrapping_sub(a.wrapping_mul(b)), sew),
+                );
+            }
+        }
+        0b101001 => {
+            // vmadd.vv: vd[i] = (vs1[i] * vd[i]) + vs2[i]
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs1, sew, i);
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(a.wrapping_mul(d).wrapping_add(b), sew),
+                );
+            }
+        }
+        0b101011 => {
+            // vnmsub.vv: vd[i] = -(vs1[i] * vd[i]) + vs2[i]
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs1, sew, i);
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(b.wrapping_sub(a.wrapping_mul(d)), sew),
+                );
+            }
+        }
+
+        // --- Widening integer add/sub (SEW→2*SEW) ---
+        0b110000 => {
+            // vwaddu.vv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_addu(a, b, sew));
+            }
+        }
+        0b110001 => {
+            // vwadd.vv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_add(a, b, sew));
+            }
+        }
+        0b110010 => {
+            // vwsubu.vv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_subu(a, b, sew));
+            }
+        }
+        0b110011 => {
+            // vwsub.vv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_sub(a, b, sew));
+            }
+        }
+        0b110100 => {
+            // vwaddu.wv (vs2 is 2*SEW, vs1 is SEW)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_waddu(a, b, sew));
+            }
+        }
+        0b110101 => {
+            // vwadd.wv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_wadd(a, b, sew));
+            }
+        }
+        0b110110 => {
+            // vwsubu.wv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_wsubu(a, b, sew));
+            }
+        }
+        0b110111 => {
+            // vwsub.wv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_wsub(a, b, sew));
+            }
+        }
+
+        // --- Widening multiply ---
+        0b111000 => {
+            // vwmulu.vv
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wmul_uu(a, b, sew));
+            }
+        }
+        0b111010 => {
+            // vwmulsu.vv (vs2 signed, vs1 unsigned)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wmul_su(a, b, sew));
+            }
+        }
+        0b111011 => {
+            // vwmul.vv (both signed)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                let b = cpu.vregs.read_elem(vs1, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wmul_ss(a, b, sew));
+            }
+        }
+
+        // --- Widening multiply-accumulate ---
+        0b111100 => {
+            // vwmaccu.vv: vd[i] += vs1[i] * vs2[i] (unsigned, widening)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs1, sew, i);
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, dsew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    dsew,
+                    i,
+                    trunc_sew(d.wrapping_add(wmul_uu(a, b, sew)), dsew),
+                );
+            }
+        }
+        0b111101 => {
+            // vwmacc.vv: vd[i] += vs1[i] * vs2[i] (signed, widening)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs1, sew, i);
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, dsew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    dsew,
+                    i,
+                    trunc_sew(d.wrapping_add(wmul_ss(a, b, sew)), dsew),
+                );
+            }
+        }
+        0b111110 => {
+            // vwmaccsu.vv: vd[i] += vs2[i](signed) * vs1[i](unsigned)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs1, sew, i);
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, dsew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    dsew,
+                    i,
+                    trunc_sew(d.wrapping_add(wmul_su(b, a, sew)), dsew),
+                );
+            }
+        }
+
         _ => {}
     }
 }
 
 // ============================================================================
-// OPMVX (funct3=6): scalar-vector moves
+// OPMVX (funct3=6): scalar-vector operations
 // ============================================================================
 fn execute_mvx(cpu: &mut Cpu, ctx: &VCtx, scalar: u64) {
-    if ctx.funct6 == 0b010000 && ctx.vl > 0 {
-        // vmv.s.x
-        cpu.vregs
-            .write_elem(ctx.vd, ctx.sew, 0, trunc_sew(scalar, ctx.sew));
+    let VCtx {
+        funct6,
+        vd,
+        vs2,
+        vm,
+        vl,
+        sew,
+        ..
+    } = *ctx;
+
+    match funct6 {
+        0b010000 => {
+            // vmv.s.x
+            if vl > 0 {
+                cpu.vregs.write_elem(vd, sew, 0, trunc_sew(scalar, sew));
+            }
+        }
+
+        // --- Integer multiply ---
+        0b100100 => {
+            // vmulhu.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(mulhu_sew(a, scalar, sew), sew));
+            }
+        }
+        0b100101 => {
+            // vmul.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(a.wrapping_mul(scalar), sew));
+            }
+        }
+        0b100110 => {
+            // vmulhsu.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(mulhsu_sew(a, scalar, sew), sew));
+            }
+        }
+        0b100111 => {
+            // vmulh.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs
+                    .write_elem(vd, sew, i, trunc_sew(mulh_sew(a, scalar, sew), sew));
+            }
+        }
+
+        // --- Integer divide ---
+        0b100000 => {
+            // vdivu.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, divu_sew(a, scalar, sew));
+            }
+        }
+        0b100001 => {
+            // vdiv.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, div_sew(a, scalar, sew));
+            }
+        }
+        0b100010 => {
+            // vremu.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, remu_sew(a, scalar, sew));
+            }
+        }
+        0b100011 => {
+            // vrem.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, sew, i, rem_sew(a, scalar, sew));
+            }
+        }
+
+        // --- Multiply-add ---
+        0b101101 => {
+            // vmacc.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(scalar.wrapping_mul(b).wrapping_add(d), sew),
+                );
+            }
+        }
+        0b101111 => {
+            // vnmsac.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(d.wrapping_sub(scalar.wrapping_mul(b)), sew),
+                );
+            }
+        }
+        0b101001 => {
+            // vmadd.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(scalar.wrapping_mul(d).wrapping_add(b), sew),
+                );
+            }
+        }
+        0b101011 => {
+            // vnmsub.vx
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, sew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    sew,
+                    i,
+                    trunc_sew(b.wrapping_sub(scalar.wrapping_mul(d)), sew),
+                );
+            }
+        }
+
+        // --- Widening integer add/sub ---
+        0b110000 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_addu(a, scalar, sew));
+            }
+        }
+        0b110001 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_add(a, scalar, sew));
+            }
+        }
+        0b110010 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_subu(a, scalar, sew));
+            }
+        }
+        0b110011 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_sub(a, scalar, sew));
+            }
+        }
+        0b110100 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_waddu(a, scalar, sew));
+            }
+        }
+        0b110101 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_wadd(a, scalar, sew));
+            }
+        }
+        0b110110 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_wsubu(a, scalar, sew));
+            }
+        }
+        0b110111 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, dsew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wop_wsub(a, scalar, sew));
+            }
+        }
+
+        // --- Widening multiply ---
+        0b111000 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wmul_uu(a, scalar, sew));
+            }
+        }
+        0b111010 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wmul_su(a, scalar, sew));
+            }
+        }
+        0b111011 => {
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let a = cpu.vregs.read_elem(vs2, sew, i);
+                cpu.vregs.write_elem(vd, dsew, i, wmul_ss(a, scalar, sew));
+            }
+        }
+
+        // --- Widening multiply-accumulate ---
+        0b111100 => {
+            // vwmaccu.vx
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, dsew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    dsew,
+                    i,
+                    trunc_sew(d.wrapping_add(wmul_uu(scalar, b, sew)), dsew),
+                );
+            }
+        }
+        0b111101 => {
+            // vwmacc.vx
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, dsew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    dsew,
+                    i,
+                    trunc_sew(d.wrapping_add(wmul_ss(scalar, b, sew)), dsew),
+                );
+            }
+        }
+        0b111110 => {
+            // vwmaccsu.vx: vd += vs2(signed) * rs1(unsigned)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, dsew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    dsew,
+                    i,
+                    trunc_sew(d.wrapping_add(wmul_su(b, scalar, sew)), dsew),
+                );
+            }
+        }
+        0b111111 => {
+            // vwmaccus.vx: vd += rs1(signed) * vs2(unsigned)
+            let dsew = sew * 2;
+            for i in 0..vl as usize {
+                if !elem_active(cpu, vm, i) {
+                    continue;
+                }
+                let b = cpu.vregs.read_elem(vs2, sew, i);
+                let d = cpu.vregs.read_elem(vd, dsew, i);
+                cpu.vregs.write_elem(
+                    vd,
+                    dsew,
+                    i,
+                    trunc_sew(d.wrapping_add(wmul_su(scalar, b, sew)), dsew),
+                );
+            }
+        }
+
+        _ => {}
     }
 }
 

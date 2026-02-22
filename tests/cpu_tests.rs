@@ -7384,3 +7384,669 @@ fn test_sh1add_uw() {
     // ZEXT.W(0xFFFF_FFFF_0000_0010) = 0x0000_0010, << 1 = 0x20, + 0x100 = 0x120
     assert_eq!(cpu.regs[1], 0x120, "sh1add.uw");
 }
+
+// ============================================================================
+// Vector integer multiply / divide / widening / narrowing tests
+// ============================================================================
+
+#[test]
+fn test_vmul_vv() {
+    // vmul.vv: v3 = v2 * v1 (element-wise, 32-bit)
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    for (i, v) in [3u32, 5, 7, 11].iter().enumerate() {
+        bus.write32(src1 + i as u64 * 4, *v);
+    }
+    for (i, v) in [2u32, 4, 6, 8].iter().enumerate() {
+        bus.write32(src2 + i as u64 * 4, *v);
+    }
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 4;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        vle(32, 1, 10, 1),
+        vle(32, 2, 11, 1),
+        opmvv(0b100101, 3, 1, 2, 1), // vmul.vv v3, v2, v1
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 6); // 3*2
+    assert_eq!(bus.read32(dst + 4), 20); // 5*4
+    assert_eq!(bus.read32(dst + 8), 42); // 7*6
+    assert_eq!(bus.read32(dst + 12), 88); // 11*8
+}
+
+#[test]
+fn test_vmulh_vv() {
+    // vmulh.vv: signed upper half of 8-bit multiply
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    // Use e8: (-1) * 127 = -127, high byte of i16 = 0xFF (-1 sign-extended)
+    // Actually: (-1 as i8) * (127 as i8) = -127 as i16 = 0xFF81, high byte = 0xFF
+    bus.write8(src1, 0xFF); // -1
+    bus.write8(src1 + 1, 0x7F); // 127
+    bus.write8(src2, 0x7F); // 127
+    bus.write8(src2 + 1, 0x02); // 2
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_000_000), // e8,m1
+        vle(8, 1, 10, 1),
+        vle(8, 2, 11, 1),
+        opmvv(0b100111, 3, 1, 2, 1), // vmulh.vv v3, v2, v1
+        vse(8, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    // (-1)*127 = -127 = 0xFF81, high = 0xFF
+    assert_eq!(bus.read8(dst), 0xFF);
+    // 127*2 = 254 = 0x00FE, high = 0x00
+    assert_eq!(bus.read8(dst + 1), 0x00);
+}
+
+#[test]
+fn test_vdivu_vv() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    // divisors in vs1, dividends in vs2
+    for (i, v) in [3u32, 5, 0, 1].iter().enumerate() {
+        bus.write32(src1 + i as u64 * 4, *v); // divisors
+    }
+    for (i, v) in [15u32, 23, 100, 0xFFFF_FFFF].iter().enumerate() {
+        bus.write32(src2 + i as u64 * 4, *v); // dividends
+    }
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 4;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000),
+        vle(32, 1, 10, 1),
+        vle(32, 2, 11, 1),
+        opmvv(0b100000, 3, 1, 2, 1), // vdivu.vv
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 5); // 15/3
+    assert_eq!(bus.read32(dst + 4), 4); // 23/5
+    assert_eq!(bus.read32(dst + 8), 0xFFFF_FFFF); // 100/0 = all ones
+    assert_eq!(bus.read32(dst + 12), 0xFFFF_FFFF); // 0xFFFFFFFF/1
+}
+
+#[test]
+fn test_vrem_vv() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    // e8: signed remainder
+    bus.write8(src1, 3); // divisor
+    bus.write8(src1 + 1, 0); // divisor = 0
+    bus.write8(src2, 0xFB); // -5 as i8
+    bus.write8(src2 + 1, 10);
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_000_000), // e8
+        vle(8, 1, 10, 1),
+        vle(8, 2, 11, 1),
+        opmvv(0b100011, 3, 1, 2, 1), // vrem.vv
+        vse(8, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    // -5 % 3 = -2 → 0xFE as u8
+    assert_eq!(bus.read8(dst), 0xFE);
+    // div by zero: remainder = dividend
+    assert_eq!(bus.read8(dst + 1), 10);
+}
+
+#[test]
+fn test_vmul_vx() {
+    // vmul.vx: multiply each element by scalar
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src = DRAM_BASE + 0x1000;
+    let dst = DRAM_BASE + 0x1020;
+
+    for (i, v) in [1u32, 2, 3, 4].iter().enumerate() {
+        bus.write32(src + i as u64 * 4, *v);
+    }
+
+    cpu.regs[10] = src;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 4;
+    cpu.regs[5] = 10; // scalar multiplier
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000),
+        vle(32, 2, 10, 1),
+        opmvx(0b100101, 3, 5, 2, 1), // vmul.vx v3, v2, x5
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 10);
+    assert_eq!(bus.read32(dst + 4), 20);
+    assert_eq!(bus.read32(dst + 8), 30);
+    assert_eq!(bus.read32(dst + 12), 40);
+}
+
+#[test]
+fn test_vmacc_vv() {
+    // vmacc.vv: vd += vs1 * vs2
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let acc_addr = DRAM_BASE + 0x1020;
+    let dst = DRAM_BASE + 0x1030;
+
+    for (i, v) in [2u32, 3].iter().enumerate() {
+        bus.write32(src1 + i as u64 * 4, *v);
+    }
+    for (i, v) in [5u32, 7].iter().enumerate() {
+        bus.write32(src2 + i as u64 * 4, *v);
+    }
+    for (i, v) in [100u32, 200].iter().enumerate() {
+        bus.write32(acc_addr + i as u64 * 4, *v);
+    }
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[13] = acc_addr;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000),
+        vle(32, 1, 10, 1),           // v1 = [2, 3]
+        vle(32, 2, 11, 1),           // v2 = [5, 7]
+        vle(32, 3, 13, 1),           // v3 = [100, 200] (accumulator)
+        opmvv(0b101101, 3, 1, 2, 1), // vmacc.vv v3, v1, v2: v3 += v1*v2
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..6 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 110); // 100 + 2*5
+    assert_eq!(bus.read32(dst + 4), 221); // 200 + 3*7
+}
+
+#[test]
+fn test_vwaddu_vv() {
+    // vwaddu.vv: widening unsigned add, e16 → e32
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    // e16 elements
+    bus.write16(src1, 0xFFFF); // 65535
+    bus.write16(src1 + 2, 0x0001); // 1
+    bus.write16(src2, 0x0001); // 1
+    bus.write16(src2 + 2, 0xFFFF); // 65535
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_001_000), // e16,m1
+        vle(16, 1, 10, 1),
+        vle(16, 2, 11, 1),
+        opmvv(0b110000, 3, 1, 2, 1), // vwaddu.vv v3, v2, v1
+        vse(32, 3, 12, 1),           // store as e32
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    // 0xFFFF + 1 = 0x10000 (fits in 32 bits, no truncation)
+    assert_eq!(bus.read32(dst), 0x10000);
+    assert_eq!(bus.read32(dst + 4), 0x10000);
+}
+
+#[test]
+fn test_vwadd_vv_signed() {
+    // vwadd.vv: widening signed add, e8 → e16
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    bus.write8(src1, 0x80); // -128
+    bus.write8(src1 + 1, 127);
+    bus.write8(src2, 0x80); // -128
+    bus.write8(src2 + 1, 127);
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_000_000), // e8,m1
+        vle(8, 1, 10, 1),
+        vle(8, 2, 11, 1),
+        opmvv(0b110001, 3, 1, 2, 1), // vwadd.vv
+        vse(16, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    // -128 + -128 = -256 = 0xFF00 as u16
+    assert_eq!(bus.read16(dst), 0xFF00u16);
+    // 127 + 127 = 254 = 0x00FE
+    assert_eq!(bus.read16(dst + 2), 254);
+}
+
+#[test]
+fn test_vwmulu_vv() {
+    // vwmulu.vv: widening unsigned multiply e16 → e32
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    bus.write16(src1, 0xFFFF);
+    bus.write16(src1 + 2, 100);
+    bus.write16(src2, 0xFFFF);
+    bus.write16(src2 + 2, 200);
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_001_000), // e16
+        vle(16, 1, 10, 1),
+        vle(16, 2, 11, 1),
+        opmvv(0b111000, 3, 1, 2, 1), // vwmulu.vv
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 0xFFFF * 0xFFFF); // 0xFFFE0001
+    assert_eq!(bus.read32(dst + 4), 20000);
+}
+
+#[test]
+fn test_vnsrl_wv() {
+    // vnsrl.wv: narrow shift right logical, e32 → e16
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src_shift = DRAM_BASE + 0x1000; // shift amounts (e16)
+    let dst = DRAM_BASE + 0x1020;
+
+    // Put wide values (e32) directly in v2
+    // Put shift amounts (e16) in v1
+    bus.write16(src_shift, 8);
+    bus.write16(src_shift + 2, 0);
+
+    // For v2, we need e32 data. Write it at src2 and load as e32.
+    let src2 = DRAM_BASE + 0x1010;
+    bus.write32(src2, 0x0000_FF00); // >> 8 = 0xFF → e16
+    bus.write32(src2 + 4, 0x0001_2345); // >> 0 = 0x2345 truncated to e16
+
+    cpu.regs[10] = src_shift;
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    // We need to load v2 as e32 and v1 as e16 with the same vl.
+    // Use e16 for vsetvli (SEW for the result), load v2 as e32 first with e32 config.
+    let prog = [
+        // Load vs2 as e32
+        v_addi(1, 0, 2),
+        vsetvli(0, 1, 0b0_0_010_000), // e32,m1
+        vle(32, 2, 11, 1),
+        // Now set e16 for the narrowing op
+        vsetvli(0, 1, 0b0_0_001_000), // e16,m1
+        vle(16, 1, 10, 1),            // shift amounts
+        opivv(0b101100, 3, 1, 2, 1),  // vnsrl.wv v3, v2, v1
+        vse(16, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..7 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read16(dst), 0x00FF);
+    assert_eq!(bus.read16(dst + 2), 0x2345);
+}
+
+#[test]
+fn test_vnsra_wi() {
+    // vnsra.wi: narrow arithmetic right shift by immediate
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    // e32 source values to narrow to e16
+    bus.write32(src2, 0xFFFF_0000u32); // negative in i32, >> 16 = 0xFFFF
+    bus.write32(src2 + 4, 0x0003_0000); // >> 16 = 3
+
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        v_addi(1, 0, 2),
+        vsetvli(0, 1, 0b0_0_010_000), // e32
+        vle(32, 2, 11, 1),
+        vsetvli(0, 1, 0b0_0_001_000), // e16
+        opivi(0b101101, 3, 16, 2, 1), // vnsra.wi v3, v2, 16
+        vse(16, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..6 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read16(dst), 0xFFFF); // sign-extended shift
+    assert_eq!(bus.read16(dst + 2), 3);
+}
+
+#[test]
+fn test_vzext_vf2() {
+    // vzext.vf2: zero-extend e16 → e32
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src = DRAM_BASE + 0x1000;
+    let dst = DRAM_BASE + 0x1020;
+
+    bus.write16(src, 0xBEEF);
+    bus.write16(src + 2, 0x1234);
+
+    cpu.regs[10] = src;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    // Load as e16, then set e32 and do vzext.vf2
+    let prog = [
+        v_addi(1, 0, 2),
+        vsetvli(0, 1, 0b0_0_001_000), // e16
+        vle(16, 2, 10, 1),            // v2 = [0xBEEF, 0x1234] as e16
+        vsetvli(0, 1, 0b0_0_010_000), // e32 (destination width)
+        // vzext.vf2: OPMVV funct6=0b010010, vs1=0b00110
+        opmvv(0b010010, 3, 0b00110, 2, 1), // vzext.vf2 v3, v2
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..6 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 0x0000_BEEF);
+    assert_eq!(bus.read32(dst + 4), 0x0000_1234);
+}
+
+#[test]
+fn test_vsext_vf2() {
+    // vsext.vf2: sign-extend e16 → e32
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src = DRAM_BASE + 0x1000;
+    let dst = DRAM_BASE + 0x1020;
+
+    bus.write16(src, 0x8000); // -32768 as i16
+    bus.write16(src + 2, 0x007F); // 127
+
+    cpu.regs[10] = src;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        v_addi(1, 0, 2),
+        vsetvli(0, 1, 0b0_0_001_000), // e16
+        vle(16, 2, 10, 1),
+        vsetvli(0, 1, 0b0_0_010_000),      // e32
+        opmvv(0b010010, 3, 0b00111, 2, 1), // vsext.vf2 v3, v2
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..6 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 0xFFFF_8000); // sign-extended
+    assert_eq!(bus.read32(dst + 4), 0x0000_007F);
+}
+
+#[test]
+fn test_vwmaccu_vv() {
+    // vwmaccu.vv: widening unsigned multiply-accumulate, e16→e32
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src1 = DRAM_BASE + 0x1000;
+    let src2 = DRAM_BASE + 0x1010;
+    let acc = DRAM_BASE + 0x1020;
+    let dst = DRAM_BASE + 0x1030;
+
+    bus.write16(src1, 100);
+    bus.write16(src1 + 2, 200);
+    bus.write16(src2, 300);
+    bus.write16(src2 + 2, 400);
+    // accumulator as e32
+    bus.write32(acc, 1000);
+    bus.write32(acc + 4, 2000);
+
+    cpu.regs[10] = src1;
+    cpu.regs[11] = src2;
+    cpu.regs[13] = acc;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+
+    let prog = [
+        // Load accumulator as e32
+        v_addi(1, 0, 2),
+        vsetvli(0, 1, 0b0_0_010_000), // e32
+        vle(32, 3, 13, 1),
+        // Load operands as e16
+        vsetvli(0, 1, 0b0_0_001_000), // e16
+        vle(16, 1, 10, 1),
+        vle(16, 2, 11, 1),
+        opmvv(0b111100, 3, 1, 2, 1), // vwmaccu.vv v3, v1, v2
+        vse(32, 3, 12, 1),           // store result as e32
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..8 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 1000 + 100 * 300); // 31000
+    assert_eq!(bus.read32(dst + 4), 2000 + 200 * 400); // 82000
+}
+
+#[test]
+fn test_vdiv_vx_signed() {
+    // vdiv.vx: signed division by scalar
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src = DRAM_BASE + 0x1000;
+    let dst = DRAM_BASE + 0x1020;
+
+    // e32 signed: [-12, 15]
+    bus.write32(src, 0xFFFF_FFF4u32); // -12
+    bus.write32(src + 4, 15);
+
+    cpu.regs[10] = src;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+    cpu.regs[5] = 4; // divisor
+
+    let prog = [
+        vsetvli(0, 1, 0b0_0_010_000),
+        vle(32, 2, 10, 1),
+        opmvx(0b100001, 3, 5, 2, 1), // vdiv.vx v3, v2, x5
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+
+    // -12 / 4 = -3 → 0xFFFFFFFD
+    assert_eq!(bus.read32(dst), 0xFFFF_FFFDu32);
+    // 15 / 4 = 3
+    assert_eq!(bus.read32(dst + 4), 3);
+}
+
+#[test]
+fn test_vwaddu_wx() {
+    // vwaddu.wx: vs2 is 2*SEW, add scalar as unsigned SEW
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+
+    let src2 = DRAM_BASE + 0x1010;
+    let dst = DRAM_BASE + 0x1020;
+
+    // e32 wide values in v2
+    bus.write32(src2, 0x0001_0000);
+    bus.write32(src2 + 4, 0xFFFF_FFFF);
+
+    cpu.regs[11] = src2;
+    cpu.regs[12] = dst;
+    cpu.regs[1] = 2;
+    cpu.regs[5] = 0xFFFF; // scalar (treated as e16 unsigned)
+
+    let prog = [
+        v_addi(1, 0, 2),
+        vsetvli(0, 1, 0b0_0_010_000), // e32 to load wide
+        vle(32, 2, 11, 1),
+        vsetvli(0, 1, 0b0_0_001_000), // e16 for the operation
+        opmvx(0b110100, 3, 5, 2, 1),  // vwaddu.wx v3, v2, x5
+        vse(32, 3, 12, 1),
+    ];
+    let bytes: Vec<u8> = prog.iter().flat_map(|i| i.to_le_bytes()).collect();
+    bus.load_binary(&bytes, 0);
+    for _ in 0..6 {
+        cpu.step(&mut bus);
+    }
+
+    assert_eq!(bus.read32(dst), 0x0001_FFFF);
+    // 0xFFFFFFFF + 0xFFFF = 0x1_0000_FFFE, truncated to 32 bits = 0x0000_FFFE
+    assert_eq!(bus.read32(dst + 4), 0x0000_FFFE);
+}
