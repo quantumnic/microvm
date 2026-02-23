@@ -243,6 +243,7 @@ pub fn execute_vector(cpu: &mut Cpu, bus: &mut Bus, raw: u32, inst_len: u64) -> 
     let opcode = raw & 0x7F;
     match opcode {
         0x57 => execute_v_arith(cpu, bus, raw, inst_len),
+        0x77 => execute_v_crypto(cpu, raw, inst_len),
         0x07 => execute_v_load(cpu, bus, raw, inst_len),
         0x27 => execute_v_store(cpu, bus, raw, inst_len),
         _ => false,
@@ -2946,6 +2947,359 @@ fn execute_mvv(cpu: &mut Cpu, ctx: &VCtx) {
 }
 
 // ============================================================================
+// OP-P (opcode 0x77): Vector crypto instructions (Zvkned)
+// ============================================================================
+fn execute_v_crypto(cpu: &mut Cpu, raw: u32, inst_len: u64) -> bool {
+    let funct3 = (raw >> 12) & 0x7;
+    let vd = ((raw >> 7) & 0x1F) as usize;
+    let vs1 = ((raw >> 15) & 0x1F) as usize;
+    let vs2 = ((raw >> 20) & 0x1F) as usize;
+    let funct6 = (raw >> 26) & 0x3F;
+
+    // All Zvkned instructions require SEW=32
+    let vtype = current_vtype(cpu);
+    if vtype.vill || vtype.sew != 32 {
+        return false;
+    }
+    let vl = current_vl(cpu);
+    let num_groups = vl as usize / 4;
+    if num_groups == 0 {
+        cpu.pc += inst_len;
+        return true;
+    }
+
+    // Only OPMVV encoding (funct3=2)
+    if funct3 != 2 {
+        return false;
+    }
+
+    set_vs_dirty(cpu);
+
+    match funct6 {
+        0b101000 if matches!(vs1, 0..=3) => {
+            // vaes*.vv: vaesdm(0), vaesdf(1), vaesem(2), vaesef(3)
+            for g in 0..num_groups {
+                let base = g * 4;
+                let mut state = aes_read_group(cpu, vd, base);
+                let rk = aes_read_group(cpu, vs2, base);
+                match vs1 {
+                    0 => aes_decrypt_middle(&mut state, &rk),
+                    1 => aes_decrypt_final(&mut state, &rk),
+                    2 => aes_encrypt_middle(&mut state, &rk),
+                    3 => aes_encrypt_final(&mut state, &rk),
+                    _ => unreachable!(),
+                }
+                aes_write_group(cpu, vd, base, &state);
+            }
+        }
+        0b101001 if matches!(vs1, 0..=3) => {
+            // vaes*.vs: scalar round key from vs2[0]
+            let rk = aes_read_group(cpu, vs2, 0);
+            for g in 0..num_groups {
+                let base = g * 4;
+                let mut state = aes_read_group(cpu, vd, base);
+                match vs1 {
+                    0 => aes_decrypt_middle(&mut state, &rk),
+                    1 => aes_decrypt_final(&mut state, &rk),
+                    2 => aes_encrypt_middle(&mut state, &rk),
+                    3 => aes_encrypt_final(&mut state, &rk),
+                    _ => unreachable!(),
+                }
+                aes_write_group(cpu, vd, base, &state);
+            }
+        }
+        0b100010 => {
+            // vaeskf1.vi — AES-128 key schedule
+            let rnum = vs1 as u32;
+            for g in 0..num_groups {
+                let base = g * 4;
+                let current_key = aes_read_group(cpu, vs2, base);
+                let new_key = aes_keyschedule_128(&current_key, rnum);
+                aes_write_group(cpu, vd, base, &new_key);
+            }
+        }
+        0b101010 => {
+            // vaeskf2.vi — AES-256 key schedule
+            let rnum = vs1 as u32;
+            for g in 0..num_groups {
+                let base = g * 4;
+                let prev_key = aes_read_group(cpu, vs2, base);
+                let current_key = aes_read_group(cpu, vd, base);
+                let new_key = aes_keyschedule_256(&prev_key, &current_key, rnum);
+                aes_write_group(cpu, vd, base, &new_key);
+            }
+        }
+        _ => return false,
+    }
+
+    cpu.pc += inst_len;
+    true
+}
+
+// ============================================================================
+// Zvkned: AES helpers for vector crypto
+// ============================================================================
+
+/// Read a 128-bit element group (4 × SEW=32 elements) from a vector register.
+fn aes_read_group(cpu: &Cpu, vreg: usize, base: usize) -> [u32; 4] {
+    [
+        cpu.vregs.read_elem(vreg, 32, base) as u32,
+        cpu.vregs.read_elem(vreg, 32, base + 1) as u32,
+        cpu.vregs.read_elem(vreg, 32, base + 2) as u32,
+        cpu.vregs.read_elem(vreg, 32, base + 3) as u32,
+    ]
+}
+
+/// Write a 128-bit element group back.
+fn aes_write_group(cpu: &mut Cpu, vreg: usize, base: usize, group: &[u32; 4]) {
+    for (i, &val) in group.iter().enumerate() {
+        cpu.vregs.write_elem(vreg, 32, base + i, val as u64);
+    }
+}
+
+/// Get byte at position from the 4×u32 state (column-major).
+/// State layout: col0=state[0], col1=state[1], col2=state[2], col3=state[3]
+/// Each column: byte0=LSB .. byte3=MSB → row 0..3
+#[inline]
+fn aes_get_byte(state: &[u32; 4], row: usize, col: usize) -> u8 {
+    ((state[col] >> (row * 8)) & 0xFF) as u8
+}
+
+/// Set byte at position in state.
+#[inline]
+fn aes_set_byte(state: &mut [u32; 4], row: usize, col: usize, val: u8) {
+    state[col] = (state[col] & !(0xFF << (row * 8))) | ((val as u32) << (row * 8));
+}
+
+/// AES SubBytes (forward S-box on all 16 bytes).
+fn aes_sub_bytes(state: &mut [u32; 4]) {
+    for w in state.iter_mut() {
+        let b0 = super::execute::AES_SBOX[(*w & 0xFF) as usize] as u32;
+        let b1 = super::execute::AES_SBOX[((*w >> 8) & 0xFF) as usize] as u32;
+        let b2 = super::execute::AES_SBOX[((*w >> 16) & 0xFF) as usize] as u32;
+        let b3 = super::execute::AES_SBOX[((*w >> 24) & 0xFF) as usize] as u32;
+        *w = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+}
+
+/// AES InvSubBytes (inverse S-box on all 16 bytes).
+fn aes_inv_sub_bytes(state: &mut [u32; 4]) {
+    for w in state.iter_mut() {
+        let b0 = super::execute::AES_INV_SBOX[(*w & 0xFF) as usize] as u32;
+        let b1 = super::execute::AES_INV_SBOX[((*w >> 8) & 0xFF) as usize] as u32;
+        let b2 = super::execute::AES_INV_SBOX[((*w >> 16) & 0xFF) as usize] as u32;
+        let b3 = super::execute::AES_INV_SBOX[((*w >> 24) & 0xFF) as usize] as u32;
+        *w = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+}
+
+/// AES ShiftRows: rotate rows left by 0/1/2/3.
+fn aes_shift_rows(state: &mut [u32; 4]) {
+    // Row 0: no shift
+    // Row 1: shift left by 1
+    let t = aes_get_byte(state, 1, 0);
+    aes_set_byte(state, 1, 0, aes_get_byte(state, 1, 1));
+    aes_set_byte(state, 1, 1, aes_get_byte(state, 1, 2));
+    aes_set_byte(state, 1, 2, aes_get_byte(state, 1, 3));
+    aes_set_byte(state, 1, 3, t);
+    // Row 2: shift left by 2
+    let t0 = aes_get_byte(state, 2, 0);
+    let t1 = aes_get_byte(state, 2, 1);
+    aes_set_byte(state, 2, 0, aes_get_byte(state, 2, 2));
+    aes_set_byte(state, 2, 1, aes_get_byte(state, 2, 3));
+    aes_set_byte(state, 2, 2, t0);
+    aes_set_byte(state, 2, 3, t1);
+    // Row 3: shift left by 3 (= right by 1)
+    let t = aes_get_byte(state, 3, 3);
+    aes_set_byte(state, 3, 3, aes_get_byte(state, 3, 2));
+    aes_set_byte(state, 3, 2, aes_get_byte(state, 3, 1));
+    aes_set_byte(state, 3, 1, aes_get_byte(state, 3, 0));
+    aes_set_byte(state, 3, 0, t);
+}
+
+/// AES InvShiftRows: rotate rows right by 0/1/2/3.
+fn aes_inv_shift_rows(state: &mut [u32; 4]) {
+    // Row 1: shift right by 1
+    let t = aes_get_byte(state, 1, 3);
+    aes_set_byte(state, 1, 3, aes_get_byte(state, 1, 2));
+    aes_set_byte(state, 1, 2, aes_get_byte(state, 1, 1));
+    aes_set_byte(state, 1, 1, aes_get_byte(state, 1, 0));
+    aes_set_byte(state, 1, 0, t);
+    // Row 2: shift right by 2
+    let t0 = aes_get_byte(state, 2, 0);
+    let t1 = aes_get_byte(state, 2, 1);
+    aes_set_byte(state, 2, 0, aes_get_byte(state, 2, 2));
+    aes_set_byte(state, 2, 1, aes_get_byte(state, 2, 3));
+    aes_set_byte(state, 2, 2, t0);
+    aes_set_byte(state, 2, 3, t1);
+    // Row 3: shift right by 3 (= left by 1)
+    let t = aes_get_byte(state, 3, 0);
+    aes_set_byte(state, 3, 0, aes_get_byte(state, 3, 1));
+    aes_set_byte(state, 3, 1, aes_get_byte(state, 3, 2));
+    aes_set_byte(state, 3, 2, aes_get_byte(state, 3, 3));
+    aes_set_byte(state, 3, 3, t);
+}
+
+/// GF(2^8) multiply by 2 (xtime).
+#[inline]
+fn gf_mul2(x: u8) -> u8 {
+    let r = (x as u16) << 1;
+    if r & 0x100 != 0 {
+        (r ^ 0x11b) as u8
+    } else {
+        r as u8
+    }
+}
+
+/// AES MixColumns: mix each column independently.
+fn aes_mix_columns(state: &mut [u32; 4]) {
+    for col in 0..4 {
+        let s0 = aes_get_byte(state, 0, col);
+        let s1 = aes_get_byte(state, 1, col);
+        let s2 = aes_get_byte(state, 2, col);
+        let s3 = aes_get_byte(state, 3, col);
+        let r0 = gf_mul2(s0) ^ gf_mul2(s1) ^ s1 ^ s2 ^ s3;
+        let r1 = s0 ^ gf_mul2(s1) ^ gf_mul2(s2) ^ s2 ^ s3;
+        let r2 = s0 ^ s1 ^ gf_mul2(s2) ^ gf_mul2(s3) ^ s3;
+        let r3 = gf_mul2(s0) ^ s0 ^ s1 ^ s2 ^ gf_mul2(s3);
+        aes_set_byte(state, 0, col, r0);
+        aes_set_byte(state, 1, col, r1);
+        aes_set_byte(state, 2, col, r2);
+        aes_set_byte(state, 3, col, r3);
+    }
+}
+
+/// GF(2^8) multiply.
+fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut p: u8 = 0;
+    for _ in 0..8 {
+        if b & 1 != 0 {
+            p ^= a;
+        }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    p
+}
+
+/// AES InvMixColumns.
+fn aes_inv_mix_columns(state: &mut [u32; 4]) {
+    for col in 0..4 {
+        let s0 = aes_get_byte(state, 0, col);
+        let s1 = aes_get_byte(state, 1, col);
+        let s2 = aes_get_byte(state, 2, col);
+        let s3 = aes_get_byte(state, 3, col);
+        let r0 = gf_mul(s0, 0x0e) ^ gf_mul(s1, 0x0b) ^ gf_mul(s2, 0x0d) ^ gf_mul(s3, 0x09);
+        let r1 = gf_mul(s0, 0x09) ^ gf_mul(s1, 0x0e) ^ gf_mul(s2, 0x0b) ^ gf_mul(s3, 0x0d);
+        let r2 = gf_mul(s0, 0x0d) ^ gf_mul(s1, 0x09) ^ gf_mul(s2, 0x0e) ^ gf_mul(s3, 0x0b);
+        let r3 = gf_mul(s0, 0x0b) ^ gf_mul(s1, 0x0d) ^ gf_mul(s2, 0x09) ^ gf_mul(s3, 0x0e);
+        aes_set_byte(state, 0, col, r0);
+        aes_set_byte(state, 1, col, r1);
+        aes_set_byte(state, 2, col, r2);
+        aes_set_byte(state, 3, col, r3);
+    }
+}
+
+/// AES AddRoundKey: XOR state with round key.
+fn aes_add_round_key(state: &mut [u32; 4], rk: &[u32; 4]) {
+    for i in 0..4 {
+        state[i] ^= rk[i];
+    }
+}
+
+/// AES encrypt middle round: SubBytes → ShiftRows → MixColumns → AddRoundKey
+fn aes_encrypt_middle(state: &mut [u32; 4], rk: &[u32; 4]) {
+    aes_sub_bytes(state);
+    aes_shift_rows(state);
+    aes_mix_columns(state);
+    aes_add_round_key(state, rk);
+}
+
+/// AES encrypt final round: SubBytes → ShiftRows → AddRoundKey
+fn aes_encrypt_final(state: &mut [u32; 4], rk: &[u32; 4]) {
+    aes_sub_bytes(state);
+    aes_shift_rows(state);
+    aes_add_round_key(state, rk);
+}
+
+/// AES decrypt middle round: InvShiftRows → InvSubBytes → AddRoundKey → InvMixColumns
+fn aes_decrypt_middle(state: &mut [u32; 4], rk: &[u32; 4]) {
+    aes_inv_shift_rows(state);
+    aes_inv_sub_bytes(state);
+    aes_add_round_key(state, rk);
+    aes_inv_mix_columns(state);
+}
+
+/// AES decrypt final round: InvShiftRows → InvSubBytes → AddRoundKey
+fn aes_decrypt_final(state: &mut [u32; 4], rk: &[u32; 4]) {
+    aes_inv_shift_rows(state);
+    aes_inv_sub_bytes(state);
+    aes_add_round_key(state, rk);
+}
+
+/// AES-128 key schedule: produce next round key from current.
+fn aes_keyschedule_128(current: &[u32; 4], rnum: u32) -> [u32; 4] {
+    let rcon = if (rnum as usize) < super::execute::AES_RCON.len() {
+        super::execute::AES_RCON[rnum as usize] as u32
+    } else {
+        0
+    };
+    // RotWord + SubWord on last word
+    let w3 = current[3];
+    let rot = w3.rotate_right(8); // RotWord
+    let sub = aes_sub_word(rot);
+    let mut nk = [0u32; 4];
+    nk[0] = current[0] ^ sub ^ rcon;
+    nk[1] = current[1] ^ nk[0];
+    nk[2] = current[2] ^ nk[1];
+    nk[3] = current[3] ^ nk[2];
+    nk
+}
+
+/// AES-256 key schedule: produce next round key.
+/// prev_key = vs2 (previous 128-bit), current_key = vd (current 128-bit).
+fn aes_keyschedule_256(prev_key: &[u32; 4], current_key: &[u32; 4], rnum: u32) -> [u32; 4] {
+    let mut nk = [0u32; 4];
+    if rnum & 1 == 1 {
+        // Odd round: SubWord (no RotWord, no Rcon)
+        let sub = aes_sub_word(current_key[3]);
+        nk[0] = prev_key[0] ^ sub;
+        nk[1] = prev_key[1] ^ nk[0];
+        nk[2] = prev_key[2] ^ nk[1];
+        nk[3] = prev_key[3] ^ nk[2];
+    } else {
+        // Even round: RotWord + SubWord + Rcon
+        let rcon_idx = (rnum / 2) as usize;
+        let rcon = if rcon_idx < super::execute::AES_RCON.len() {
+            super::execute::AES_RCON[rcon_idx] as u32
+        } else {
+            0
+        };
+        let w3 = current_key[3];
+        let rot = w3.rotate_right(8);
+        let sub = aes_sub_word(rot);
+        nk[0] = prev_key[0] ^ sub ^ rcon;
+        nk[1] = prev_key[1] ^ nk[0];
+        nk[2] = prev_key[2] ^ nk[1];
+        nk[3] = prev_key[3] ^ nk[2];
+    }
+    nk
+}
+
+/// Apply AES S-box to each byte of a 32-bit word.
+fn aes_sub_word(w: u32) -> u32 {
+    let b0 = super::execute::AES_SBOX[(w & 0xFF) as usize] as u32;
+    let b1 = super::execute::AES_SBOX[((w >> 8) & 0xFF) as usize] as u32;
+    let b2 = super::execute::AES_SBOX[((w >> 16) & 0xFF) as usize] as u32;
+    let b3 = super::execute::AES_SBOX[((w >> 24) & 0xFF) as usize] as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+// ============================================================================
 // OPMVX (funct3=6): scalar-vector operations
 // ============================================================================
 fn execute_mvx(cpu: &mut Cpu, ctx: &VCtx, scalar: u64) {
@@ -3910,5 +4264,87 @@ mod tests {
         let d = f64::from_bits(f64_div(a, b));
         assert!((d - 10.0 / 3.0).abs() < 1e-10);
         assert_eq!(f64::from_bits(f64_sqrt(4.0f64.to_bits())), 2.0);
+    }
+
+    // ========================================================================
+    // Zvkned tests
+    // ========================================================================
+
+    #[test]
+    fn test_aes_sub_bytes_roundtrip() {
+        let mut state = [0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f];
+        let original = state;
+        aes_sub_bytes(&mut state);
+        // SubBytes should change the state
+        assert_ne!(state, original);
+        aes_inv_sub_bytes(&mut state);
+        // InvSubBytes should restore it
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn test_aes_shift_rows_roundtrip() {
+        let mut state = [0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f];
+        let original = state;
+        aes_shift_rows(&mut state);
+        assert_ne!(state, original);
+        aes_inv_shift_rows(&mut state);
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn test_aes_mix_columns_roundtrip() {
+        let mut state = [0x63637c63, 0x7c776b7c, 0xf26bc5f2, 0x6fc56f6f];
+        let original = state;
+        aes_mix_columns(&mut state);
+        assert_ne!(state, original);
+        aes_inv_mix_columns(&mut state);
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn test_aes_encrypt_final_decrypt_final_roundtrip() {
+        // Final round: encrypt then decrypt with same key is a valid roundtrip
+        // because final round has no MixColumns
+        let plaintext = [0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00];
+        let key = [0xaabbccdd, 0xeeff0011, 0x22334455, 0x66778899];
+
+        let mut state = plaintext;
+        // Encrypt final: SubBytes → ShiftRows → XOR key
+        aes_encrypt_final(&mut state, &key);
+        assert_ne!(state, plaintext);
+        // To reverse: XOR key → InvShiftRows → InvSubBytes
+        // Which is: InvSubBytes(InvShiftRows(state XOR key))
+        aes_add_round_key(&mut state, &key);
+        aes_inv_shift_rows(&mut state);
+        aes_inv_sub_bytes(&mut state);
+        assert_eq!(state, plaintext);
+    }
+
+    #[test]
+    fn test_aes_keyschedule_128() {
+        // FIPS 197 Appendix A.1: AES-128 key expansion
+        // Key: 2b7e1516 28aed2a6 abf71588 09cf4f3c
+        let key = [0x16157e2b, 0xa6d2ae28, 0x8815f7ab, 0x3c4fcf09];
+        let rk1 = aes_keyschedule_128(&key, 1);
+        // Expected round key 1: a0fafe17 88542cb1 23a33939 2a6c7605
+        assert_eq!(rk1[0], 0x17fefaa0);
+        assert_eq!(rk1[1], 0xb12c5488);
+        assert_eq!(rk1[2], 0x3939a323);
+        assert_eq!(rk1[3], 0x05766c2a);
+    }
+
+    #[test]
+    fn test_aes_sub_word() {
+        // SubWord(0x00010203) = S[00] S[01] S[02] S[03] = 63 7c 77 7b
+        assert_eq!(aes_sub_word(0x03020100), 0x7b777c63);
+    }
+
+    #[test]
+    fn test_gf_mul() {
+        assert_eq!(gf_mul(0x57, 0x83), 0xc1);
+        assert_eq!(gf_mul(0x57, 0x02), 0xae);
+        assert_eq!(gf_mul(0x01, 0x01), 0x01);
+        assert_eq!(gf_mul(0x00, 0xff), 0x00);
     }
 }

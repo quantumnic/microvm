@@ -945,6 +945,7 @@ pub fn mnemonic(inst: u32) -> &'static str {
                 }
             }
         }
+        0x77 => "vaes", // OP-P: Zvkned vector crypto
         0x43 | 0x47 | 0x4B | 0x4F => "fmadd",
         0x53 => "fpu",
         _ => "unknown",
