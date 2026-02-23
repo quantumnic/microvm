@@ -12248,3 +12248,402 @@ fn test_zvksh_in_isa_string() {
     let dtb_str = String::from_utf8_lossy(&dtb);
     assert!(dtb_str.contains("zvksh"), "DTB should advertise zvksh");
 }
+
+// =====================================================================
+// Zfh: Half-precision floating-point extension tests
+// =====================================================================
+
+/// Helper: NaN-box a half-precision (u16) value for f-register storage
+fn nan_box_h(val: u16) -> u64 {
+    val as u64 | 0xFFFF_FFFF_FFFF_0000
+}
+
+/// Helper: encode f16 from f32 (simple direct conversion for test constants)
+fn f32_to_f16_bits(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 31) & 1) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x007F_FFFF;
+    if exp == 0xFF {
+        if frac == 0 {
+            (sign << 15) | (0x1F << 10)
+        } else {
+            (sign << 15) | (0x1F << 10) | 0x200
+        } // qNaN
+    } else if exp == 0 {
+        sign << 15 // zero (flush subnormals)
+    } else {
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            (sign << 15) | (0x1F << 10)
+        }
+        // overflow → inf
+        else if new_exp <= 0 {
+            sign << 15
+        }
+        // underflow → zero
+        else {
+            (sign << 15) | ((new_exp as u16) << 10) | ((frac >> 13) as u16)
+        }
+    }
+}
+
+/// Helper: decode f16 bits to f32
+fn f16_to_f32_bits(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let frac = (h & 0x3FF) as u32;
+    let bits = if exp == 0 {
+        if frac == 0 {
+            sign << 31
+        } else {
+            let mut f = frac;
+            let mut e: i32 = -14 + 127;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            f &= 0x3FF;
+            (sign << 31) | ((e as u32) << 23) | (f << 13)
+        }
+    } else if exp == 0x1F {
+        if frac == 0 {
+            (sign << 31) | (0xFF << 23)
+        } else {
+            (sign << 31) | (0xFF << 23) | (frac << 13)
+        }
+    } else {
+        (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13)
+    };
+    f32::from_bits(bits)
+}
+
+#[test]
+fn test_zfh_fadd_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    // f2 = 3.0h, f3 = 2.0h
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(3.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(2.0));
+    // FADD.H f1, f2, f3: funct7=0x02, rs2=3, rs1=2, rm=000, rd=1
+    let fadd_h = 0x02 << 25 | 3 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fadd_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    let result = f16_to_f32_bits(cpu.fregs[1] as u16);
+    assert_eq!(result, 5.0, "FADD.H: 3.0 + 2.0 = 5.0");
+}
+
+#[test]
+fn test_zfh_fsub_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(5.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(2.0));
+    let fsub_h = 0x06 << 25 | 3 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fsub_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[1] as u16), 3.0);
+}
+
+#[test]
+fn test_zfh_fmul_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(3.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(4.0));
+    let fmul_h = 0x0A << 25 | 3 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fmul_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[1] as u16), 12.0);
+}
+
+#[test]
+fn test_zfh_fdiv_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(10.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(2.0));
+    let fdiv_h = 0x0E << 25 | 3 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fdiv_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[1] as u16), 5.0);
+}
+
+#[test]
+fn test_zfh_fsqrt_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(4.0));
+    // FSQRT.H f1, f2: funct7=0x2E, rs2=0
+    let fsqrt_h = 0x2E << 25 | 0 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fsqrt_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[1] as u16), 2.0);
+}
+
+#[test]
+fn test_zfh_fmv_h_x_and_x_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    let h_val = f32_to_f16_bits(1.5);
+    cpu.regs[1] = h_val as u64;
+    // FMV.H.X f2, x1: funct7=0x7A, rs2=0, rs1=1, rm=000, rd=2
+    let fmv_h_x = 0x7A << 25 | 0 << 20 | 1 << 15 | 0 << 12 | 2 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fmv_h_x as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.fregs[2] as u16, h_val, "FMV.H.X");
+    assert_eq!(
+        cpu.fregs[2] & 0xFFFF_FFFF_FFFF_0000,
+        0xFFFF_FFFF_FFFF_0000,
+        "NaN-boxed"
+    );
+
+    // FMV.X.H x3, f2: funct7=0x72, rs2=0, rs1=2, rm=000, rd=3
+    let fmv_x_h = 0x72 << 25 | 0 << 20 | 2 << 15 | 0 << 12 | 3 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fmv_x_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    // FMV.X.H sign-extends the 16-bit value
+    assert_eq!(cpu.regs[3] as u16, h_val, "FMV.X.H low bits");
+}
+
+#[test]
+fn test_zfh_fcvt_s_h_and_h_s() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    // Load 2.5h into f2
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(2.5));
+    // FCVT.S.H f1, f2: funct7=0x20, rs2=2 (H source)
+    let fcvt_s_h = 0x20 << 25 | 2 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fcvt_s_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f32::from_bits(cpu.fregs[1] as u32), 2.5, "FCVT.S.H");
+
+    // FCVT.H.S f3, f1: funct7=0x22, rs2=0 (S source)
+    let fcvt_h_s = 0x22 << 25 | 0 << 20 | 1 << 15 | 0 << 12 | 3 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fcvt_h_s as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[3] as u16), 2.5, "FCVT.H.S");
+}
+
+#[test]
+fn test_zfh_fcvt_d_h_and_h_d() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(4.0));
+    // FCVT.D.H f1, f2: funct7=0x21, rs2=2
+    let fcvt_d_h = 0x21 << 25 | 2 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fcvt_d_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f64::from_bits(cpu.fregs[1]), 4.0, "FCVT.D.H");
+
+    // FCVT.H.D f3, f1: funct7=0x22, rs2=1
+    let fcvt_h_d = 0x22 << 25 | 1 << 20 | 1 << 15 | 0 << 12 | 3 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fcvt_h_d as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[3] as u16), 4.0, "FCVT.H.D");
+}
+
+#[test]
+fn test_zfh_fcvt_w_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(7.0));
+    // FCVT.W.H x1, f2: funct7=0x62, rs2=0
+    let fcvt_w_h = 0x62 << 25 | 0 << 20 | 2 << 15 | 1 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fcvt_w_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[1] as i64, 7, "FCVT.W.H");
+}
+
+#[test]
+fn test_zfh_fcvt_h_w() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.regs[1] = 5u64;
+    // FCVT.H.W f2, x1: funct7=0x6A, rs2=0
+    let fcvt_h_w = 0x6A << 25 | 0 << 20 | 1 << 15 | 0 << 12 | 2 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fcvt_h_w as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[2] as u16), 5.0, "FCVT.H.W");
+}
+
+#[test]
+fn test_zfh_fclass_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    // +1.0h = 0x3C00
+    cpu.fregs[2] = nan_box_h(0x3C00);
+    // FCLASS.H x1, f2: funct7=0x72, rs2=0, rm=001
+    let fclass_h = 0x72 << 25 | 0 << 20 | 2 << 15 | 1 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fclass_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[1], 1 << 6, "FCLASS.H: +normal = bit 6");
+}
+
+#[test]
+fn test_zfh_feq_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(3.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(3.0));
+    // FEQ.H x1, f2, f3: funct7=0x52, rm=010
+    let feq_h = 0x52 << 25 | 3 << 20 | 2 << 15 | 2 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, feq_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[1], 1, "FEQ.H: 3.0 == 3.0");
+}
+
+#[test]
+fn test_zfh_flt_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(2.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(3.0));
+    // FLT.H x1, f2, f3: funct7=0x52, rm=001
+    let flt_h = 0x52 << 25 | 3 << 20 | 2 << 15 | 1 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, flt_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[1], 1, "FLT.H: 2.0 < 3.0");
+}
+
+#[test]
+fn test_zfh_fsgnj_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(3.0)); // +3.0
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(-1.0)); // -1.0
+                                                     // FSGNJ.H f1, f2, f3: funct7=0x12, rm=000 → take sign from f3
+    let fsgnj_h = 0x12 << 25 | 3 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fsgnj_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    let result = f16_to_f32_bits(cpu.fregs[1] as u16);
+    assert_eq!(result, -3.0, "FSGNJ.H: sign of -1.0 applied to 3.0 → -3.0");
+}
+
+#[test]
+fn test_zfh_fmadd_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(2.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(3.0));
+    cpu.fregs[4] = nan_box_h(f32_to_f16_bits(1.0));
+    // FMADD.H f1, f2, f3, f4: opcode=0x43, fmt=2 (H)
+    // rs3=4 in bits[31:27], fmt=2 in bits[26:25]
+    let fmadd_h = (4 << 27) | (2 << 25) | (3 << 20) | (2 << 15) | (0 << 12) | (1 << 7) | 0x43;
+    bus.write32(DRAM_BASE, fmadd_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    // 2.0 * 3.0 + 1.0 = 7.0
+    assert_eq!(f16_to_f32_bits(cpu.fregs[1] as u16), 7.0, "FMADD.H");
+}
+
+#[test]
+fn test_zfh_fmin_fmax_h() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    cpu.fregs[2] = nan_box_h(f32_to_f16_bits(3.0));
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(5.0));
+    // FMIN.H f1, f2, f3: funct7=0x16, rm=0
+    let fmin_h = 0x16 << 25 | 3 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fmin_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[1] as u16), 3.0, "FMIN.H");
+
+    // FMAX.H f1, f2, f3: funct7=0x16, rm=1
+    let fmax_h = 0x16 << 25 | 3 << 20 | 2 << 15 | 1 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fmax_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(f16_to_f32_bits(cpu.fregs[1] as u16), 5.0, "FMAX.H");
+}
+
+#[test]
+fn test_zfh_flh_fsh() {
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    let h_val = f32_to_f16_bits(6.5);
+    // Store the half value at DRAM_BASE + 0x100
+    bus.write16(DRAM_BASE + 0x100, h_val);
+    cpu.regs[1] = DRAM_BASE + 0x100;
+    // FLH f2, 0(x1): opcode=0x07, funct3=1
+    let flh = (0 << 20) | (1 << 15) | (1 << 12) | (2 << 7) | 0x07;
+    bus.write32(DRAM_BASE, flh as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.fregs[2] as u16, h_val, "FLH loaded correctly");
+    assert_eq!(
+        cpu.fregs[2] & 0xFFFF_FFFF_FFFF_0000,
+        0xFFFF_FFFF_FFFF_0000,
+        "FLH NaN-boxed"
+    );
+
+    // FSH f2, 8(x1): opcode=0x27, funct3=1
+    let fsh = (0 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (8 << 7) | 0x27;
+    bus.write32(DRAM_BASE, fsh as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    assert_eq!(bus.read16(DRAM_BASE + 0x108), h_val, "FSH stored correctly");
+}
+
+#[test]
+fn test_zfh_nan_boxing() {
+    // When reading a non-NaN-boxed f16, should get canonical NaN
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    let mut bus = Bus::new(64 * 1024);
+    // Store a value that's NOT properly NaN-boxed (upper bits not all 1s)
+    cpu.fregs[2] = 0x0000_0000_0000_3C00; // 1.0h but not NaN-boxed
+    cpu.fregs[3] = nan_box_h(f32_to_f16_bits(2.0));
+    // FADD.H f1, f2, f3: the non-boxed input should be treated as canonical NaN
+    let fadd_h = 0x02 << 25 | 3 << 20 | 2 << 15 | 0 << 12 | 1 << 7 | 0x53;
+    bus.write32(DRAM_BASE, fadd_h as u32);
+    cpu.pc = DRAM_BASE;
+    cpu.step(&mut bus);
+    let result_bits = cpu.fregs[1] as u16;
+    let exp = (result_bits >> 10) & 0x1F;
+    let frac = result_bits & 0x3FF;
+    assert_eq!(exp, 0x1F, "Result should be NaN (exp=0x1F)");
+    assert_ne!(frac, 0, "Result should be NaN (frac!=0)");
+}
+
+#[test]
+fn test_zfh_in_isa_string() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    let dtb_str = String::from_utf8_lossy(&dtb);
+    assert!(dtb_str.contains("zfh"), "DTB should advertise zfh");
+}

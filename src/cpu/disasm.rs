@@ -182,6 +182,7 @@ pub fn disassemble(raw: u32, pc: u64) -> String {
         0x07 => {
             // FP loads
             let op = match funct3 {
+                1 => "flh",
                 2 => "flw",
                 3 => "fld",
                 _ => "fl?",
@@ -191,6 +192,7 @@ pub fn disassemble(raw: u32, pc: u64) -> String {
         0x27 => {
             // FP stores
             let op = match funct3 {
+                1 => "fsh",
                 2 => "fsw",
                 3 => "fsd",
                 _ => "fs?",
@@ -207,7 +209,12 @@ pub fn disassemble(raw: u32, pc: u64) -> String {
                 0x4F => "fnmadd",
                 _ => unreachable!(),
             };
-            let suffix = if (raw >> 25) & 3 == 1 { ".d" } else { ".s" };
+            let suffix = match (raw >> 25) & 3 {
+                0 => ".s",
+                1 => ".d",
+                2 => ".h",
+                _ => ".?",
+            };
             format!(
                 "{}{} {}, {}, {}, {}",
                 op,
@@ -489,7 +496,12 @@ fn disasm_op_w(rd: usize, rs1: usize, rs2: usize, funct3: u32, funct7: u32) -> S
 }
 
 fn disasm_fp(raw: u32, rd: usize, rs1: usize, rs2: usize, funct7: u32) -> String {
-    let fmt = if funct7 & 3 == 1 { ".d" } else { ".s" };
+    let fmt = match funct7 & 3 {
+        0 => ".s",
+        1 => ".d",
+        2 => ".h",
+        _ => ".?",
+    };
     match funct7 >> 2 {
         0 => format!("fadd{}  {}, {}, {}", fmt, f(rd), f(rs1), f(rs2)),
         1 => format!("fsub{}  {}, {}, {}", fmt, f(rd), f(rs1), f(rs2)),
@@ -526,12 +538,13 @@ fn disasm_fp(raw: u32, rd: usize, rs1: usize, rs2: usize, funct7: u32) -> String
         0x1C => {
             let rm = (raw >> 12) & 7;
             if rm == 0 {
-                format!(
-                    "fmv.x{} {}, {}",
-                    if funct7 & 3 == 1 { ".d" } else { ".w" },
-                    r(rd),
-                    f(rs1)
-                )
+                let suffix = match funct7 & 3 {
+                    0 => ".w",
+                    1 => ".d",
+                    2 => ".h",
+                    _ => ".?",
+                };
+                format!("fmv.x{} {}, {}", suffix, r(rd), f(rs1))
             } else {
                 format!("fclass{} {}, {}", fmt, r(rd), f(rs1))
             }
@@ -540,12 +553,13 @@ fn disasm_fp(raw: u32, rd: usize, rs1: usize, rs2: usize, funct7: u32) -> String
             if rs2 == 1 {
                 format!("fli{}   {}, {}", fmt, f(rd), rs1)
             } else {
-                format!(
-                    "fmv{}.x {}, {}",
-                    if funct7 & 3 == 1 { ".d" } else { ".w" },
-                    f(rd),
-                    r(rs1)
-                )
+                let suffix = match funct7 & 3 {
+                    0 => ".w",
+                    1 => ".d",
+                    2 => ".h",
+                    _ => ".?",
+                };
+                format!("fmv{}.x {}, {}", suffix, f(rd), r(rs1))
             }
         }
         0x14 => {
@@ -563,11 +577,14 @@ fn disasm_fp(raw: u32, rd: usize, rs1: usize, rs2: usize, funct7: u32) -> String
             4 => format!("fround{} {}, {}", fmt, f(rd), f(rs1)),
             5 => format!("froundnx{} {}, {}", fmt, f(rd), f(rs1)),
             _ => {
-                if funct7 & 3 == 1 {
-                    format!("fcvt.d.s {}, {}", f(rd), f(rs1))
-                } else {
-                    format!("fcvt.s.d {}, {}", f(rd), f(rs1))
-                }
+                let src_fmt = match rs2 {
+                    0 => "s",
+                    1 => "d",
+                    2 => "h",
+                    _ => "?",
+                };
+                let dst_fmt = &fmt[1..]; // strip leading dot
+                format!("fcvt.{}.{} {}, {}", dst_fmt, src_fmt, f(rd), f(rs1))
             }
         },
         _ => format!("fp?     {:#010x}", raw),

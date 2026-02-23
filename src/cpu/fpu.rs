@@ -1,7 +1,8 @@
-//! RV64F (single-precision) and RV64D (double-precision) floating-point extensions.
+//! RV64F (single-precision), RV64D (double-precision), and Zfh (half-precision)
+//! floating-point extensions.
 //!
-//! All f-register values are stored as u64 bits (NaN-boxed for single-precision).
-//! NaN-boxing: single values stored in f-regs have upper 32 bits set to all 1s.
+//! All f-register values are stored as u64 bits (NaN-boxed for single/half-precision).
+//! NaN-boxing: single values have upper 32 bits = 1s; half values have upper 48 bits = 1s.
 
 use super::Cpu;
 use crate::memory::Bus;
@@ -10,6 +11,12 @@ use crate::memory::Bus;
 #[inline]
 fn nan_box(val: u32) -> u64 {
     val as u64 | 0xFFFF_FFFF_0000_0000
+}
+
+/// NaN-box a 16-bit half-precision value into 64 bits (upper 48 bits = 1s)
+#[inline]
+fn nan_box_h(val: u16) -> u64 {
+    val as u64 | 0xFFFF_FFFF_FFFF_0000
 }
 
 /// Unbox a NaN-boxed single. If not properly NaN-boxed, return canonical NaN.
@@ -22,9 +29,167 @@ fn unbox_f32(val: u64) -> f32 {
     }
 }
 
+/// Unbox a NaN-boxed half. If not properly NaN-boxed, return canonical NaN (0x7E00).
+#[inline]
+fn unbox_f16(val: u64) -> u16 {
+    if val & 0xFFFF_FFFF_FFFF_0000 == 0xFFFF_FFFF_FFFF_0000 {
+        val as u16
+    } else {
+        0x7E00 // canonical half NaN
+    }
+}
+
 #[inline]
 fn to_f64(val: u64) -> f64 {
     f64::from_bits(val)
+}
+
+// =====================================================================
+// IEEE 754 half-precision (binary16) conversion helpers
+// =====================================================================
+
+/// Convert half-precision (u16 bits) to single-precision f32
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let frac = (h & 0x3FF) as u32;
+
+    let bits = if exp == 0 {
+        if frac == 0 {
+            // Zero
+            sign << 31
+        } else {
+            // Subnormal: normalize
+            let mut f = frac;
+            let mut e: i32 = -14 + 127; // bias conversion
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            f &= 0x3FF; // remove implicit bit
+            (sign << 31) | ((e as u32) << 23) | (f << 13)
+        }
+    } else if exp == 0x1F {
+        // Inf or NaN
+        if frac == 0 {
+            (sign << 31) | (0xFF << 23)
+        } else {
+            // NaN: preserve quiet bit, shift mantissa
+            (sign << 31) | (0xFF << 23) | (frac << 13)
+        }
+    } else {
+        // Normal
+        let new_exp = (exp as i32 - 15 + 127) as u32;
+        (sign << 31) | (new_exp << 23) | (frac << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Convert single-precision f32 to half-precision (u16 bits), with round-to-nearest-even
+fn f32_to_f16(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 31) & 1) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        // Inf or NaN
+        if frac == 0 {
+            (sign << 15) | (0x1F << 10)
+        } else {
+            // NaN: set quiet bit, preserve some mantissa
+            (sign << 15) | (0x1F << 10) | ((frac >> 13) as u16).max(1)
+        }
+    } else if exp > 142 {
+        // Overflow → infinity (bias diff: 127-15=112, max half exp=30 → 142)
+        (sign << 15) | (0x1F << 10)
+    } else if exp < 103 {
+        // Too small for even subnormal
+        sign << 15
+    } else if exp < 113 {
+        // Subnormal half
+        let shift = 113 - exp;
+        let full_frac = (1 << 23) | frac; // add implicit bit
+        let shifted = full_frac >> (shift + 13);
+        // Round
+        let round_bit = (full_frac >> (shift + 12)) & 1;
+        let sticky = if (full_frac & ((1 << (shift + 12)) - 1)) != 0 {
+            1
+        } else {
+            0
+        };
+        let mut result = (sign << 15) | (shifted as u16);
+        if round_bit != 0 && (sticky != 0 || (shifted & 1) != 0) {
+            result += 1;
+        }
+        result
+    } else {
+        // Normal
+        let new_exp = (exp - 112) as u16;
+        let new_frac = (frac >> 13) as u16;
+        // Round
+        let round_bit = (frac >> 12) & 1;
+        let sticky = frac & 0xFFF;
+        let mut result = (sign << 15) | (new_exp << 10) | new_frac;
+        if round_bit != 0 && (sticky != 0 || (new_frac & 1) != 0) {
+            result += 1;
+        }
+        result
+    }
+}
+
+/// Check if a half-precision value is a signaling NaN
+fn is_snan_f16(h: u16) -> bool {
+    let exp = (h >> 10) & 0x1F;
+    let frac = h & 0x3FF;
+    // sNaN: exponent all 1s, mantissa non-zero with bit 9 (quiet bit) = 0
+    exp == 0x1F && frac != 0 && (frac & 0x200) == 0
+}
+
+/// FCLASS for half-precision
+fn fclass_f16(h: u16) -> u32 {
+    let sign = (h >> 15) & 1;
+    let exp = (h >> 10) & 0x1F;
+    let frac = h & 0x3FF;
+
+    if exp == 0x1F {
+        if frac == 0 {
+            if sign == 1 {
+                1 << 0
+            } else {
+                1 << 7
+            } // -inf / +inf
+        } else if frac & 0x200 != 0 {
+            1 << 9 // quiet NaN
+        } else {
+            1 << 8 // signaling NaN
+        }
+    } else if exp == 0 {
+        if frac == 0 {
+            if sign == 1 {
+                1 << 3
+            } else {
+                1 << 4
+            } // -0 / +0
+        } else if sign == 1 {
+            1 << 2 // negative subnormal
+        } else {
+            1 << 5 // positive subnormal
+        }
+    } else if sign == 1 {
+        1 << 1 // negative normal
+    } else {
+        1 << 6 // positive normal
+    }
+}
+
+/// Accumulate FP exception flags for half-precision results
+fn accumulate_f16_flags(cpu: &mut Cpu, h: u16) {
+    let exp = (h >> 10) & 0x1F;
+    let frac = h & 0x3FF;
+    if exp == 0 && frac != 0 {
+        set_flags(cpu, UF | NX);
+    }
 }
 
 // Rounding mode constants (for future use with software rounding)
@@ -83,6 +248,11 @@ fn exec_fp_load(cpu: &mut Cpu, bus: &mut Bus, raw: u32, len: u64) {
     };
 
     match funct3 {
+        1 => {
+            // FLH (Zfh)
+            let val = bus.read16(phys);
+            cpu.fregs[rd] = nan_box_h(val);
+        }
         2 => {
             // FLW
             let val = bus.read32(phys);
@@ -125,6 +295,10 @@ fn exec_fp_store(cpu: &mut Cpu, bus: &mut Bus, raw: u32, len: u64) {
     };
 
     match funct3 {
+        1 => {
+            // FSH (Zfh)
+            bus.write16(phys, cpu.fregs[rs2] as u16);
+        }
         2 => {
             // FSW
             bus.write32(phys, cpu.fregs[rs2] as u32);
@@ -170,12 +344,21 @@ fn exec_fmadd(cpu: &mut Cpu, raw: u32, len: u64) {
             cpu.fregs[rd] = result.to_bits();
             accumulate_f64_flags(cpu, result);
         }
+        2 => {
+            // FMADD.H (Zfh)
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let c = f16_to_f32(unbox_f16(cpu.fregs[rs3]));
+            let result = f32_to_f16(a.mul_add(b, c));
+            cpu.fregs[rd] = nan_box_h(result);
+            accumulate_f16_flags(cpu, result);
+        }
         _ => {}
     }
     cpu.pc += len;
 }
 
-/// FMSUB.S / FMSUB.D: rd = rs1*rs2 - rs3
+/// FMSUB.S / FMSUB.D / FMSUB.H: rd = rs1*rs2 - rs3
 fn exec_fmsub(cpu: &mut Cpu, raw: u32, len: u64) {
     let rd = ((raw >> 7) & 0x1F) as usize;
     let rs1 = ((raw >> 15) & 0x1F) as usize;
@@ -201,12 +384,21 @@ fn exec_fmsub(cpu: &mut Cpu, raw: u32, len: u64) {
             cpu.fregs[rd] = result.to_bits();
             accumulate_f64_flags(cpu, result);
         }
+        2 => {
+            // FMSUB.H (Zfh)
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let c = f16_to_f32(unbox_f16(cpu.fregs[rs3]));
+            let result = f32_to_f16(a.mul_add(b, -c));
+            cpu.fregs[rd] = nan_box_h(result);
+            accumulate_f16_flags(cpu, result);
+        }
         _ => {}
     }
     cpu.pc += len;
 }
 
-/// FNMSUB.S / FNMSUB.D: rd = -(rs1*rs2) + rs3 = (-rs1)*rs2 + rs3
+/// FNMSUB.S / FNMSUB.D / FNMSUB.H: rd = -(rs1*rs2) + rs3 = (-rs1)*rs2 + rs3
 fn exec_fnmsub(cpu: &mut Cpu, raw: u32, len: u64) {
     let rd = ((raw >> 7) & 0x1F) as usize;
     let rs1 = ((raw >> 15) & 0x1F) as usize;
@@ -232,12 +424,21 @@ fn exec_fnmsub(cpu: &mut Cpu, raw: u32, len: u64) {
             cpu.fregs[rd] = result.to_bits();
             accumulate_f64_flags(cpu, result);
         }
+        2 => {
+            // FNMSUB.H (Zfh)
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let c = f16_to_f32(unbox_f16(cpu.fregs[rs3]));
+            let result = f32_to_f16((-a).mul_add(b, c));
+            cpu.fregs[rd] = nan_box_h(result);
+            accumulate_f16_flags(cpu, result);
+        }
         _ => {}
     }
     cpu.pc += len;
 }
 
-/// FNMADD.S / FNMADD.D: rd = -(rs1*rs2) - rs3 = (-rs1)*rs2 - rs3
+/// FNMADD.S / FNMADD.D / FNMADD.H: rd = -(rs1*rs2) - rs3 = (-rs1)*rs2 - rs3
 fn exec_fnmadd(cpu: &mut Cpu, raw: u32, len: u64) {
     let rd = ((raw >> 7) & 0x1F) as usize;
     let rs1 = ((raw >> 15) & 0x1F) as usize;
@@ -262,6 +463,15 @@ fn exec_fnmadd(cpu: &mut Cpu, raw: u32, len: u64) {
             let result = (-a).mul_add(b, -c);
             cpu.fregs[rd] = result.to_bits();
             accumulate_f64_flags(cpu, result);
+        }
+        2 => {
+            // FNMADD.H (Zfh)
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let c = f16_to_f32(unbox_f16(cpu.fregs[rs3]));
+            let result = f32_to_f16((-a).mul_add(b, -c));
+            cpu.fregs[rd] = nan_box_h(result);
+            accumulate_f16_flags(cpu, result);
         }
         _ => {}
     }
@@ -836,55 +1046,321 @@ fn exec_fp_op(cpu: &mut Cpu, bus: &mut Bus, raw: u32, len: u64) {
                 cpu.fregs[rd] = cpu.regs[rs1];
             }
         }
+        // === Half-precision (H) — Zfh ===
+        0x02 => {
+            // FADD.H
+            cpu.csrs.set_fs_dirty();
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let r = f32_to_f16(a + b);
+            cpu.fregs[rd] = nan_box_h(r);
+            accumulate_f16_flags(cpu, r);
+        }
+        0x06 => {
+            // FSUB.H
+            cpu.csrs.set_fs_dirty();
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let r = f32_to_f16(a - b);
+            cpu.fregs[rd] = nan_box_h(r);
+            accumulate_f16_flags(cpu, r);
+        }
+        0x0A => {
+            // FMUL.H
+            cpu.csrs.set_fs_dirty();
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let r = f32_to_f16(a * b);
+            cpu.fregs[rd] = nan_box_h(r);
+            accumulate_f16_flags(cpu, r);
+        }
+        0x0E => {
+            // FDIV.H
+            cpu.csrs.set_fs_dirty();
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            if b == 0.0 && !a.is_nan() {
+                set_flags(cpu, DZ);
+            }
+            let r = f32_to_f16(a / b);
+            cpu.fregs[rd] = nan_box_h(r);
+            accumulate_f16_flags(cpu, r);
+        }
+        0x2E => {
+            // FSQRT.H
+            cpu.csrs.set_fs_dirty();
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            if a < 0.0 && !a.is_nan() {
+                set_flags(cpu, NV);
+            }
+            let r = f32_to_f16(a.sqrt());
+            cpu.fregs[rd] = nan_box_h(r);
+            accumulate_f16_flags(cpu, r);
+        }
+        0x12 => {
+            // FSGNJ.H / FSGNJN.H / FSGNJX.H
+            cpu.csrs.set_fs_dirty();
+            let a = unbox_f16(cpu.fregs[rs1]);
+            let b = unbox_f16(cpu.fregs[rs2]);
+            let result = match rm {
+                0 => (a & 0x7FFF) | (b & 0x8000),
+                1 => (a & 0x7FFF) | ((b ^ 0x8000) & 0x8000),
+                2 => (a & 0x7FFF) | ((a ^ b) & 0x8000),
+                _ => a,
+            };
+            cpu.fregs[rd] = nan_box_h(result);
+        }
+        0x16 => {
+            // FMIN.H / FMAX.H
+            cpu.csrs.set_fs_dirty();
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let r = match rm {
+                0 => {
+                    // FMIN.H
+                    if a.is_nan() && b.is_nan() {
+                        set_flags(cpu, NV);
+                        f32::from_bits(0x7FC0_0000)
+                    } else if a.is_nan() {
+                        if is_snan_f32(a) {
+                            set_flags(cpu, NV);
+                        }
+                        b
+                    } else if b.is_nan() {
+                        if is_snan_f32(b) {
+                            set_flags(cpu, NV);
+                        }
+                        a
+                    } else if a == 0.0 && b == 0.0 {
+                        if a.is_sign_negative() {
+                            a
+                        } else {
+                            b
+                        }
+                    } else if a < b {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                1 => {
+                    // FMAX.H
+                    if a.is_nan() && b.is_nan() {
+                        set_flags(cpu, NV);
+                        f32::from_bits(0x7FC0_0000)
+                    } else if a.is_nan() {
+                        if is_snan_f32(a) {
+                            set_flags(cpu, NV);
+                        }
+                        b
+                    } else if b.is_nan() {
+                        if is_snan_f32(b) {
+                            set_flags(cpu, NV);
+                        }
+                        a
+                    } else if a == 0.0 && b == 0.0 {
+                        if a.is_sign_positive() {
+                            a
+                        } else {
+                            b
+                        }
+                    } else if a > b {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                _ => a,
+            };
+            cpu.fregs[rd] = nan_box_h(f32_to_f16(r));
+        }
+        0x52 => {
+            // FLE.H / FLT.H / FEQ.H
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1]));
+            let b = f16_to_f32(unbox_f16(cpu.fregs[rs2]));
+            let result = match rm {
+                0 => {
+                    if a.is_nan() || b.is_nan() {
+                        set_flags(cpu, NV);
+                        0u64
+                    } else {
+                        (a <= b) as u64
+                    }
+                }
+                1 => {
+                    if a.is_nan() || b.is_nan() {
+                        set_flags(cpu, NV);
+                        0u64
+                    } else {
+                        (a < b) as u64
+                    }
+                }
+                2 => {
+                    let ah = unbox_f16(cpu.fregs[rs1]);
+                    let bh = unbox_f16(cpu.fregs[rs2]);
+                    if is_snan_f16(ah) || is_snan_f16(bh) {
+                        set_flags(cpu, NV);
+                    }
+                    if a.is_nan() || b.is_nan() {
+                        0u64
+                    } else {
+                        (a == b) as u64
+                    }
+                }
+                _ => 0u64,
+            };
+            cpu.regs[rd] = result;
+            cpu.pc += len;
+            return;
+        }
+        0x62 => {
+            // FCVT.W.H / FCVT.WU.H / FCVT.L.H / FCVT.LU.H
+            let a = f16_to_f32(unbox_f16(cpu.fregs[rs1])) as f64;
+            let result = match rs2 {
+                0 => fcvt_to_i32(cpu, a) as u64,
+                1 => fcvt_to_u32(cpu, a) as u64,
+                2 => fcvt_to_i64(cpu, a),
+                3 => fcvt_to_u64(cpu, a),
+                _ => 0,
+            };
+            cpu.regs[rd] = result;
+            cpu.pc += len;
+            return;
+        }
+        0x6A => {
+            // FCVT.H.W / FCVT.H.WU / FCVT.H.L / FCVT.H.LU
+            cpu.csrs.set_fs_dirty();
+            let r = match rs2 {
+                0 => f32_to_f16(cpu.regs[rs1] as i32 as f32),
+                1 => f32_to_f16(cpu.regs[rs1] as u32 as f32),
+                2 => f32_to_f16(cpu.regs[rs1] as i64 as f32),
+                3 => f32_to_f16(cpu.regs[rs1] as f32),
+                _ => 0,
+            };
+            cpu.fregs[rd] = nan_box_h(r);
+        }
+        0x72 => {
+            // FMV.X.H / FCLASS.H
+            match rm {
+                0 => {
+                    // FMV.X.H: move half bits to integer, sign-extended
+                    cpu.regs[rd] = cpu.fregs[rs1] as u16 as i16 as i64 as u64;
+                    cpu.pc += len;
+                    return;
+                }
+                1 => {
+                    // FCLASS.H
+                    cpu.regs[rd] = fclass_f16(unbox_f16(cpu.fregs[rs1])) as u64;
+                    cpu.pc += len;
+                    return;
+                }
+                _ => {
+                    cpu.handle_exception(2, raw as u64, bus);
+                    return;
+                }
+            }
+        }
+        0x7A => {
+            // FMV.H.X
+            cpu.csrs.set_fs_dirty();
+            cpu.fregs[rd] = nan_box_h(cpu.regs[rs1] as u16);
+        }
+
         // Conversions between S and D
         0x20 => {
             match rs2 {
-                4 => {
-                    // FROUND.S (Zfa) — round to integer, result as float
-                    cpu.csrs.set_fs_dirty();
-                    let a = unbox_f32(cpu.fregs[rs1]);
-                    let r = fround_f32(cpu, a, rm, false);
-                    cpu.fregs[rd] = nan_box(r.to_bits());
-                }
-                5 => {
-                    // FROUNDNX.S (Zfa) — round to integer, set inexact
-                    cpu.csrs.set_fs_dirty();
-                    let a = unbox_f32(cpu.fregs[rs1]);
-                    let r = fround_f32(cpu, a, rm, true);
-                    cpu.fregs[rd] = nan_box(r.to_bits());
-                }
-                _ => {
-                    // FCVT.S.D (rs2=1)
+                1 => {
+                    // FCVT.S.D
                     cpu.csrs.set_fs_dirty();
                     let d = to_f64(cpu.fregs[rs1]);
                     let s = d as f32;
                     cpu.fregs[rd] = nan_box(s.to_bits());
                     accumulate_f32_flags(cpu, s);
                 }
+                2 => {
+                    // FCVT.S.H (Zfh)
+                    cpu.csrs.set_fs_dirty();
+                    let h = unbox_f16(cpu.fregs[rs1]);
+                    let s = f16_to_f32(h);
+                    cpu.fregs[rd] = nan_box(s.to_bits());
+                }
+                4 => {
+                    // FROUND.S (Zfa)
+                    cpu.csrs.set_fs_dirty();
+                    let a = unbox_f32(cpu.fregs[rs1]);
+                    let r = fround_f32(cpu, a, rm, false);
+                    cpu.fregs[rd] = nan_box(r.to_bits());
+                }
+                5 => {
+                    // FROUNDNX.S (Zfa)
+                    cpu.csrs.set_fs_dirty();
+                    let a = unbox_f32(cpu.fregs[rs1]);
+                    let r = fround_f32(cpu, a, rm, true);
+                    cpu.fregs[rd] = nan_box(r.to_bits());
+                }
+                _ => {
+                    cpu.handle_exception(2, raw as u64, bus);
+                    return;
+                }
             }
         }
         0x21 => {
             match rs2 {
+                0 => {
+                    // FCVT.D.S
+                    cpu.csrs.set_fs_dirty();
+                    let s = unbox_f32(cpu.fregs[rs1]);
+                    let d = s as f64;
+                    cpu.fregs[rd] = d.to_bits();
+                }
+                2 => {
+                    // FCVT.D.H (Zfh)
+                    cpu.csrs.set_fs_dirty();
+                    let h = unbox_f16(cpu.fregs[rs1]);
+                    let d = f16_to_f32(h) as f64;
+                    cpu.fregs[rd] = d.to_bits();
+                }
                 4 => {
-                    // FROUND.D (Zfa) — round to integer, result as double
+                    // FROUND.D (Zfa)
                     cpu.csrs.set_fs_dirty();
                     let a = to_f64(cpu.fregs[rs1]);
                     let r = fround_f64(cpu, a, rm, false);
                     cpu.fregs[rd] = r.to_bits();
                 }
                 5 => {
-                    // FROUNDNX.D (Zfa) — round to integer, set inexact
+                    // FROUNDNX.D (Zfa)
                     cpu.csrs.set_fs_dirty();
                     let a = to_f64(cpu.fregs[rs1]);
                     let r = fround_f64(cpu, a, rm, true);
                     cpu.fregs[rd] = r.to_bits();
                 }
                 _ => {
-                    // FCVT.D.S (rs2=0)
-                    cpu.csrs.set_fs_dirty();
+                    cpu.handle_exception(2, raw as u64, bus);
+                    return;
+                }
+            }
+        }
+        0x22 => {
+            // FCVT.H.S (rs2=0) / FCVT.H.D (rs2=1)
+            cpu.csrs.set_fs_dirty();
+            match rs2 {
+                0 => {
+                    // FCVT.H.S
                     let s = unbox_f32(cpu.fregs[rs1]);
-                    let d = s as f64;
-                    cpu.fregs[rd] = d.to_bits();
+                    let h = f32_to_f16(s);
+                    cpu.fregs[rd] = nan_box_h(h);
+                    accumulate_f16_flags(cpu, h);
+                }
+                1 => {
+                    // FCVT.H.D
+                    let d = to_f64(cpu.fregs[rs1]);
+                    let h = f32_to_f16(d as f32);
+                    cpu.fregs[rd] = nan_box_h(h);
+                    accumulate_f16_flags(cpu, h);
+                }
+                _ => {
+                    cpu.handle_exception(2, raw as u64, bus);
+                    return;
                 }
             }
         }
