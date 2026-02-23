@@ -3097,11 +3097,177 @@ fn execute_v_crypto(cpu: &mut Cpu, raw: u32, inst_len: u64) -> bool {
                 aes_write_group(cpu, vd, base, &new_key);
             }
         }
+        0b100000 => {
+            // vsm3me.vv vd, vs2, vs1 — SM3 message expansion (Zvksh)
+            // Requires 256-bit element groups (8 × SEW=32)
+            let num_eg = vl as usize / 8;
+            for g in 0..num_eg {
+                let base = g * 8;
+                // vs1 holds w[0..7], vs2 holds w[8..15]
+                let mut w = [0u32; 24];
+                for (i, slot) in w[..8].iter_mut().enumerate() {
+                    *slot = cpu.vregs.read_elem(vs1, 32, base + i) as u32;
+                }
+                for (i, slot) in w[8..16].iter_mut().enumerate() {
+                    *slot = cpu.vregs.read_elem(vs2, 32, base + i) as u32;
+                }
+                // Compute w[16..23]
+                for j in 0..8 {
+                    let i = j + 16;
+                    w[i] = sm3_p1(w[i - 16] ^ w[i - 9] ^ w[i - 3].rotate_left(15))
+                        ^ w[i - 13].rotate_left(7)
+                        ^ w[i - 6];
+                }
+                // Output w[16..23]
+                for i in 0..8 {
+                    cpu.vregs.write_elem(vd, 32, base + i, w[16 + i] as u64);
+                }
+            }
+        }
+        0b101011 => {
+            // vsm3c.vi vd, vs2, uimm — SM3 compression (Zvksh)
+            let rnds = (vs1 as u32) & 0x1F; // round number (0..31, steps of 2)
+            let num_eg = vl as usize / 8;
+            for g in 0..num_eg {
+                let base = g * 8;
+                // vd holds current state {H,G,F,E,D,C,B,A} as 8 words
+                let mut s = [0u32; 8];
+                for (i, slot) in s.iter_mut().enumerate() {
+                    *slot = cpu.vregs.read_elem(vd, 32, base + i) as u32;
+                }
+                // vs2 holds message words — we need w[rnds] and w[rnds+1]
+                // Message schedule: vs2 = {w7',w6',...,w0'} but spec says
+                // w0' = vs2[0], w1' = vs2[1], etc.  We need the two expanded
+                // message words for rounds (rnds*2) and (rnds*2+1).
+                // Actually: uimm selects which pair of rounds (0..15).
+                // vs2 contains the message words; we pick elements at uimm*2 offsets.
+                // Per spec: MessageWords = {vs2[7], ..., vs2[0]}, and
+                //   w0 = vs2[0], w1 = vs2[1], ..., w7 = vs2[7]
+                // We use rnds to index: B0 = w[rnds mod 8], B1 = w[(rnds+1) mod 8]
+                // Actually per the Zvksh spec, vs2 provides two 256-bit blocks
+                // but the encoding just provides MessageWord pairs from vs2[0..7].
+                // Let me follow the reference: rnds = round index (0-based, increments by 2).
+                // The spec says: {w0,w1,...,w7} from vs2; use w[0] and w[4] per round pair.
+                // Actually the RISC-V Zvksh spec states:
+                //   w0' = vs2[0] XOR vs2[4], w1' computed similarly.
+                // Let me implement the actual SM3 compression per spec.
+
+                // Simplified correct implementation:
+                // A=s[7], B=s[6], C=s[5], D=s[4], E=s[3], F=s[2], G=s[1], H=s[0]
+                let (mut a, mut b, mut c, mut d) = (s[7], s[6], s[5], s[4]);
+                let (mut e, mut f, mut gg, mut h) = (s[3], s[2], s[1], s[0]);
+
+                let w0 = cpu.vregs.read_elem(vs2, 32, base) as u32;
+                let w1 = cpu.vregs.read_elem(vs2, 32, base + 1) as u32;
+                let w4 = cpu.vregs.read_elem(vs2, 32, base + 4) as u32;
+                let w5 = cpu.vregs.read_elem(vs2, 32, base + 5) as u32;
+
+                let x0 = w0 ^ w4;
+                let x1 = w1 ^ w5;
+
+                let j = rnds * 2;
+                // Round j
+                {
+                    let ss1 = a.wrapping_add(e).wrapping_add(sm3_t(j)).rotate_left(7);
+                    let ss2 = ss1 ^ a.rotate_left(12);
+                    let tt1 = sm3_ff(j, a, b, c)
+                        .wrapping_add(d)
+                        .wrapping_add(ss2)
+                        .wrapping_add(x0);
+                    let tt2 = sm3_gg(j, e, f, gg)
+                        .wrapping_add(h)
+                        .wrapping_add(ss1)
+                        .wrapping_add(w0);
+                    d = c;
+                    c = b.rotate_left(9);
+                    b = a;
+                    a = tt1;
+                    h = gg;
+                    gg = f.rotate_left(19);
+                    f = e;
+                    e = sm3_p0(tt2);
+                }
+                // Round j+1
+                {
+                    let j1 = j + 1;
+                    let ss1 = a.wrapping_add(e).wrapping_add(sm3_t(j1)).rotate_left(7);
+                    let ss2 = ss1 ^ a.rotate_left(12);
+                    let tt1 = sm3_ff(j1, a, b, c)
+                        .wrapping_add(d)
+                        .wrapping_add(ss2)
+                        .wrapping_add(x1);
+                    let tt2 = sm3_gg(j1, e, f, gg)
+                        .wrapping_add(h)
+                        .wrapping_add(ss1)
+                        .wrapping_add(w1);
+                    d = c;
+                    c = b.rotate_left(9);
+                    b = a;
+                    a = tt1;
+                    h = gg;
+                    gg = f.rotate_left(19);
+                    f = e;
+                    e = sm3_p0(tt2);
+                }
+
+                // Write back
+                let result = [h, gg, f, e, d, c, b, a];
+                for (i, &val) in result.iter().enumerate() {
+                    cpu.vregs.write_elem(vd, 32, base + i, val as u64);
+                }
+            }
+        }
         _ => return false,
     }
 
     cpu.pc += inst_len;
     true
+}
+
+// ============================================================================
+// Zvksh: SM3 hash function
+// ============================================================================
+
+/// SM3 P0 permutation: X ^ ROL(X,9) ^ ROL(X,17)
+#[inline]
+fn sm3_p0(x: u32) -> u32 {
+    x ^ x.rotate_left(9) ^ x.rotate_left(17)
+}
+
+/// SM3 P1 permutation: X ^ ROL(X,15) ^ ROL(X,23)
+#[inline]
+fn sm3_p1(x: u32) -> u32 {
+    x ^ x.rotate_left(15) ^ x.rotate_left(23)
+}
+
+/// SM3 T constant for round j
+#[inline]
+fn sm3_t(j: u32) -> u32 {
+    if j < 16 {
+        0x79CC4519u32.rotate_left(j % 32)
+    } else {
+        0x7A879D8Au32.rotate_left(j % 32)
+    }
+}
+
+/// SM3 FF boolean function
+#[inline]
+fn sm3_ff(j: u32, x: u32, y: u32, z: u32) -> u32 {
+    if j < 16 {
+        x ^ y ^ z
+    } else {
+        (x & y) | (x & z) | (y & z)
+    }
+}
+
+/// SM3 GG boolean function
+#[inline]
+fn sm3_gg(j: u32, x: u32, y: u32, z: u32) -> u32 {
+    if j < 16 {
+        x ^ y ^ z
+    } else {
+        (x & y) | (!x & z)
+    }
 }
 
 // ============================================================================

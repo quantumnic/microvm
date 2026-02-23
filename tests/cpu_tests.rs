@@ -12140,3 +12140,111 @@ fn test_zvksed_in_isa_string() {
     let dtb_str = String::from_utf8_lossy(&dtb);
     assert!(dtb_str.contains("zvksed"), "DTB should advertise zvksed");
 }
+
+// ============================================================================
+// Zvksh: SM3 hash function
+// ============================================================================
+
+#[test]
+fn test_zvksh_vsm3me() {
+    // vsm3me.vv vd, vs2, vs1 — SM3 message expansion
+    // funct6=0b100000, requires 8-element groups (SEW=32, LMUL=2)
+    // Register allocation: vd=v8(v8-v9), vs2=v4(v4-v5), vs1=v2(v2-v3) — no overlap
+    let prog = &[
+        vsetivli(0, 8, 0b010_001),   // e32,m2, VL=8
+        op_p_mvv(0b100000, 8, 2, 4), // vsm3me.vv v8, v4, v2
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // vs1(v2) = w[0..7]
+    for i in 0..8 {
+        cpu.vregs.write_elem(2, 32, i, (i as u64 + 1) * 0x11111111);
+    }
+    // vs2(v4) = w[8..15]
+    for i in 0..8 {
+        cpu.vregs.write_elem(4, 32, i, (i as u64 + 9) * 0x11111111);
+    }
+    cpu.step(&mut bus); // vsetivli
+    cpu.step(&mut bus); // vsm3me.vv
+                        // Output w[16..23] should be non-trivial
+    let w16 = cpu.vregs.read_elem(8, 32, 0) as u32;
+    let w17 = cpu.vregs.read_elem(8, 32, 1) as u32;
+    assert_ne!(w16, 0, "SM3 message expansion should produce non-zero");
+    assert_ne!(w16, w17, "Expanded words should differ");
+}
+
+#[test]
+fn test_zvksh_vsm3c() {
+    // vsm3c.vi vd, vs2, rnds — SM3 compression
+    // funct6=0b101011, vd=v8(v8-v9), vs2=v4(v4-v5)
+    let prog = &[
+        vsetivli(0, 8, 0b010_001),   // e32,m2, VL=8
+        op_p_mvv(0b101011, 8, 0, 4), // vsm3c.vi v8, v4, rnds=0
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // Initial state (IV-like)
+    let iv: [u32; 8] = [
+        0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600, 0xa96f30bc, 0x163138aa, 0xe38dee4d,
+        0xb0fb0e4e,
+    ];
+    for (i, &val) in iv.iter().enumerate() {
+        cpu.vregs.write_elem(8, 32, i, val as u64);
+    }
+    // Message words in vs2
+    for i in 0..8 {
+        cpu.vregs.write_elem(4, 32, i, (i as u64 + 1) * 0x01020304);
+    }
+    cpu.step(&mut bus); // vsetivli
+    let ok = cpu.step(&mut bus); // vsm3c.vi
+    assert!(ok, "vsm3c.vi should execute successfully");
+    // State should change
+    let s0 = cpu.vregs.read_elem(8, 32, 0) as u32;
+    let s7 = cpu.vregs.read_elem(8, 32, 7) as u32;
+    assert_ne!(s0, iv[0], "SM3 compression should change state[0]");
+    assert_ne!(s7, iv[7], "SM3 compression should change state[7]");
+}
+
+#[test]
+fn test_zvksh_vsm3c_different_rounds() {
+    // Different round numbers should produce different results
+    let run_round = |rnd: u32| -> Vec<u64> {
+        let prog = &[
+            vsetivli(0, 8, 0b010_001),     // e32,m2, VL=8
+            op_p_mvv(0b101011, 8, rnd, 4), // vsm3c.vi v8, v4, rnds=rnd
+        ];
+        let (mut cpu, mut bus) = run_program(prog, 0);
+        for i in 0..8 {
+            cpu.vregs.write_elem(8, 32, i, 0x12345678_u64);
+            cpu.vregs.write_elem(4, 32, i, 0xaabbccdd_u64);
+        }
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        (0..8).map(|i| cpu.vregs.read_elem(8, 32, i)).collect()
+    };
+    let r0 = run_round(0);
+    let r8 = run_round(8);
+    assert_ne!(
+        r0, r8,
+        "Different round numbers should produce different results"
+    );
+}
+
+#[test]
+fn test_zvksh_disassembly() {
+    let sm3me = op_p_mvv(0b100000, 2, 1, 4);
+    let sm3c = op_p_mvv(0b101011, 2, 3, 4);
+    assert!(
+        microvm::cpu::disasm::disassemble(sm3me, 0).contains("vsm3me.vv"),
+        "Should disassemble vsm3me.vv"
+    );
+    assert!(
+        microvm::cpu::disasm::disassemble(sm3c, 0).contains("vsm3c.vi"),
+        "Should disassemble vsm3c.vi"
+    );
+}
+
+#[test]
+fn test_zvksh_in_isa_string() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    let dtb_str = String::from_utf8_lossy(&dtb);
+    assert!(dtb_str.contains("zvksh"), "DTB should advertise zvksh");
+}
