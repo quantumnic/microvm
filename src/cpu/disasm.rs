@@ -609,6 +609,7 @@ fn disasm_v_crypto(raw: u32, vd: usize, vs1: usize, vs2: usize) -> String {
                 1 => "vaesdf.vv",
                 2 => "vaesem.vv",
                 3 => "vaesef.vv",
+                16 => return format!("vsm4r.vv v{}, v{}", vd, vs2),
                 17 => return format!("vgmul.vv v{}, v{}", vd, vs2),
                 _ => return format!("vaes?   v{}, v{}", vd, vs2),
             };
@@ -620,10 +621,12 @@ fn disasm_v_crypto(raw: u32, vd: usize, vs1: usize, vs2: usize) -> String {
                 1 => "vaesdf.vs",
                 2 => "vaesem.vs",
                 3 => "vaesef.vs",
+                16 => return format!("vsm4r.vs v{}, v{}", vd, vs2),
                 _ => return format!("vaes?   v{}, v{}", vd, vs2),
             };
             format!("{:<8}v{}, v{}", op, vd, vs2)
         }
+        0b100001 => format!("vsm4k.vi v{}, v{}, {}", vd, vs2, vs1),
         0b100010 => format!("vaeskf1.vi v{}, v{}, {}", vd, vs2, vs1),
         0b101010 => format!("vaeskf2.vi v{}, v{}, {}", vd, vs2, vs1),
         0b101100 => format!("vghsh.vv v{}, v{}, v{}", vd, vs2, vs1),

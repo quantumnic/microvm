@@ -12021,3 +12021,122 @@ fn test_zvkg_in_isa_string() {
         "DTB should advertise zvkg extension"
     );
 }
+
+// =========================================================================
+// Zvksed tests — SM4 block cipher
+// =========================================================================
+
+#[test]
+fn test_zvksed_vsm4r_vv() {
+    // vsm4r.vv vd, vs2 — SM4 encryption round
+    // funct6=0b101000, vs1=16
+    let prog = &[
+        vsetivli(0, 4, 0b010_000),    // e32,m1, VL=4
+        op_p_mvv(0b101000, 2, 16, 4), // vsm4r.vv v2, v4
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // State (plaintext)
+    cpu.vregs.write_elem(2, 32, 0, 0x01234567_u64);
+    cpu.vregs.write_elem(2, 32, 1, 0x89abcdef_u64);
+    cpu.vregs.write_elem(2, 32, 2, 0xfedcba98_u64);
+    cpu.vregs.write_elem(2, 32, 3, 0x76543210_u64);
+    // Round keys
+    cpu.vregs.write_elem(4, 32, 0, 0xf12186f9_u64);
+    cpu.vregs.write_elem(4, 32, 1, 0x41662b61_u64);
+    cpu.vregs.write_elem(4, 32, 2, 0x5a6ab19a_u64);
+    cpu.vregs.write_elem(4, 32, 3, 0x7ba92077_u64);
+    cpu.step(&mut bus); // vsetivli
+    cpu.step(&mut bus); // vsm4r.vv
+                        // Output should differ from input
+    let r0 = cpu.vregs.read_elem(2, 32, 0) as u32;
+    assert_ne!(r0, 0x01234567, "SM4 round should change state");
+}
+
+#[test]
+fn test_zvksed_vsm4r_vs() {
+    // vsm4r.vs vd, vs2 — SM4 with scalar round key
+    // funct6=0b101001, vs1=16
+    let prog = &[
+        vsetivli(0, 4, 0b010_000),
+        op_p_mvv(0b101001, 2, 16, 4), // vsm4r.vs v2, v4
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    cpu.vregs.write_elem(2, 32, 0, 0x01234567_u64);
+    cpu.vregs.write_elem(2, 32, 1, 0x89abcdef_u64);
+    cpu.vregs.write_elem(2, 32, 2, 0xfedcba98_u64);
+    cpu.vregs.write_elem(2, 32, 3, 0x76543210_u64);
+    cpu.vregs.write_elem(4, 32, 0, 0xf12186f9_u64);
+    cpu.vregs.write_elem(4, 32, 1, 0x41662b61_u64);
+    cpu.vregs.write_elem(4, 32, 2, 0x5a6ab19a_u64);
+    cpu.vregs.write_elem(4, 32, 3, 0x7ba92077_u64);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+    let r0 = cpu.vregs.read_elem(2, 32, 0) as u32;
+    assert_ne!(r0, 0x01234567, "SM4 vs round should change state");
+}
+
+#[test]
+fn test_zvksed_vsm4k() {
+    // vsm4k.vi vd, vs2, rnd — SM4 key expansion
+    // funct6=0b100001
+    let prog = &[
+        vsetivli(0, 4, 0b010_000),
+        op_p_mvv(0b100001, 2, 0, 4), // vsm4k.vi v2, v4, rnd=0
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // Initial key (MK XOR FK already done by software)
+    cpu.vregs.write_elem(4, 32, 0, 0xa3b1bac6_u64);
+    cpu.vregs.write_elem(4, 32, 1, 0x56aa3350_u64);
+    cpu.vregs.write_elem(4, 32, 2, 0x677d9197_u64);
+    cpu.vregs.write_elem(4, 32, 3, 0xb27022dc_u64);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+    // Should produce round keys different from input
+    let rk0 = cpu.vregs.read_elem(2, 32, 0) as u32;
+    let rk1 = cpu.vregs.read_elem(2, 32, 1) as u32;
+    assert_ne!(rk0, 0xa3b1bac6, "Key expansion should change");
+    assert_ne!(rk1, 0x56aa3350, "Key expansion should change");
+}
+
+#[test]
+fn test_zvksed_vsm4r_vv_vs_same_single_group() {
+    // With one group, vv and vs should produce same result
+    let prog_vv = &[vsetivli(0, 4, 0b010_000), op_p_mvv(0b101000, 2, 16, 4)];
+    let prog_vs = &[vsetivli(0, 4, 0b010_000), op_p_mvv(0b101001, 2, 16, 4)];
+    let state = [0x01234567_u64, 0x89abcdef, 0xfedcba98, 0x76543210];
+    let rk = [0xf12186f9_u64, 0x41662b61, 0x5a6ab19a, 0x7ba92077];
+
+    let run = |prog: &[u32]| -> Vec<u64> {
+        let (mut cpu, mut bus) = run_program(prog, 0);
+        for i in 0..4 {
+            cpu.vregs.write_elem(2, 32, i, state[i]);
+            cpu.vregs.write_elem(4, 32, i, rk[i]);
+        }
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        (0..4).map(|i| cpu.vregs.read_elem(2, 32, i)).collect()
+    };
+
+    assert_eq!(
+        run(prog_vv),
+        run(prog_vs),
+        "vv and vs should match with single group"
+    );
+}
+
+#[test]
+fn test_zvksed_disassembly() {
+    let sm4r_vv = op_p_mvv(0b101000, 2, 16, 4);
+    let sm4r_vs = op_p_mvv(0b101001, 2, 16, 4);
+    let sm4k = op_p_mvv(0b100001, 2, 3, 4);
+    assert!(microvm::cpu::disasm::disassemble(sm4r_vv, 0).contains("vsm4r.vv"));
+    assert!(microvm::cpu::disasm::disassemble(sm4r_vs, 0).contains("vsm4r.vs"));
+    assert!(microvm::cpu::disasm::disassemble(sm4k, 0).contains("vsm4k"));
+}
+
+#[test]
+fn test_zvksed_in_isa_string() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    let dtb_str = String::from_utf8_lossy(&dtb);
+    assert!(dtb_str.contains("zvksed"), "DTB should advertise zvksed");
+}
