@@ -11596,3 +11596,274 @@ fn test_zvkned_in_isa_string() {
         "DTB should advertise zvkned extension"
     );
 }
+
+// =========================================================================
+// Zvknhb tests — Vector SHA-2 (SHA-256 + SHA-512)
+// =========================================================================
+
+#[test]
+fn test_zvknhb_vsha2ms_sha256() {
+    // vsha2ms.vv v2, v4, v6 — SHA-256 message schedule (SEW=32)
+    // funct6=0b101101
+    let prog = &[
+        vsetivli(0, 4, 0b010_000),   // e32,m1, VL=4
+        op_p_mvv(0b101101, 2, 6, 4), // vsha2ms.vv v2, v4, v6
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // vd = {W[3], W[2], W[1], W[0]}
+    cpu.vregs.write_elem(2, 32, 0, 0x428a2f98); // W[0]
+    cpu.vregs.write_elem(2, 32, 1, 0x71374491); // W[1]
+    cpu.vregs.write_elem(2, 32, 2, 0xb5c0fbcf); // W[2]
+    cpu.vregs.write_elem(2, 32, 3, 0xe9b5dba5); // W[3]
+                                                // vs2 = {W[11], W[10], W[9], W[4]}
+    cpu.vregs.write_elem(4, 32, 0, 0x3956c25b); // W[4]
+    cpu.vregs.write_elem(4, 32, 1, 0x923f82a4); // W[9]
+    cpu.vregs.write_elem(4, 32, 2, 0xab1c5ed5); // W[10]
+    cpu.vregs.write_elem(4, 32, 3, 0xd807aa98); // W[11]
+                                                // vs1 = {W[15], W[14], W[13], W[12]}
+    cpu.vregs.write_elem(6, 32, 0, 0x12835b01); // W[12]
+    cpu.vregs.write_elem(6, 32, 1, 0x243185be); // W[13]
+    cpu.vregs.write_elem(6, 32, 2, 0x550c7dc3); // W[14]
+    cpu.vregs.write_elem(6, 32, 3, 0x72be5d74); // W[15]
+    cpu.step(&mut bus); // vsetivli
+    cpu.step(&mut bus); // vsha2ms.vv
+                        // Verify output changed (message schedule produces new words)
+    let w16 = cpu.vregs.read_elem(2, 32, 0) as u32;
+    let w17 = cpu.vregs.read_elem(2, 32, 1) as u32;
+    // Manual calculation of W[16]:
+    // sig1(W[14]) + W[9] + sig0(W[1]) + W[0]
+    let sig1_w14 =
+        0x550c7dc3_u32.rotate_right(17) ^ 0x550c7dc3_u32.rotate_right(19) ^ (0x550c7dc3_u32 >> 10);
+    let sig0_w1 =
+        0x71374491_u32.rotate_right(7) ^ 0x71374491_u32.rotate_right(18) ^ (0x71374491_u32 >> 3);
+    let expected_w16 = sig1_w14
+        .wrapping_add(0x923f82a4)
+        .wrapping_add(sig0_w1)
+        .wrapping_add(0x428a2f98);
+    assert_eq!(w16, expected_w16, "W[16] mismatch");
+    // W[17] = sig1(W[15]) + W[10] + sig0(W[2]) + W[1]
+    let sig1_w15 =
+        0x72be5d74_u32.rotate_right(17) ^ 0x72be5d74_u32.rotate_right(19) ^ (0x72be5d74_u32 >> 10);
+    let sig0_w2 =
+        0xb5c0fbcf_u32.rotate_right(7) ^ 0xb5c0fbcf_u32.rotate_right(18) ^ (0xb5c0fbcf_u32 >> 3);
+    let expected_w17 = sig1_w15
+        .wrapping_add(0xab1c5ed5)
+        .wrapping_add(sig0_w2)
+        .wrapping_add(0x71374491);
+    assert_eq!(w17, expected_w17, "W[17] mismatch");
+}
+
+#[test]
+fn test_zvknhb_vsha2ch_sha256() {
+    // vsha2ch.vv v2, v4, v6 — SHA-256 compression high (SEW=32)
+    // funct6=0b101110
+    let prog = &[
+        vsetivli(0, 4, 0b010_000),   // e32,m1, VL=4
+        op_p_mvv(0b101110, 2, 6, 4), // vsha2ch.vv v2, v4, v6
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // vs2 = {a, b, e, f}
+    cpu.vregs.write_elem(4, 32, 0, 0xbb67ae85_u64); // f
+    cpu.vregs.write_elem(4, 32, 1, 0x510e527f_u64); // e
+    cpu.vregs.write_elem(4, 32, 2, 0x6a09e667_u64); // b (actually this is 'a' in SHA-256 init but mapped as b)
+    cpu.vregs.write_elem(4, 32, 3, 0x6a09e667_u64); // a
+                                                    // vd = {c, d, g, h}
+    cpu.vregs.write_elem(2, 32, 0, 0x1f83d9ab_u64); // h
+    cpu.vregs.write_elem(2, 32, 1, 0x9b05688c_u64); // g
+    cpu.vregs.write_elem(2, 32, 2, 0x3c6ef372_u64); // d
+    cpu.vregs.write_elem(2, 32, 3, 0xa54ff53a_u64); // c
+                                                    // vs1 = MessageSchedPlusC[3:0] — ch uses [3:2]
+    cpu.vregs.write_elem(6, 32, 0, 0x00000000_u64); // [0] unused by ch
+    cpu.vregs.write_elem(6, 32, 1, 0x00000000_u64); // [1] unused by ch
+    cpu.vregs.write_elem(6, 32, 2, 0x12345678_u64); // W0 (used by ch)
+    cpu.vregs.write_elem(6, 32, 3, 0x9abcdef0_u64); // W1 (used by ch)
+    cpu.step(&mut bus); // vsetivli
+    cpu.step(&mut bus); // vsha2ch.vv
+                        // Output is {a, b, e, f} in vd — should differ from input
+    let out0 = cpu.vregs.read_elem(2, 32, 0);
+    let out3 = cpu.vregs.read_elem(2, 32, 3);
+    assert!(
+        out0 != 0x1f83d9ab || out3 != 0xa54ff53a,
+        "State should change after SHA-256 compression"
+    );
+}
+
+#[test]
+fn test_zvknhb_vsha2cl_sha256() {
+    // vsha2cl.vv v2, v4, v6 — SHA-256 compression low (SEW=32)
+    // funct6=0b101111 — uses words [1:0] from vs1
+    let prog = &[
+        vsetivli(0, 4, 0b010_000),
+        op_p_mvv(0b101111, 2, 6, 4), // vsha2cl.vv v2, v4, v6
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // Set up same initial state but cl uses [1:0]
+    cpu.vregs.write_elem(4, 32, 0, 0xbb67ae85_u64);
+    cpu.vregs.write_elem(4, 32, 1, 0x510e527f_u64);
+    cpu.vregs.write_elem(4, 32, 2, 0x6a09e667_u64);
+    cpu.vregs.write_elem(4, 32, 3, 0x6a09e667_u64);
+    cpu.vregs.write_elem(2, 32, 0, 0x1f83d9ab_u64);
+    cpu.vregs.write_elem(2, 32, 1, 0x9b05688c_u64);
+    cpu.vregs.write_elem(2, 32, 2, 0x3c6ef372_u64);
+    cpu.vregs.write_elem(2, 32, 3, 0xa54ff53a_u64);
+    cpu.vregs.write_elem(6, 32, 0, 0xaabbccdd_u64); // W0 (used by cl)
+    cpu.vregs.write_elem(6, 32, 1, 0x11223344_u64); // W1 (used by cl)
+    cpu.vregs.write_elem(6, 32, 2, 0x00000000_u64);
+    cpu.vregs.write_elem(6, 32, 3, 0x00000000_u64);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+    let out0 = cpu.vregs.read_elem(2, 32, 0);
+    assert!(
+        out0 != 0x1f83d9ab,
+        "State should change after SHA-256 cl compression"
+    );
+}
+
+#[test]
+fn test_zvknhb_vsha2ms_sha512() {
+    // vsha2ms.vv with SEW=64 — SHA-512 message schedule
+    let prog = &[
+        vsetivli(0, 4, 0b011_001),   // e64,m2, VL=4
+        op_p_mvv(0b101101, 2, 6, 4), // vsha2ms.vv v2, v4, v6
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    // vd = {W[3], W[2], W[1], W[0]}
+    cpu.vregs.write_elem(2, 64, 0, 0x428a2f98d728ae22_u64);
+    cpu.vregs.write_elem(2, 64, 1, 0x7137449123ef65cd_u64);
+    cpu.vregs.write_elem(2, 64, 2, 0xb5c0fbcfec4d3b2f_u64);
+    cpu.vregs.write_elem(2, 64, 3, 0xe9b5dba58189dbbc_u64);
+    // vs2 = {W[11], W[10], W[9], W[4]}
+    cpu.vregs.write_elem(4, 64, 0, 0x3956c25bf348b538_u64);
+    cpu.vregs.write_elem(4, 64, 1, 0x923f82a4af194f9b_u64);
+    cpu.vregs.write_elem(4, 64, 2, 0xab1c5ed5da6d8118_u64);
+    cpu.vregs.write_elem(4, 64, 3, 0xd807aa98a3030242_u64);
+    // vs1 = {W[15], W[14], W[13], W[12]}
+    cpu.vregs.write_elem(6, 64, 0, 0x12835b0145706fbe_u64);
+    cpu.vregs.write_elem(6, 64, 1, 0x243185be4ee4b28c_u64);
+    cpu.vregs.write_elem(6, 64, 2, 0x550c7dc3d5ffb4e2_u64);
+    cpu.vregs.write_elem(6, 64, 3, 0x72be5d74f27b896f_u64);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+    // Verify W[16] using SHA-512 sigma functions
+    let w14: u64 = 0x550c7dc3d5ffb4e2;
+    let sig1 = w14.rotate_right(19) ^ w14.rotate_right(61) ^ (w14 >> 6);
+    let w1: u64 = 0x7137449123ef65cd;
+    let sig0 = w1.rotate_right(1) ^ w1.rotate_right(8) ^ (w1 >> 7);
+    let w9: u64 = 0x923f82a4af194f9b;
+    let w0: u64 = 0x428a2f98d728ae22;
+    let expected = sig1.wrapping_add(w9).wrapping_add(sig0).wrapping_add(w0);
+    let actual = cpu.vregs.read_elem(2, 64, 0);
+    assert_eq!(actual, expected, "SHA-512 W[16] mismatch");
+}
+
+#[test]
+fn test_zvknhb_vsha2ch_sha512() {
+    // vsha2ch.vv with SEW=64 — SHA-512 compression high
+    let prog = &[
+        vsetivli(0, 4, 0b011_001),   // e64,m2, VL=4
+        op_p_mvv(0b101110, 2, 6, 4), // vsha2ch.vv v2, v4, v6
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    cpu.vregs.write_elem(4, 64, 0, 0xbb67ae8584caa73b_u64);
+    cpu.vregs.write_elem(4, 64, 1, 0x510e527fade682d1_u64);
+    cpu.vregs.write_elem(4, 64, 2, 0x6a09e667f3bcc908_u64);
+    cpu.vregs.write_elem(4, 64, 3, 0x6a09e667f3bcc908_u64);
+    cpu.vregs.write_elem(2, 64, 0, 0x1f83d9abfb41bd6b_u64);
+    cpu.vregs.write_elem(2, 64, 1, 0x9b05688c2b3e6c1f_u64);
+    cpu.vregs.write_elem(2, 64, 2, 0x3c6ef372fe94f82b_u64);
+    cpu.vregs.write_elem(2, 64, 3, 0xa54ff53a5f1d36f1_u64);
+    cpu.vregs.write_elem(6, 64, 0, 0);
+    cpu.vregs.write_elem(6, 64, 1, 0);
+    cpu.vregs.write_elem(6, 64, 2, 0xdeadbeefcafebabe_u64);
+    cpu.vregs.write_elem(6, 64, 3, 0x1234567890abcdef_u64);
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+    let out = cpu.vregs.read_elem(2, 64, 0);
+    assert!(
+        out != 0x1f83d9abfb41bd6b,
+        "SHA-512 state should change after compression"
+    );
+}
+
+#[test]
+fn test_zvknhb_ch_cl_produce_different_results() {
+    // ch and cl should use different words from vs1, producing different results
+    let state_abef = [0x6a09e667_u64, 0x510e527f, 0xbb67ae85, 0x6a09e667];
+    let state_cdgh = [0x1f83d9ab_u64, 0x9b05688c, 0x3c6ef372, 0xa54ff53a];
+    let msg = [0x11111111_u64, 0x22222222, 0x33333333, 0x44444444];
+
+    let prog_ch = &[
+        vsetivli(0, 4, 0b010_000),
+        op_p_mvv(0b101110, 2, 6, 4), // vsha2ch
+    ];
+    let prog_cl = &[
+        vsetivli(0, 4, 0b010_000),
+        op_p_mvv(0b101111, 2, 6, 4), // vsha2cl
+    ];
+
+    let run = |prog: &[u32]| -> [u64; 4] {
+        let (mut cpu, mut bus) = run_program(prog, 0);
+        for i in 0..4 {
+            cpu.vregs.write_elem(4, 32, i, state_abef[i]);
+            cpu.vregs.write_elem(2, 32, i, state_cdgh[i]);
+            cpu.vregs.write_elem(6, 32, i, msg[i]);
+        }
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        [
+            cpu.vregs.read_elem(2, 32, 0),
+            cpu.vregs.read_elem(2, 32, 1),
+            cpu.vregs.read_elem(2, 32, 2),
+            cpu.vregs.read_elem(2, 32, 3),
+        ]
+    };
+
+    let result_ch = run(prog_ch);
+    let result_cl = run(prog_cl);
+    assert_ne!(
+        result_ch, result_cl,
+        "ch and cl should produce different results with different message words"
+    );
+}
+
+#[test]
+fn test_zvknhb_sew16_illegal() {
+    // SHA-2 with SEW=16 should not execute (illegal)
+    let prog = &[
+        vsetivli(0, 4, 0b001_000),   // e16,m1, VL=4
+        op_p_mvv(0b101101, 2, 6, 4), // vsha2ms.vv — should fail
+    ];
+    let (mut cpu, mut bus) = run_program(prog, 0);
+    cpu.step(&mut bus); // vsetivli
+    let pc_before = cpu.pc;
+    cpu.step(&mut bus); // should trap (illegal instruction)
+                        // PC should NOT advance by 4 — it should have trapped
+    assert_ne!(
+        cpu.pc,
+        pc_before + 4,
+        "SHA-2 with SEW=16 should trap as illegal"
+    );
+}
+
+#[test]
+fn test_zvknhb_disassembly() {
+    let inst_ms = op_p_mvv(0b101101, 2, 6, 4);
+    let inst_ch = op_p_mvv(0b101110, 2, 6, 4);
+    let inst_cl = op_p_mvv(0b101111, 2, 6, 4);
+    let d_ms = microvm::cpu::disasm::disassemble(inst_ms, 0);
+    let d_ch = microvm::cpu::disasm::disassemble(inst_ch, 0);
+    let d_cl = microvm::cpu::disasm::disassemble(inst_cl, 0);
+    assert!(d_ms.contains("vsha2ms"), "Expected vsha2ms, got: {}", d_ms);
+    assert!(d_ch.contains("vsha2ch"), "Expected vsha2ch, got: {}", d_ch);
+    assert!(d_cl.contains("vsha2cl"), "Expected vsha2cl, got: {}", d_cl);
+}
+
+#[test]
+fn test_zvknhb_in_isa_string() {
+    let dtb = microvm::dtb::generate_dtb(128 * 1024 * 1024, "", false, None);
+    let dtb_str = String::from_utf8_lossy(&dtb);
+    assert!(
+        dtb_str.contains("zvknhb"),
+        "DTB should advertise zvknhb extension"
+    );
+}

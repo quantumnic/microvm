@@ -2947,7 +2947,7 @@ fn execute_mvv(cpu: &mut Cpu, ctx: &VCtx) {
 }
 
 // ============================================================================
-// OP-P (opcode 0x77): Vector crypto instructions (Zvkned)
+// OP-P (opcode 0x77): Vector crypto instructions (Zvkned, Zvknhb)
 // ============================================================================
 fn execute_v_crypto(cpu: &mut Cpu, raw: u32, inst_len: u64) -> bool {
     let funct3 = (raw >> 12) & 0x7;
@@ -2956,9 +2956,26 @@ fn execute_v_crypto(cpu: &mut Cpu, raw: u32, inst_len: u64) -> bool {
     let vs2 = ((raw >> 20) & 0x1F) as usize;
     let funct6 = (raw >> 26) & 0x3F;
 
-    // All Zvkned instructions require SEW=32
     let vtype = current_vtype(cpu);
-    if vtype.vill || vtype.sew != 32 {
+    if vtype.vill {
+        return false;
+    }
+
+    // Only OPMVV encoding (funct3=2)
+    if funct3 != 2 {
+        return false;
+    }
+
+    // Dispatch Zvknhb (SHA-2) instructions — accept SEW=32 or SEW=64
+    match funct6 {
+        0b101101..=0b101111 if vtype.sew == 32 || vtype.sew == 64 => {
+            return execute_v_sha2(cpu, vd, vs1, vs2, funct6, vtype.sew, inst_len);
+        }
+        _ => {}
+    }
+
+    // All Zvkned instructions require SEW=32
+    if vtype.sew != 32 {
         return false;
     }
     let vl = current_vl(cpu);
@@ -2966,11 +2983,6 @@ fn execute_v_crypto(cpu: &mut Cpu, raw: u32, inst_len: u64) -> bool {
     if num_groups == 0 {
         cpu.pc += inst_len;
         return true;
-    }
-
-    // Only OPMVV encoding (funct3=2)
-    if funct3 != 2 {
-        return false;
     }
 
     set_vs_dirty(cpu);
@@ -3034,6 +3046,315 @@ fn execute_v_crypto(cpu: &mut Cpu, raw: u32, inst_len: u64) -> bool {
 
     cpu.pc += inst_len;
     true
+}
+
+// ============================================================================
+// Zvknhb: Vector SHA-2 (SHA-256 with SEW=32, SHA-512 with SEW=64)
+// ============================================================================
+
+/// Read a 4-element group at SEW width from a vector register.
+fn sha2_read_group_u32(cpu: &Cpu, vreg: usize, base: usize) -> [u32; 4] {
+    [
+        cpu.vregs.read_elem(vreg, 32, base) as u32,
+        cpu.vregs.read_elem(vreg, 32, base + 1) as u32,
+        cpu.vregs.read_elem(vreg, 32, base + 2) as u32,
+        cpu.vregs.read_elem(vreg, 32, base + 3) as u32,
+    ]
+}
+
+fn sha2_write_group_u32(cpu: &mut Cpu, vreg: usize, base: usize, g: &[u32; 4]) {
+    for (i, &val) in g.iter().enumerate() {
+        cpu.vregs.write_elem(vreg, 32, base + i, val as u64);
+    }
+}
+
+fn sha2_read_group_u64(cpu: &Cpu, vreg: usize, base: usize) -> [u64; 4] {
+    [
+        cpu.vregs.read_elem(vreg, 64, base),
+        cpu.vregs.read_elem(vreg, 64, base + 1),
+        cpu.vregs.read_elem(vreg, 64, base + 2),
+        cpu.vregs.read_elem(vreg, 64, base + 3),
+    ]
+}
+
+fn sha2_write_group_u64(cpu: &mut Cpu, vreg: usize, base: usize, g: &[u64; 4]) {
+    for (i, &val) in g.iter().enumerate() {
+        cpu.vregs.write_elem(vreg, 64, base + i, val);
+    }
+}
+
+// SHA-256 sigma functions (lowercase = message schedule)
+#[inline]
+fn sha256_sig0(x: u32) -> u32 {
+    x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+}
+#[inline]
+fn sha256_sig1(x: u32) -> u32 {
+    x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+}
+// SHA-256 Sigma functions (uppercase = compression)
+#[inline]
+fn sha256_sum0(x: u32) -> u32 {
+    x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)
+}
+#[inline]
+fn sha256_sum1(x: u32) -> u32 {
+    x.rotate_right(6) ^ x.rotate_right(11) ^ x.rotate_right(25)
+}
+
+// SHA-512 sigma functions
+#[inline]
+fn sha512_sig0(x: u64) -> u64 {
+    x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7)
+}
+#[inline]
+fn sha512_sig1(x: u64) -> u64 {
+    x.rotate_right(19) ^ x.rotate_right(61) ^ (x >> 6)
+}
+// SHA-512 Sigma functions
+#[inline]
+fn sha512_sum0(x: u64) -> u64 {
+    x.rotate_right(28) ^ x.rotate_right(34) ^ x.rotate_right(39)
+}
+#[inline]
+fn sha512_sum1(x: u64) -> u64 {
+    x.rotate_right(14) ^ x.rotate_right(18) ^ x.rotate_right(41)
+}
+
+#[inline]
+fn sha_ch<
+    T: std::ops::BitAnd<Output = T> + std::ops::BitXor<Output = T> + std::ops::Not<Output = T> + Copy,
+>(
+    x: T,
+    y: T,
+    z: T,
+) -> T {
+    (x & y) ^ ((!x) & z)
+}
+#[inline]
+fn sha_maj<T: std::ops::BitAnd<Output = T> + std::ops::BitXor<Output = T> + Copy>(
+    x: T,
+    y: T,
+    z: T,
+) -> T {
+    (x & y) ^ (x & z) ^ (y & z)
+}
+
+fn execute_v_sha2(
+    cpu: &mut Cpu,
+    vd: usize,
+    vs1: usize,
+    vs2: usize,
+    funct6: u32,
+    sew: u32,
+    inst_len: u64,
+) -> bool {
+    let vl = current_vl(cpu);
+    let num_groups = vl as usize / 4;
+    if num_groups == 0 {
+        cpu.pc += inst_len;
+        return true;
+    }
+
+    set_vs_dirty(cpu);
+
+    match sew {
+        32 => execute_v_sha2_32(cpu, vd, vs1, vs2, funct6, num_groups),
+        64 => execute_v_sha2_64(cpu, vd, vs1, vs2, funct6, num_groups),
+        _ => return false,
+    }
+
+    cpu.pc += inst_len;
+    true
+}
+
+fn execute_v_sha2_32(
+    cpu: &mut Cpu,
+    vd: usize,
+    vs1: usize,
+    vs2: usize,
+    funct6: u32,
+    num_groups: usize,
+) {
+    for g in 0..num_groups {
+        let base = g * 4;
+        match funct6 {
+            0b101101 => {
+                // vsha2ms.vv — SHA-256 message schedule
+                let w_vd = sha2_read_group_u32(cpu, vd, base); // {W[3], W[2], W[1], W[0]}
+                let w_vs2 = sha2_read_group_u32(cpu, vs2, base); // {W[11], W[10], W[9], W[4]}
+                let w_vs1 = sha2_read_group_u32(cpu, vs1, base); // {W[15], W[14], W[13], W[12]}
+                let w16 = sha256_sig1(w_vs1[2])
+                    .wrapping_add(w_vs2[1])
+                    .wrapping_add(sha256_sig0(w_vd[1]))
+                    .wrapping_add(w_vd[0]);
+                let w17 = sha256_sig1(w_vs1[3])
+                    .wrapping_add(w_vs2[2])
+                    .wrapping_add(sha256_sig0(w_vd[2]))
+                    .wrapping_add(w_vd[1]);
+                let w18 = sha256_sig1(w16)
+                    .wrapping_add(w_vs2[3])
+                    .wrapping_add(sha256_sig0(w_vd[3]))
+                    .wrapping_add(w_vd[2]);
+                let w19 = sha256_sig1(w17)
+                    .wrapping_add(w_vs1[0])
+                    .wrapping_add(sha256_sig0(w_vs2[0]))
+                    .wrapping_add(w_vd[3]);
+                sha2_write_group_u32(cpu, vd, base, &[w16, w17, w18, w19]);
+            }
+            0b101110 => {
+                // vsha2ch.vv — SHA-256 compression high (uses words [3:2] from vs1)
+                sha2_compress_32(cpu, vd, vs1, vs2, base, true);
+            }
+            0b101111 => {
+                // vsha2cl.vv — SHA-256 compression low (uses words [1:0] from vs1)
+                sha2_compress_32(cpu, vd, vs1, vs2, base, false);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(unused_assignments)]
+fn sha2_compress_32(cpu: &mut Cpu, vd: usize, vs1: usize, vs2: usize, base: usize, high: bool) {
+    let abef = sha2_read_group_u32(cpu, vs2, base); // {a, b, e, f}
+    let cdgh = sha2_read_group_u32(cpu, vd, base); // {c, d, g, h}
+    let msg = sha2_read_group_u32(cpu, vs1, base); // MessageSchedPlusC[3:0]
+
+    let (w0, w1) = if high {
+        (msg[2], msg[3])
+    } else {
+        (msg[0], msg[1])
+    };
+
+    let (mut a, mut b, mut c, mut d) = (abef[3], abef[2], cdgh[3], cdgh[2]);
+    let (mut e, mut f, mut g, mut h) = (abef[1], abef[0], cdgh[1], cdgh[0]);
+
+    // Round 0
+    let t1 = h
+        .wrapping_add(sha256_sum1(e))
+        .wrapping_add(sha_ch(e, f, g))
+        .wrapping_add(w0);
+    let t2 = sha256_sum0(a).wrapping_add(sha_maj(a, b, c));
+    h = g;
+    g = f;
+    f = e;
+    e = d.wrapping_add(t1);
+    d = c;
+    c = b;
+    b = a;
+    a = t1.wrapping_add(t2);
+
+    // Round 1
+    let t1 = h
+        .wrapping_add(sha256_sum1(e))
+        .wrapping_add(sha_ch(e, f, g))
+        .wrapping_add(w1);
+    let t2 = sha256_sum0(a).wrapping_add(sha_maj(a, b, c));
+    h = g;
+    g = f;
+    f = e;
+    e = d.wrapping_add(t1);
+    d = c;
+    c = b;
+    b = a;
+    a = t1.wrapping_add(t2);
+
+    // Output: {a, b, e, f} — the new state written to vd
+    sha2_write_group_u32(cpu, vd, base, &[f, e, b, a]);
+}
+
+fn execute_v_sha2_64(
+    cpu: &mut Cpu,
+    vd: usize,
+    vs1: usize,
+    vs2: usize,
+    funct6: u32,
+    num_groups: usize,
+) {
+    for g in 0..num_groups {
+        let base = g * 4;
+        match funct6 {
+            0b101101 => {
+                // vsha2ms.vv — SHA-512 message schedule
+                let w_vd = sha2_read_group_u64(cpu, vd, base);
+                let w_vs2 = sha2_read_group_u64(cpu, vs2, base);
+                let w_vs1 = sha2_read_group_u64(cpu, vs1, base);
+                let w16 = sha512_sig1(w_vs1[2])
+                    .wrapping_add(w_vs2[1])
+                    .wrapping_add(sha512_sig0(w_vd[1]))
+                    .wrapping_add(w_vd[0]);
+                let w17 = sha512_sig1(w_vs1[3])
+                    .wrapping_add(w_vs2[2])
+                    .wrapping_add(sha512_sig0(w_vd[2]))
+                    .wrapping_add(w_vd[1]);
+                let w18 = sha512_sig1(w16)
+                    .wrapping_add(w_vs2[3])
+                    .wrapping_add(sha512_sig0(w_vd[3]))
+                    .wrapping_add(w_vd[2]);
+                let w19 = sha512_sig1(w17)
+                    .wrapping_add(w_vs1[0])
+                    .wrapping_add(sha512_sig0(w_vs2[0]))
+                    .wrapping_add(w_vd[3]);
+                sha2_write_group_u64(cpu, vd, base, &[w16, w17, w18, w19]);
+            }
+            0b101110 => {
+                // vsha2ch.vv — SHA-512 compression high
+                sha2_compress_64(cpu, vd, vs1, vs2, base, true);
+            }
+            0b101111 => {
+                // vsha2cl.vv — SHA-512 compression low
+                sha2_compress_64(cpu, vd, vs1, vs2, base, false);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(unused_assignments)]
+fn sha2_compress_64(cpu: &mut Cpu, vd: usize, vs1: usize, vs2: usize, base: usize, high: bool) {
+    let abef = sha2_read_group_u64(cpu, vs2, base);
+    let cdgh = sha2_read_group_u64(cpu, vd, base);
+    let msg = sha2_read_group_u64(cpu, vs1, base);
+
+    let (w0, w1) = if high {
+        (msg[2], msg[3])
+    } else {
+        (msg[0], msg[1])
+    };
+
+    let (mut a, mut b, mut c, mut d) = (abef[3], abef[2], cdgh[3], cdgh[2]);
+    let (mut e, mut f, mut g, mut h) = (abef[1], abef[0], cdgh[1], cdgh[0]);
+
+    let t1 = h
+        .wrapping_add(sha512_sum1(e))
+        .wrapping_add(sha_ch(e, f, g))
+        .wrapping_add(w0);
+    let t2 = sha512_sum0(a).wrapping_add(sha_maj(a, b, c));
+    h = g;
+    g = f;
+    f = e;
+    e = d.wrapping_add(t1);
+    d = c;
+    c = b;
+    b = a;
+    a = t1.wrapping_add(t2);
+
+    let t1 = h
+        .wrapping_add(sha512_sum1(e))
+        .wrapping_add(sha_ch(e, f, g))
+        .wrapping_add(w1);
+    let t2 = sha512_sum0(a).wrapping_add(sha_maj(a, b, c));
+    h = g;
+    g = f;
+    f = e;
+    e = d.wrapping_add(t1);
+    d = c;
+    c = b;
+    b = a;
+    a = t1.wrapping_add(t2);
+
+    sha2_write_group_u64(cpu, vd, base, &[f, e, b, a]);
 }
 
 // ============================================================================

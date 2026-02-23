@@ -244,6 +244,7 @@ pub fn disassemble(raw: u32, pc: u64) -> String {
             }
         }
         0x73 => disasm_system(raw, rd, rs1, funct3),
+        0x77 => disasm_v_crypto(raw, rd, rs1, rs2),
         _ => format!(".word   {:#010x}", raw),
     }
 }
@@ -599,6 +600,38 @@ fn disasm_atomic(_raw: u32, rd: usize, rs1: usize, rs2: usize, funct3: u32, func
     }
 }
 
+fn disasm_v_crypto(raw: u32, vd: usize, vs1: usize, vs2: usize) -> String {
+    let funct6 = (raw >> 26) & 0x3F;
+    match funct6 {
+        0b101000 => {
+            let op = match vs1 {
+                0 => "vaesdm.vv",
+                1 => "vaesdf.vv",
+                2 => "vaesem.vv",
+                3 => "vaesef.vv",
+                _ => return format!("vaes?   v{}, v{}", vd, vs2),
+            };
+            format!("{:<8}v{}, v{}", op, vd, vs2)
+        }
+        0b101001 => {
+            let op = match vs1 {
+                0 => "vaesdm.vs",
+                1 => "vaesdf.vs",
+                2 => "vaesem.vs",
+                3 => "vaesef.vs",
+                _ => return format!("vaes?   v{}, v{}", vd, vs2),
+            };
+            format!("{:<8}v{}, v{}", op, vd, vs2)
+        }
+        0b100010 => format!("vaeskf1.vi v{}, v{}, {}", vd, vs2, vs1),
+        0b101010 => format!("vaeskf2.vi v{}, v{}, {}", vd, vs2, vs1),
+        0b101101 => format!("vsha2ms.vv v{}, v{}, v{}", vd, vs2, vs1),
+        0b101110 => format!("vsha2ch.vv v{}, v{}, v{}", vd, vs2, vs1),
+        0b101111 => format!("vsha2cl.vv v{}, v{}, v{}", vd, vs2, vs1),
+        _ => format!("vcrypto? {:#010x}", raw),
+    }
+}
+
 fn disasm_system(raw: u32, rd: usize, rs1: usize, funct3: u32) -> String {
     if funct3 == 0 {
         return match raw {
@@ -945,7 +978,15 @@ pub fn mnemonic(inst: u32) -> &'static str {
                 }
             }
         }
-        0x77 => "vaes", // OP-P: Zvkned vector crypto
+        0x77 => {
+            // OP-P: Zvkned/Zvknhb vector crypto
+            let f6 = (inst >> 26) & 0x3F;
+            if f6 == 0b101101 || f6 == 0b101110 || f6 == 0b101111 {
+                "vsha2"
+            } else {
+                "vaes"
+            }
+        }
         0x43 | 0x47 | 0x4B | 0x4F => "fmadd",
         0x53 => "fpu",
         _ => "unknown",
