@@ -2,8 +2,9 @@ pub mod ram;
 pub mod rom;
 
 use crate::devices::{
-    clint::Clint, plic::Plic, rtc::GoldfishRtc, syscon::Syscon, uart::Uart, virtio_blk::VirtioBlk,
-    virtio_console::VirtioConsole, virtio_net::VirtioNet, virtio_rng::VirtioRng,
+    clint::Clint, plic::Plic, rtc::GoldfishRtc, syscon::Syscon, uart::Uart, virtio_9p::Virtio9p,
+    virtio_blk::VirtioBlk, virtio_console::VirtioConsole, virtio_net::VirtioNet,
+    virtio_rng::VirtioRng,
 };
 
 /// SBI HSM hart start request: (target_hart, start_addr, opaque)
@@ -33,6 +34,8 @@ pub const VIRTIO2_BASE: u64 = 0x1000_3000; // VirtIO RNG
 pub const VIRTIO2_SIZE: u64 = 0x1000;
 pub const VIRTIO3_BASE: u64 = 0x1000_4000; // VirtIO Net
 pub const VIRTIO3_SIZE: u64 = 0x1000;
+pub const VIRTIO4_BASE: u64 = 0x1000_7000; // VirtIO 9P
+pub const VIRTIO4_SIZE: u64 = 0x1000;
 pub const RTC_BASE: u64 = 0x1000_5000; // Goldfish RTC
 pub const RTC_SIZE: u64 = 0x1000;
 pub const SYSCON_BASE: u64 = 0x1000_6000; // Syscon (poweroff/reboot)
@@ -53,6 +56,7 @@ pub struct Bus {
     pub virtio_console: VirtioConsole,
     pub virtio_rng: VirtioRng,
     pub virtio_net: VirtioNet,
+    pub virtio_9p: Virtio9p,
     pub rtc: GoldfishRtc,
     pub syscon: Syscon,
     /// Pending hart start requests from SBI HSM
@@ -76,6 +80,7 @@ impl Bus {
             virtio_console: VirtioConsole::new(),
             virtio_rng: VirtioRng::new(),
             virtio_net: VirtioNet::new(),
+            virtio_9p: Virtio9p::new(),
             rtc: GoldfishRtc::new(),
             syscon: Syscon::new(),
             hart_start_queue: Vec::new(),
@@ -88,7 +93,7 @@ impl Bus {
     /// Route a physical address to the correct MMIO device or RAM.
     /// Returns (device_id, offset) where device_id:
     ///   0=RAM, 1=UART, 2=VirtIO blk, 3=CLINT, 4=PLIC,
-    ///   5=VirtIO console, 6=VirtIO RNG, 7=VirtIO Net, 8=RTC, 9=Syscon, 0xFF=unmapped
+    ///   5=VirtIO console, 6=VirtIO RNG, 7=VirtIO Net, 8=RTC, 9=Syscon, 10=VirtIO 9P, 0xFF=unmapped
     #[inline(always)]
     fn route(&self, addr: u64) -> (u8, u64) {
         if addr >= DRAM_BASE {
@@ -111,6 +116,9 @@ impl Bus {
         }
         if (VIRTIO3_BASE..VIRTIO3_BASE + VIRTIO3_SIZE).contains(&addr) {
             return (7, addr - VIRTIO3_BASE);
+        }
+        if (VIRTIO4_BASE..VIRTIO4_BASE + VIRTIO4_SIZE).contains(&addr) {
+            return (10, addr - VIRTIO4_BASE);
         }
         if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
             return (8, addr - RTC_BASE);
@@ -139,6 +147,7 @@ impl Bus {
             (7, off) => self.virtio_net.read(off) as u8,
             (8, off) => self.rtc.read(off) as u8,
             (9, off) => self.syscon.read(off) as u8,
+            (10, off) => self.virtio_9p.read(off) as u8,
             _ => {
                 log::trace!("Bus: unmapped read8 at {:#010x}", addr);
                 0
@@ -207,6 +216,7 @@ impl Bus {
             (7, off) => self.virtio_net.read(off),
             (8, off) => self.rtc.read(off),
             (9, off) => self.syscon.read(off),
+            (10, off) => self.virtio_9p.read(off),
             _ => {
                 log::trace!("Bus: unmapped read32 at {:#010x}", addr);
                 0
@@ -238,6 +248,7 @@ impl Bus {
             (7, off) => self.virtio_net.write(off, val as u64),
             (8, off) => self.rtc.write(off, val as u64),
             (9, off) => self.syscon.write(off, val as u64),
+            (10, off) => self.virtio_9p.write(off, val as u64),
             _ => {
                 log::trace!("Bus: unmapped write8 at {:#010x} val={:#04x}", addr, val);
             }
@@ -269,6 +280,7 @@ impl Bus {
             (7, off) => self.virtio_net.write(off, val as u64),
             (8, off) => self.rtc.write(off, val as u64),
             (9, off) => self.syscon.write(off, val as u64),
+            (10, off) => self.virtio_9p.write(off, val as u64),
             _ => {
                 log::trace!("Bus: unmapped write32 at {:#010x} val={:#010x}", addr, val);
             }

@@ -16,6 +16,7 @@ pub struct VmConfig {
     pub kernel_path: PathBuf,
     pub disk_path: Option<PathBuf>,
     pub initrd_path: Option<PathBuf>,
+    pub share_path: Option<PathBuf>,
     pub ram_size_mib: u64,
     pub kernel_cmdline: String,
     pub load_addr: u64,
@@ -95,6 +96,11 @@ impl Vm {
                     e
                 );
             }
+        }
+
+        // Attach 9P shared directory if provided
+        if let Some(ref share_path) = self.config.share_path {
+            self.bus.virtio_9p.set_root(share_path);
         }
 
         // Load initrd if provided
@@ -237,6 +243,9 @@ impl Vm {
             }
             if self.bus.virtio_net.has_interrupt() {
                 self.bus.plic.set_pending(12);
+            }
+            if self.bus.virtio_9p.has_interrupt() {
+                self.bus.plic.set_pending(14);
             }
             self.bus.rtc.tick();
             if self.bus.rtc.has_interrupt() {
@@ -546,6 +555,11 @@ impl Vm {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_net.process_queues(ram, dram_base);
+                }
+                if self.bus.virtio_9p.needs_processing() {
+                    let dram_base = DRAM_BASE;
+                    let ram = self.bus.ram.as_mut_slice();
+                    self.bus.virtio_9p.process_queue(ram, dram_base);
                 }
             }
         }

@@ -81,6 +81,10 @@ enum Commands {
         #[arg(short, long)]
         initrd: Option<PathBuf>,
 
+        /// Host directory to share via VirtIO 9P (mount -t 9p -o trans=virtio microvm /mnt)
+        #[arg(long)]
+        share: Option<PathBuf>,
+
         /// RAM size in MiB (default: 128)
         #[arg(short, long, default_value = "128")]
         memory: u64,
@@ -164,6 +168,7 @@ fn main() {
             kernel,
             disk,
             initrd,
+            share,
             memory: mem_size,
             cpus,
             cmdline,
@@ -183,6 +188,7 @@ fn main() {
                 kernel_path: kernel,
                 disk_path: disk,
                 initrd_path: initrd,
+                share_path: share,
                 ram_size_mib: mem_size,
                 kernel_cmdline: cmdline,
                 load_addr: addr,
