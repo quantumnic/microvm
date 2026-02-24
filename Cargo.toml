@@ -1,6 +1,6 @@
 [package]
 name = "microvm"
-version = "0.76.0"
+version = "0.77.0"
 edition = "2021"
 authors = ["Nicola Spieser <redbasecap-buiss@users.noreply.github.com>"]
 description = "Lightweight RISC-V system emulator — Boot Linux in one command"
