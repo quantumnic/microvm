@@ -247,6 +247,9 @@ impl Vm {
             if self.bus.virtio_9p.has_interrupt() {
                 self.bus.plic.set_pending(14);
             }
+            if self.bus.virtio_input.has_interrupt() {
+                self.bus.plic.set_pending(15);
+            }
             self.bus.rtc.tick();
             if self.bus.rtc.has_interrupt() {
                 self.bus.plic.set_pending(13);
@@ -581,6 +584,12 @@ impl Vm {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_9p.process_queue(ram, dram_base);
+                }
+                // Deliver pending input events to guest
+                if self.bus.virtio_input.has_pending_events() {
+                    let dram_base = DRAM_BASE;
+                    let ram = self.bus.ram.as_mut_slice();
+                    self.bus.virtio_input.process_eventq(ram, dram_base);
                 }
             }
         }
