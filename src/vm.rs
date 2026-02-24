@@ -253,6 +253,9 @@ impl Vm {
             if self.bus.virtio_balloon.has_interrupt() {
                 self.bus.plic.set_pending(16);
             }
+            if self.bus.virtio_gpu.has_interrupt() {
+                self.bus.plic.set_pending(17);
+            }
             self.bus.rtc.tick();
             if self.bus.rtc.has_interrupt() {
                 self.bus.plic.set_pending(13);
@@ -598,6 +601,11 @@ impl Vm {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_balloon.process_queues(ram, dram_base);
+                }
+                if self.bus.virtio_gpu.needs_processing() {
+                    let dram_base = DRAM_BASE;
+                    let ram = self.bus.ram.as_mut_slice();
+                    self.bus.virtio_gpu.process_controlq(ram, dram_base);
                 }
             }
         }
