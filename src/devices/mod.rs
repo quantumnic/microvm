@@ -11,4 +11,6 @@ pub mod virtio_gpu;
 pub mod virtio_input;
 pub mod virtio_net;
 pub mod virtio_rng;
+#[allow(dead_code)]
+pub mod virtio_sound;
 pub mod virtio_vsock;
