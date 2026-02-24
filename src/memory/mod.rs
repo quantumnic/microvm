@@ -75,6 +75,12 @@ pub struct Bus {
     pub pmu_fw_active: [bool; 16],
     /// FWFT: misaligned exception delegation to S-mode
     pub fwft_misaligned_deleg: bool,
+    /// SUSP: resume address for non-retentive suspend
+    pub susp_resume_addr: Option<u64>,
+    /// SUSP: opaque value for non-retentive suspend resume
+    pub susp_resume_opaque: Option<u64>,
+    /// SUSP: non-retentive suspend pending
+    pub susp_non_retentive: bool,
 }
 
 impl Bus {
@@ -99,6 +105,9 @@ impl Bus {
             pmu_fw_events: [0; 16],
             pmu_fw_active: [false; 16],
             fwft_misaligned_deleg: false,
+            susp_resume_addr: None,
+            susp_resume_opaque: None,
+            susp_non_retentive: false,
         }
     }
 

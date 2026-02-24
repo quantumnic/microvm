@@ -389,6 +389,104 @@ impl TriggerModule {
     pub fn has_active_triggers(&self) -> bool {
         self.triggers.iter().any(|t| t.is_mcontrol6())
     }
+
+    // === SBI DBTR (Debug Triggers) interface ===
+
+    /// Return the number of triggers available
+    pub fn num_triggers(&self) -> usize {
+        NUM_TRIGGERS
+    }
+
+    /// Read tdata1/tdata2/tdata3 for a trigger by index.
+    /// Returns None if index is out of range.
+    pub fn dbtr_read(&self, idx: usize) -> Option<(u64, u64, u64)> {
+        if idx >= NUM_TRIGGERS {
+            return None;
+        }
+        let t = &self.triggers[idx];
+        Some((t.tdata1, t.tdata2, t.tdata3))
+    }
+
+    /// Install (configure) a trigger via SBI DBTR.
+    /// Sets tdata1/tdata2/tdata3 on the first available (disabled) slot.
+    /// Returns the slot index on success, or None if no slots available.
+    pub fn dbtr_install(&mut self, tdata1: u64, tdata2: u64, tdata3: u64) -> Option<usize> {
+        let slot = self
+            .triggers
+            .iter()
+            .position(|t| t.trigger_type() == TYPE_DISABLED)?;
+
+        let new_type = tdata1 >> 60;
+        let stored_tdata1 = if new_type == TYPE_MCONTROL6 {
+            (TYPE_MCONTROL6 << 60) | (tdata1 & MC6_WRITABLE)
+        } else if new_type == TYPE_DISABLED || new_type == 0 {
+            TYPE_DISABLED << 60
+        } else {
+            // Unsupported type
+            return None;
+        };
+
+        self.triggers[slot].tdata1 = stored_tdata1;
+        self.triggers[slot].tdata2 = tdata2;
+        self.triggers[slot].tdata3 = tdata3;
+        Some(slot)
+    }
+
+    /// Uninstall (disable) a trigger by index.
+    /// Returns true if the trigger existed and was uninstalled.
+    pub fn dbtr_uninstall(&mut self, idx: usize) -> bool {
+        if idx >= NUM_TRIGGERS {
+            return false;
+        }
+        self.triggers[idx].tdata1 = TYPE_DISABLED << 60;
+        self.triggers[idx].tdata2 = 0;
+        self.triggers[idx].tdata3 = 0;
+        true
+    }
+
+    /// Enable a trigger by index (set it to mcontrol6 if it was installed but disabled).
+    /// If the trigger is already active, this is a no-op success.
+    /// Returns true if the trigger was enabled.
+    pub fn dbtr_enable(&mut self, idx: usize) -> bool {
+        if idx >= NUM_TRIGGERS {
+            return false;
+        }
+        // If trigger is disabled type but has saved state in tdata2/tdata3,
+        // we restore it as mcontrol6. For simplicity, if it's already mcontrol6
+        // we leave it alone.
+        let t = &self.triggers[idx];
+        if t.trigger_type() == TYPE_MCONTROL6 {
+            return true; // already enabled
+        }
+        // Can't enable a trigger that was never installed (all zeros)
+        if t.tdata2 == 0 && t.tdata3 == 0 {
+            return false;
+        }
+        // Restore as mcontrol6 with previously stored writable bits
+        // (the tdata1 low bits may still hold the configuration)
+        let bits = self.triggers[idx].tdata1 & MC6_WRITABLE;
+        if bits == 0 {
+            return false; // no configuration to restore
+        }
+        self.triggers[idx].tdata1 = (TYPE_MCONTROL6 << 60) | bits;
+        true
+    }
+
+    /// Disable a trigger by index (set type to disabled but preserve config in lower bits).
+    /// Returns true if the trigger was disabled.
+    pub fn dbtr_disable(&mut self, idx: usize) -> bool {
+        if idx >= NUM_TRIGGERS {
+            return false;
+        }
+        let t = &self.triggers[idx];
+        if t.trigger_type() != TYPE_MCONTROL6 {
+            return true; // already disabled
+        }
+        // Preserve writable bits but change type to disabled
+        let bits = self.triggers[idx].tdata1 & MC6_WRITABLE;
+        self.triggers[idx].tdata1 = (TYPE_DISABLED << 60) | bits;
+        true
+    }
 }
 
 #[cfg(test)]

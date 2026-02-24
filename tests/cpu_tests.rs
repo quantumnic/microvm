@@ -12870,3 +12870,407 @@ fn test_zfh_in_isa_string() {
     let dtb_str = String::from_utf8_lossy(&dtb);
     assert!(dtb_str.contains("zfh"), "DTB should advertise zfh");
 }
+
+// =============================================================================
+// SBI SUSP (System Suspend) extension tests
+// =============================================================================
+
+#[test]
+fn test_sbi_susp_probe_supported() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x10; // Base extension
+    cpu.regs[16] = 3; // probe_extension
+    cpu.regs[10] = 0x535553; // SUSP
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "probe should succeed");
+    assert_eq!(cpu.regs[11], 1, "SUSP should be available");
+}
+
+#[test]
+fn test_sbi_susp_retentive_suspend() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x535553; // SUSP EID
+    cpu.regs[16] = 0; // system_suspend FID
+    cpu.regs[10] = 0; // sleep_type = SUSPEND_TO_RAM
+    cpu.regs[11] = 0x8000_1000; // resume_addr (ignored for retentive)
+    cpu.regs[12] = 42; // opaque (ignored for retentive)
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "retentive suspend should succeed");
+    assert_eq!(
+        cpu.hart_state,
+        microvm::cpu::HartState::Suspended,
+        "hart should be suspended"
+    );
+    assert!(cpu.wfi, "hart should be in WFI state");
+}
+
+#[test]
+fn test_sbi_susp_non_retentive_suspend() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x535553; // SUSP EID
+    cpu.regs[16] = 0; // system_suspend FID
+    cpu.regs[10] = 0x8000_0000; // sleep_type = SUSPEND_TO_DISK
+    cpu.regs[11] = 0x8000_2000; // resume_addr
+    cpu.regs[12] = 0xDEAD; // opaque
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "non-retentive suspend should succeed");
+    assert_eq!(
+        cpu.hart_state,
+        microvm::cpu::HartState::Suspended,
+        "hart should be suspended"
+    );
+    assert_eq!(
+        bus.susp_resume_addr,
+        Some(0x8000_2000),
+        "resume addr stored"
+    );
+    assert_eq!(bus.susp_resume_opaque, Some(0xDEAD), "opaque stored");
+    assert!(bus.susp_non_retentive, "non-retentive flag set");
+}
+
+#[test]
+fn test_sbi_susp_invalid_sleep_type() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x535553; // SUSP
+    cpu.regs[16] = 0;
+    cpu.regs[10] = 0x1234; // invalid sleep_type
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs[10] as i64, -3,
+        "invalid sleep_type should return SBI_ERR_INVALID_PARAM"
+    );
+}
+
+#[test]
+fn test_sbi_susp_invalid_fid() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x535553;
+    cpu.regs[16] = 99; // invalid FID
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs[10] as i64, -2,
+        "invalid FID should return SBI_ERR_NOT_SUPPORTED"
+    );
+}
+
+// =============================================================================
+// SBI DBTR (Debug Triggers) extension tests
+// =============================================================================
+
+#[test]
+fn test_sbi_dbtr_probe_supported() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x10; // Base
+    cpu.regs[16] = 3; // probe
+    cpu.regs[10] = 0x44425452; // DBTR
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0);
+    assert_eq!(cpu.regs[11], 1, "DBTR should be available");
+}
+
+#[test]
+fn test_sbi_dbtr_num_triggers() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x44425452; // DBTR
+    cpu.regs[16] = 0; // num_triggers
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "should succeed");
+    assert_eq!(cpu.regs[11], 4, "should have 4 triggers");
+}
+
+#[test]
+fn test_sbi_dbtr_install_and_read() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Install a trigger: mcontrol6, execute, S-mode, exact match at 0x1000
+    let tdata1 = (6u64 << 60) | (1 << 4) | (1 << 2); // type=6 | S | EXECUTE
+    let tdata2 = 0x1000u64;
+    cpu.regs[17] = 0x44425452; // DBTR
+    cpu.regs[16] = 2; // install
+    cpu.regs[10] = tdata1;
+    cpu.regs[11] = tdata2;
+    cpu.regs[12] = 0; // tdata3
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "install should succeed");
+    let slot = cpu.regs[11];
+    assert_eq!(slot, 0, "should use slot 0");
+
+    // Read it back
+    cpu.pc = DRAM_BASE;
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 1; // read
+    cpu.regs[10] = slot;
+    cpu.regs[11] = 1; // count=1
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "read should succeed");
+    // tdata1 should have type=6 and our bits
+    assert_eq!(cpu.regs[11] >> 60, 6, "type should be mcontrol6");
+    assert_eq!(cpu.regs[12], 0x1000, "tdata2 should be our address");
+}
+
+#[test]
+fn test_sbi_dbtr_uninstall() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Install a trigger
+    let tdata1 = (6u64 << 60) | (1 << 4) | (1 << 2);
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 2;
+    cpu.regs[10] = tdata1;
+    cpu.regs[11] = 0x2000;
+    cpu.regs[12] = 0;
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0);
+
+    // Uninstall it (mask=0 means single trigger at base)
+    cpu.pc = DRAM_BASE;
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 3; // uninstall
+    cpu.regs[10] = 0; // trig_idx_base
+    cpu.regs[11] = 0; // mask=0 (single)
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "uninstall should succeed");
+
+    // Verify trigger is disabled
+    assert!(
+        !cpu.triggers.has_active_triggers(),
+        "no active triggers after uninstall"
+    );
+}
+
+#[test]
+fn test_sbi_dbtr_enable_disable() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+
+    // Install a trigger
+    let tdata1 = (6u64 << 60) | (1 << 6) | (1 << 4) | (1 << 3) | (1 << 2); // M|S|U|EXECUTE
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 2;
+    cpu.regs[10] = tdata1;
+    cpu.regs[11] = 0x3000;
+    cpu.regs[12] = 0;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0);
+    assert!(cpu.triggers.has_active_triggers());
+
+    // Disable it
+    cpu.pc = DRAM_BASE;
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 5; // disable
+    cpu.regs[10] = 0;
+    cpu.regs[11] = 0;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "disable should succeed");
+    assert!(
+        !cpu.triggers.has_active_triggers(),
+        "no active triggers after disable"
+    );
+
+    // Re-enable it
+    cpu.pc = DRAM_BASE;
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 4; // enable
+    cpu.regs[10] = 0;
+    cpu.regs[11] = 0;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs[10], 0, "enable should succeed");
+    assert!(
+        cpu.triggers.has_active_triggers(),
+        "trigger should be active after re-enable"
+    );
+}
+
+#[test]
+fn test_sbi_dbtr_read_invalid_index() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 1; // read
+    cpu.regs[10] = 99; // invalid index
+    cpu.regs[11] = 1; // count=1
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs[10] as i64, -3,
+        "invalid index should return SBI_ERR_INVALID_PARAM"
+    );
+}
+
+#[test]
+fn test_sbi_dbtr_install_all_slots() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    let tdata1 = (6u64 << 60) | (1 << 4) | (1 << 2);
+
+    // Install 4 triggers (all slots)
+    for i in 0..4u64 {
+        cpu.pc = DRAM_BASE;
+        cpu.regs[17] = 0x44425452;
+        cpu.regs[16] = 2;
+        cpu.regs[10] = tdata1;
+        cpu.regs[11] = 0x1000 + i * 0x100;
+        cpu.regs[12] = 0;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[10], 0, "install {} should succeed", i);
+    }
+
+    // 5th install should fail
+    cpu.pc = DRAM_BASE;
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 2;
+    cpu.regs[10] = tdata1;
+    cpu.regs[11] = 0x5000;
+    cpu.regs[12] = 0;
+    cpu.step(&mut bus);
+    assert_ne!(cpu.regs[10], 0, "5th install should fail (no slots)");
+}
+
+#[test]
+fn test_sbi_dbtr_invalid_fid() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x44425452;
+    cpu.regs[16] = 99; // invalid FID
+    let ecall = 0x00000073u32;
+    bus.load_binary(&ecall.to_le_bytes(), 0);
+    cpu.step(&mut bus);
+    assert_eq!(
+        cpu.regs[10] as i64, -2,
+        "invalid FID should return SBI_ERR_NOT_SUPPORTED"
+    );
+}
+
+// =============================================================================
+// Trigger module DBTR interface unit tests
+// =============================================================================
+
+#[test]
+fn test_trigger_dbtr_install_uninstall() {
+    use microvm::cpu::trigger::TriggerModule;
+    let mut tm = TriggerModule::new();
+
+    // Install: mcontrol6, exact match execute at 0x1000
+    let tdata1 = (6u64 << 60) | (1 << 6) | (1 << 4) | (1 << 3) | (1 << 2); // M|S|U|EXECUTE
+    let slot = tm.dbtr_install(tdata1, 0x1000, 0);
+    assert_eq!(slot, Some(0));
+    assert!(tm.has_active_triggers());
+
+    // Read back
+    let (t1, t2, t3) = tm.dbtr_read(0).unwrap();
+    assert_eq!(t1 >> 60, 6);
+    assert_eq!(t2, 0x1000);
+    assert_eq!(t3, 0);
+
+    // Uninstall
+    assert!(tm.dbtr_uninstall(0));
+    assert!(!tm.has_active_triggers());
+}
+
+#[test]
+fn test_trigger_dbtr_enable_disable_cycle() {
+    use microvm::cpu::trigger::TriggerModule;
+    let mut tm = TriggerModule::new();
+
+    let tdata1 = (6u64 << 60) | (1 << 6) | (1 << 4) | (1 << 2);
+    tm.dbtr_install(tdata1, 0x2000, 0);
+    assert!(tm.has_active_triggers());
+
+    // Disable
+    assert!(tm.dbtr_disable(0));
+    assert!(!tm.has_active_triggers());
+
+    // Enable
+    assert!(tm.dbtr_enable(0));
+    assert!(tm.has_active_triggers());
+
+    // Trigger should still fire at 0x2000
+    assert!(tm
+        .check_execute(0x2000, microvm::cpu::PrivilegeMode::Machine)
+        .is_some());
+}
+
+#[test]
+fn test_trigger_dbtr_read_out_of_range() {
+    use microvm::cpu::trigger::TriggerModule;
+    let tm = TriggerModule::new();
+    assert!(tm.dbtr_read(99).is_none());
+}
+
+#[test]
+fn test_trigger_dbtr_uninstall_out_of_range() {
+    use microvm::cpu::trigger::TriggerModule;
+    let mut tm = TriggerModule::new();
+    assert!(!tm.dbtr_uninstall(99));
+}

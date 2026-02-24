@@ -1487,6 +1487,7 @@ fn sbi_ext_name(eid: u64) -> &'static str {
         0x4442434E => "DBCN",
         0x504D55 => "PMU",
         0x535553 => "SUSP",
+        0x44425452 => "DBTR",
         0x4E41434C => "NACL",
         0x535441 => "STA",
         0x43505043 => "CPPC",
@@ -1584,6 +1585,8 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                             | 0x4442434E
                             | 0x504D55
                             | 0x46574654
+                            | 0x535553
+                            | 0x44425452
                     );
                     cpu.regs[10] = 0;
                     cpu.regs[11] = if available { 1 } else { 0 };
@@ -2070,10 +2073,166 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             }
         }
         0x535553 => {
-            // SUSP (System Suspend) extension
-            cpu.regs[10] = (-2i64) as u64;
-            cpu.regs[11] = 0;
-            true
+            // SUSP (System Suspend) extension — SBI v2.0
+            // FID 0: system_suspend(sleep_type, resume_addr, opaque)
+            match fid {
+                0 => {
+                    let sleep_type = a0;
+                    let resume_addr = cpu.regs[11];
+                    let opaque = cpu.regs[12];
+                    // Sleep types: 0 = SUSPEND_TO_RAM (retentive), 0x80000000 = SUSPEND_TO_DISK (non-retentive)
+                    match sleep_type {
+                        0 => {
+                            // SUSPEND_TO_RAM: retentive suspend — hart goes to WFI-like state
+                            // All hart state is preserved, resume at current PC+4
+                            cpu.hart_state = crate::cpu::HartState::Suspended;
+                            cpu.wfi = true;
+                            cpu.regs[10] = 0; // SBI_SUCCESS
+                            cpu.regs[11] = 0;
+                        }
+                        0x8000_0000 => {
+                            // SUSPEND_TO_DISK: non-retentive suspend
+                            // On resume, hart starts fresh at resume_addr with a0=opaque
+                            // For now, simulate immediate resume (like a hart restart)
+                            cpu.hart_state = crate::cpu::HartState::Suspended;
+                            cpu.wfi = true;
+                            // Store resume info — on wakeup the VM loop will handle it
+                            bus.susp_resume_addr = Some(resume_addr);
+                            bus.susp_resume_opaque = Some(opaque);
+                            bus.susp_non_retentive = true;
+                            cpu.regs[10] = 0; // SBI_SUCCESS
+                            cpu.regs[11] = 0;
+                        }
+                        _ => {
+                            cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
+                            cpu.regs[11] = 0;
+                        }
+                    }
+                    true
+                }
+                _ => {
+                    cpu.regs[10] = (-2i64) as u64; // SBI_ERR_NOT_SUPPORTED
+                    cpu.regs[11] = 0;
+                    true
+                }
+            }
+        }
+        0x44425452 => {
+            // DBTR (Debug Triggers) extension — SBI v2.0
+            // Allows S-mode to manage hardware debug triggers via SBI calls
+            match fid {
+                0 => {
+                    // dbtr_num_triggers() -> num
+                    cpu.regs[10] = 0; // SBI_SUCCESS
+                    cpu.regs[11] = cpu.triggers.num_triggers() as u64;
+                    true
+                }
+                1 => {
+                    // dbtr_read_trig(trig_idx_base, trig_count, shmem_phys_lo, shmem_phys_hi)
+                    // Read trigger state into shared memory
+                    // For simplicity, return data in a0/a1 for single trigger reads
+                    let trig_idx = a0 as usize;
+                    let trig_count = cpu.regs[11];
+                    if trig_count != 1 {
+                        // We support single-trigger reads via registers for simplicity
+                        // Multi-trigger reads via shmem not yet supported
+                        cpu.regs[10] = (-2i64) as u64; // SBI_ERR_NOT_SUPPORTED
+                        cpu.regs[11] = 0;
+                    } else if let Some((tdata1, tdata2, _tdata3)) = cpu.triggers.dbtr_read(trig_idx)
+                    {
+                        cpu.regs[10] = 0;
+                        // Pack tdata1 and tdata2 in return registers
+                        cpu.regs[11] = tdata1;
+                        cpu.regs[12] = tdata2;
+                    } else {
+                        cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
+                        cpu.regs[11] = 0;
+                    }
+                    true
+                }
+                2 => {
+                    // dbtr_install_trig(trig_count, shmem_phys_lo, shmem_phys_hi)
+                    // Install a single trigger from register args:
+                    // a0 = tdata1, a1 = tdata2, a2 = tdata3
+                    let tdata1 = a0;
+                    let tdata2 = cpu.regs[11];
+                    let tdata3 = cpu.regs[12];
+                    if let Some(idx) = cpu.triggers.dbtr_install(tdata1, tdata2, tdata3) {
+                        cpu.regs[10] = 0; // SBI_SUCCESS
+                        cpu.regs[11] = idx as u64;
+                    } else {
+                        cpu.regs[10] = (-8i64) as u64; // SBI_ERR_NO_SHMEM (repurposed: no slot)
+                        cpu.regs[11] = 0;
+                    }
+                    true
+                }
+                3 => {
+                    // dbtr_uninstall_trig(trig_idx_base, trig_idx_mask)
+                    let base = a0 as usize;
+                    let mask = cpu.regs[11];
+                    let mut ok = true;
+                    for bit in 0..64u64 {
+                        if mask & (1 << bit) != 0 {
+                            let idx = base + bit as usize;
+                            if !cpu.triggers.dbtr_uninstall(idx) {
+                                ok = false;
+                            }
+                        }
+                    }
+                    // Also handle base itself if mask is 0 (single trigger)
+                    if mask == 0 {
+                        ok = cpu.triggers.dbtr_uninstall(base);
+                    }
+                    cpu.regs[10] = if ok { 0 } else { (-3i64) as u64 };
+                    cpu.regs[11] = 0;
+                    true
+                }
+                4 => {
+                    // dbtr_enable_trig(trig_idx_base, trig_idx_mask)
+                    let base = a0 as usize;
+                    let mask = cpu.regs[11];
+                    let mut ok = true;
+                    if mask == 0 {
+                        ok = cpu.triggers.dbtr_enable(base);
+                    } else {
+                        for bit in 0..64u64 {
+                            if mask & (1 << bit) != 0
+                                && !cpu.triggers.dbtr_enable(base + bit as usize)
+                            {
+                                ok = false;
+                            }
+                        }
+                    }
+                    cpu.regs[10] = if ok { 0 } else { (-3i64) as u64 };
+                    cpu.regs[11] = 0;
+                    true
+                }
+                5 => {
+                    // dbtr_disable_trig(trig_idx_base, trig_idx_mask)
+                    let base = a0 as usize;
+                    let mask = cpu.regs[11];
+                    let mut ok = true;
+                    if mask == 0 {
+                        ok = cpu.triggers.dbtr_disable(base);
+                    } else {
+                        for bit in 0..64u64 {
+                            if mask & (1 << bit) != 0
+                                && !cpu.triggers.dbtr_disable(base + bit as usize)
+                            {
+                                ok = false;
+                            }
+                        }
+                    }
+                    cpu.regs[10] = if ok { 0 } else { (-3i64) as u64 };
+                    cpu.regs[11] = 0;
+                    true
+                }
+                _ => {
+                    cpu.regs[10] = (-2i64) as u64;
+                    cpu.regs[11] = 0;
+                    true
+                }
+            }
         }
         0x4E41434C => {
             // NACL (Nested Acceleration) extension

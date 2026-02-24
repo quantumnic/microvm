@@ -470,6 +470,27 @@ impl Vm {
                 }
             }
 
+            // Handle non-retentive suspend resume (SBI SUSP)
+            if self.bus.susp_non_retentive {
+                // Wake hart 0 at resume address with opaque in a1
+                if let (Some(resume_addr), Some(opaque)) =
+                    (self.bus.susp_resume_addr, self.bus.susp_resume_opaque)
+                {
+                    let cpu = &mut self.cpus[0];
+                    if cpu.hart_state == crate::cpu::HartState::Suspended {
+                        cpu.hart_state = crate::cpu::HartState::Started;
+                        cpu.wfi = false;
+                        cpu.pc = resume_addr;
+                        cpu.regs[10] = 0; // hart_id
+                        cpu.regs[11] = opaque;
+                        cpu.mode = crate::cpu::PrivilegeMode::Supervisor;
+                    }
+                }
+                self.bus.susp_resume_addr = None;
+                self.bus.susp_resume_opaque = None;
+                self.bus.susp_non_retentive = false;
+            }
+
             // Sync hart states to bus for SBI hart_get_status visibility
             for h in 0..num_harts {
                 self.bus.hart_states[h] = match self.cpus[h].hart_state {
