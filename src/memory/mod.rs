@@ -67,6 +67,14 @@ pub struct Bus {
     pub hart_states: Vec<u64>,
     /// Number of harts in the system (for SBI validation)
     pub num_harts: usize,
+    /// PMU firmware counters (16 counters, indices 32-47)
+    pub pmu_fw_counters: [u64; 16],
+    /// PMU firmware event selectors
+    pub pmu_fw_events: [u64; 16],
+    /// PMU firmware counter active flags
+    pub pmu_fw_active: [bool; 16],
+    /// FWFT: misaligned exception delegation to S-mode
+    pub fwft_misaligned_deleg: bool,
 }
 
 impl Bus {
@@ -87,6 +95,10 @@ impl Bus {
             tlb_flush_queue: Vec::new(),
             hart_states: Vec::new(),
             num_harts: 1,
+            pmu_fw_counters: [0; 16],
+            pmu_fw_events: [0; 16],
+            pmu_fw_active: [false; 16],
+            fwft_misaligned_deleg: false,
         }
     }
 

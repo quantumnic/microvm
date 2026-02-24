@@ -1582,6 +1582,8 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
                             | 0x52464E43
                             | 0x53525354
                             | 0x4442434E
+                            | 0x504D55
+                            | 0x46574654
                     );
                     cpu.regs[10] = 0;
                     cpu.regs[11] = if available { 1 } else { 0 };
@@ -1846,11 +1848,226 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             }
         }
         0x504D55 => {
-            // PMU (Performance Monitoring Unit) extension
-            // Linux probes this early; return SBI_ERR_NOT_SUPPORTED for all functions
-            cpu.regs[10] = (-2i64) as u64;
-            cpu.regs[11] = 0;
-            true
+            // PMU (Performance Monitoring Unit) extension — SBI v2.0
+            // Counters 0-2: cycle, time, instret (hardware, fixed)
+            // Counters 3-31: HPM counters (hardware, configurable)
+            // Counters 32-47: firmware counters (software)
+            const NUM_HW_COUNTERS: u64 = 32; // counters 0-31
+            const NUM_FW_COUNTERS: u64 = 16; // counters 32-47
+            const NUM_COUNTERS: u64 = NUM_HW_COUNTERS + NUM_FW_COUNTERS;
+
+            match fid {
+                0 => {
+                    // sbi_pmu_num_counters() -> total number of counters
+                    cpu.regs[10] = 0; // SBI_SUCCESS
+                    cpu.regs[11] = NUM_COUNTERS;
+                    true
+                }
+                1 => {
+                    // sbi_pmu_counter_get_info(counter_idx) -> counter info
+                    let idx = a0;
+                    if idx >= NUM_COUNTERS {
+                        cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
+                        cpu.regs[11] = 0;
+                    } else if idx < NUM_HW_COUNTERS {
+                        // Hardware counter info:
+                        // bits [11:0] = CSR number (cycle=0xC00, time=0xC01, instret=0xC02, hpmcounter3..31=0xC03..0xC1F)
+                        // bits [17:12] = width - 1 (63 for 64-bit counters)
+                        // bit 0 of upper word: type=0 for hardware
+                        let csr_num = 0xC00 + idx; // cycle=0xC00, time=0xC01, instret=0xC02, hpmcounter3-31=0xC03+
+                        let width_minus1 = 63u64;
+                        cpu.regs[10] = 0;
+                        cpu.regs[11] = csr_num | (width_minus1 << 12);
+                    } else {
+                        // Firmware counter: type bit (bit 0 of upper) = 1
+                        // width = 63 bits
+                        let width_minus1 = 63u64;
+                        cpu.regs[10] = 0;
+                        cpu.regs[11] = (1u64 << 63) | (width_minus1 << 12);
+                    }
+                    true
+                }
+                2 => {
+                    // sbi_pmu_counter_config_matching(counter_idx_base, counter_idx_mask,
+                    //   config_flags, event_idx, event_data)
+                    // a0=base, a1=mask, a2=flags, a3=event_idx, a4=event_data
+                    let base = a0;
+                    let mask = cpu.regs[11];
+                    let flags = cpu.regs[12];
+                    let event_idx = cpu.regs[13];
+                    let _event_data = cpu.regs[14];
+
+                    // event_idx: bits [19:16] = event type, bits [15:0] = event code
+                    let event_type = (event_idx >> 16) & 0xF;
+                    let event_code = event_idx & 0xFFFF;
+
+                    // Find first matching counter in the mask
+                    let mut found = false;
+                    for bit in 0..64u64 {
+                        if mask & (1u64 << bit) == 0 {
+                            continue;
+                        }
+                        let idx = base + bit;
+                        if idx >= NUM_COUNTERS {
+                            continue;
+                        }
+
+                        // Type 0 = hardware general events
+                        // Type 1 = hardware cache events
+                        // Type 15 = firmware events
+                        match event_type {
+                            0 => {
+                                // Hardware general events: map to fixed/HPM counters
+                                // Event codes: 1=cycle, 2=instret, 3+=HPM events
+                                if idx < NUM_HW_COUNTERS {
+                                    // For HPM counters 3-31, set the event selector
+                                    if idx >= 3 {
+                                        let hpm_idx = idx - 3;
+                                        // Write event code to mhpmevent CSR
+                                        cpu.csrs.write(0x323 + hpm_idx as u16, event_code);
+                                    }
+                                    // If SBI_PMU_CFG_FLAG_AUTO_START (bit 0), start counting
+                                    if flags & 1 != 0 {
+                                        // Clear inhibit bit for this counter
+                                        let inhibit = cpu.csrs.read(0x320); // mcountinhibit
+                                        cpu.csrs.write(0x320, inhibit & !(1u64 << idx));
+                                    }
+                                    cpu.regs[10] = 0; // SBI_SUCCESS
+                                    cpu.regs[11] = idx;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            1 => {
+                                // Hardware cache events — map to HPM counters
+                                if (3..NUM_HW_COUNTERS).contains(&idx) {
+                                    if flags & 1 != 0 {
+                                        let inhibit = cpu.csrs.read(0x320);
+                                        cpu.csrs.write(0x320, inhibit & !(1u64 << idx));
+                                    }
+                                    cpu.regs[10] = 0;
+                                    cpu.regs[11] = idx;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            15 => {
+                                // Firmware events — use firmware counters 32-47
+                                if idx >= NUM_HW_COUNTERS {
+                                    let fw_idx = (idx - NUM_HW_COUNTERS) as usize;
+                                    bus.pmu_fw_counters[fw_idx] = 0;
+                                    bus.pmu_fw_events[fw_idx] = event_code;
+                                    if flags & 1 != 0 {
+                                        bus.pmu_fw_active[fw_idx] = true;
+                                    }
+                                    cpu.regs[10] = 0;
+                                    cpu.regs[11] = idx;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !found {
+                        cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
+                        cpu.regs[11] = 0;
+                    }
+                    true
+                }
+                3 => {
+                    // sbi_pmu_counter_start(counter_idx_base, counter_idx_mask, start_flags, initial_value)
+                    let base = a0;
+                    let mask = cpu.regs[11];
+                    let flags = cpu.regs[12];
+                    let initial_value = cpu.regs[13];
+                    let set_initial = flags & 1 != 0; // SBI_PMU_START_SET_INIT_VALUE
+
+                    for bit in 0..64u64 {
+                        if mask & (1u64 << bit) == 0 {
+                            continue;
+                        }
+                        let idx = base + bit;
+                        if idx < NUM_HW_COUNTERS {
+                            // Clear inhibit bit to start counting
+                            let inhibit = cpu.csrs.read(0x320);
+                            cpu.csrs.write(0x320, inhibit & !(1u64 << idx));
+                            if set_initial && idx >= 3 {
+                                let hpm_idx = (idx - 3) as usize;
+                                cpu.csrs.hpm_counters[hpm_idx] = initial_value;
+                            }
+                        } else if idx < NUM_COUNTERS {
+                            let fw_idx = (idx - NUM_HW_COUNTERS) as usize;
+                            bus.pmu_fw_active[fw_idx] = true;
+                            if set_initial {
+                                bus.pmu_fw_counters[fw_idx] = initial_value;
+                            }
+                        }
+                    }
+                    cpu.regs[10] = 0;
+                    cpu.regs[11] = 0;
+                    true
+                }
+                4 => {
+                    // sbi_pmu_counter_stop(counter_idx_base, counter_idx_mask, stop_flags)
+                    let base = a0;
+                    let mask = cpu.regs[11];
+                    let _flags = cpu.regs[12]; // bit 0 = SBI_PMU_STOP_FLAG_RESET
+
+                    for bit in 0..64u64 {
+                        if mask & (1u64 << bit) == 0 {
+                            continue;
+                        }
+                        let idx = base + bit;
+                        if idx < NUM_HW_COUNTERS {
+                            // Set inhibit bit to stop counting
+                            let inhibit = cpu.csrs.read(0x320);
+                            cpu.csrs.write(0x320, inhibit | (1u64 << idx));
+                        } else if idx < NUM_COUNTERS {
+                            let fw_idx = (idx - NUM_HW_COUNTERS) as usize;
+                            bus.pmu_fw_active[fw_idx] = false;
+                        }
+                    }
+                    cpu.regs[10] = 0;
+                    cpu.regs[11] = 0;
+                    true
+                }
+                5 => {
+                    // sbi_pmu_counter_fw_read(counter_idx) -> firmware counter value
+                    let idx = a0;
+                    if (NUM_HW_COUNTERS..NUM_COUNTERS).contains(&idx) {
+                        let fw_idx = (idx - NUM_HW_COUNTERS) as usize;
+                        cpu.regs[10] = 0;
+                        cpu.regs[11] = bus.pmu_fw_counters[fw_idx];
+                    } else if idx < NUM_HW_COUNTERS {
+                        // For HW counters, read the CSR value
+                        let csr = 0xC00 + idx as u16;
+                        cpu.regs[10] = 0;
+                        cpu.regs[11] = cpu.csrs.read(csr);
+                    } else {
+                        cpu.regs[10] = (-3i64) as u64;
+                        cpu.regs[11] = 0;
+                    }
+                    true
+                }
+                6 => {
+                    // sbi_pmu_counter_fw_read_hi (RV32 only, return 0 for RV64)
+                    cpu.regs[10] = 0;
+                    cpu.regs[11] = 0;
+                    true
+                }
+                7 => {
+                    // sbi_pmu_snapshot_set_shmem — not supported
+                    cpu.regs[10] = (-2i64) as u64;
+                    cpu.regs[11] = 0;
+                    true
+                }
+                _ => {
+                    cpu.regs[10] = (-2i64) as u64;
+                    cpu.regs[11] = 0;
+                    true
+                }
+            }
         }
         0x535553 => {
             // SUSP (System Suspend) extension
@@ -1877,10 +2094,53 @@ fn handle_sbi_call(cpu: &mut Cpu, bus: &mut Bus) -> bool {
             true
         }
         0x46574654 => {
-            // FWFT (Firmware Features) extension
-            cpu.regs[10] = (-2i64) as u64;
-            cpu.regs[11] = 0;
-            true
+            // FWFT (Firmware Features) extension — SBI v2.0
+            // Feature IDs: 0=MISALIGNED_EXC_DELEG, 1=LANDING_PAD, 2=SHADOW_STACK, 3=DOUBLE_TRAP, 4=PTE_AD_HW_UPDATING
+            match fid {
+                0 => {
+                    // fwft_set(feature_id, value, flags)
+                    let feature_id = a0;
+                    let value = cpu.regs[11];
+                    match feature_id {
+                        0 => {
+                            // MISALIGNED_EXC_DELEG: delegate misaligned exceptions to S-mode
+                            // value: 0=disabled, 1=enabled
+                            if value <= 1 {
+                                bus.fwft_misaligned_deleg = value != 0;
+                                cpu.regs[10] = 0; // SBI_SUCCESS
+                            } else {
+                                cpu.regs[10] = (-3i64) as u64; // SBI_ERR_INVALID_PARAM
+                            }
+                            cpu.regs[11] = 0;
+                        }
+                        _ => {
+                            cpu.regs[10] = (-2i64) as u64; // SBI_ERR_NOT_SUPPORTED
+                            cpu.regs[11] = 0;
+                        }
+                    }
+                    true
+                }
+                1 => {
+                    // fwft_get(feature_id) -> value
+                    let feature_id = a0;
+                    match feature_id {
+                        0 => {
+                            cpu.regs[10] = 0;
+                            cpu.regs[11] = if bus.fwft_misaligned_deleg { 1 } else { 0 };
+                        }
+                        _ => {
+                            cpu.regs[10] = (-2i64) as u64;
+                            cpu.regs[11] = 0;
+                        }
+                    }
+                    true
+                }
+                _ => {
+                    cpu.regs[10] = (-2i64) as u64;
+                    cpu.regs[11] = 0;
+                    true
+                }
+            }
         }
         _ => {
             // Unknown extension — return not supported

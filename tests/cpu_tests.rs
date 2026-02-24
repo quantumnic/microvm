@@ -1854,26 +1854,206 @@ fn test_hpm_counter_access_control() {
 }
 
 #[test]
-fn test_sbi_pmu_returns_not_supported() {
-    // SBI PMU extension (EID 0x504D55) should return SBI_ERR_NOT_SUPPORTED
-    // We test via probe_extension which should return 0 for PMU
+fn test_sbi_pmu_num_counters() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
     setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
-    // Set up ecall: a7=0x10 (base), a6=3 (probe), a0=0x504D55 (PMU)
-    cpu.regs[17] = 0x10; // a7 = base extension
-    cpu.regs[16] = 3; // a6 = probe_extension
-    cpu.regs[10] = 0x504D55; // a0 = PMU extension ID
-                             // Execute ECALL
-    let ecall = 0x00000073u32;
-    bus.load_binary(&ecall.to_le_bytes(), 0);
+
+    // sbi_pmu_num_counters (fid=0)
+    cpu.regs[17] = 0x504D55; // PMU
+    cpu.regs[16] = 0; // num_counters
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
     cpu.step(&mut bus);
-    // After ecall trap to M-mode, the SBI handler should run
-    // But since we trap to M-mode firmware, we need to test differently.
-    // Instead, verify the CSR directly:
-    assert_eq!(cpu.csrs.read(csr::MENVCFGH), 0);
+
+    assert_eq!(cpu.regs[10] as i64, 0, "PMU num_counters should succeed");
+    assert_eq!(cpu.regs[11], 48, "Should have 48 counters (32 HW + 16 FW)");
+}
+
+#[test]
+fn test_sbi_pmu_counter_get_info_hw() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Get info for counter 0 (cycle)
+    cpu.regs[17] = 0x504D55;
+    cpu.regs[16] = 1; // counter_get_info
+    cpu.regs[10] = 0; // counter_idx = 0 (cycle)
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0, "get_info should succeed");
+    let info = cpu.regs[11];
+    let csr_num = info & 0xFFF;
+    let width = ((info >> 12) & 0x3F) + 1;
+    assert_eq!(csr_num, 0xC00, "Counter 0 should map to cycle CSR");
+    assert_eq!(width, 64, "Counter should be 64-bit");
+}
+
+#[test]
+fn test_sbi_pmu_counter_get_info_fw() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Get info for counter 32 (first firmware counter)
+    cpu.regs[17] = 0x504D55;
+    cpu.regs[16] = 1;
+    cpu.regs[10] = 32;
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0);
+    let info = cpu.regs[11];
+    assert!(
+        info & (1u64 << 63) != 0,
+        "Firmware counter should have type bit set"
+    );
+}
+
+#[test]
+fn test_sbi_pmu_counter_start_stop() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Start counter 3 with initial value
+    cpu.regs[17] = 0x504D55;
+    cpu.regs[16] = 3; // counter_start
+    cpu.regs[10] = 3; // base=3
+    cpu.regs[11] = 1; // mask=1 (counter 3 only)
+    cpu.regs[12] = 1; // flags: SET_INIT_VALUE
+    cpu.regs[13] = 42; // initial_value
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0, "counter_start should succeed");
+    assert_eq!(
+        cpu.csrs.hpm_counters[0], 42,
+        "Counter 3 should be set to 42"
+    );
+
+    // Stop counter 3
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x504D55;
+    cpu.regs[16] = 4; // counter_stop
+    cpu.regs[10] = 3;
+    cpu.regs[11] = 1;
+    cpu.regs[12] = 0;
+
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0, "counter_stop should succeed");
+}
+
+#[test]
+fn test_sbi_pmu_fw_counter_read() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Set firmware counter directly
+    bus.pmu_fw_counters[0] = 12345;
+
+    // Read firmware counter 32
+    cpu.regs[17] = 0x504D55;
+    cpu.regs[16] = 5; // counter_fw_read
+    cpu.regs[10] = 32; // counter_idx = 32 (first FW counter)
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0);
+    assert_eq!(cpu.regs[11], 12345, "FW counter should read 12345");
+}
+
+#[test]
+fn test_sbi_pmu_config_matching() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Config counter 3 for hardware general event, auto-start
+    cpu.regs[17] = 0x504D55;
+    cpu.regs[16] = 2; // counter_config_matching
+    cpu.regs[10] = 3; // base=3
+    cpu.regs[11] = 1; // mask=1 (counter 3)
+    cpu.regs[12] = 1; // flags: AUTO_START
+    cpu.regs[13] = 1; // event_idx: type=0 (hw general), code=1 (cycle)
+    cpu.regs[14] = 0; // event_data
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0, "config_matching should succeed");
+    assert_eq!(cpu.regs[11], 3, "Should return counter idx 3");
+}
+
+#[test]
+fn test_sbi_pmu_invalid_counter() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // Get info for out-of-range counter
+    cpu.regs[17] = 0x504D55;
+    cpu.regs[16] = 1; // counter_get_info
+    cpu.regs[10] = 100; // invalid counter
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(
+        cpu.regs[10] as i64, -3,
+        "Invalid counter should return SBI_ERR_INVALID_PARAM"
+    );
+}
+
+#[test]
+fn test_sbi_pmu_probe_supported() {
+    // Verify PMU extension is now probed as supported
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    cpu.regs[17] = 0x10; // base extension
+    cpu.regs[16] = 3; // probe_extension
+    cpu.regs[10] = 0x504D55; // PMU
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0, "probe should succeed");
+    assert_eq!(cpu.regs[11], 1, "PMU should be probed as available");
 }
 
 #[test]
@@ -2128,15 +2308,58 @@ fn test_sbi_cppc_returns_not_supported() {
 }
 
 #[test]
-fn test_sbi_fwft_returns_not_supported() {
+fn test_sbi_fwft_misaligned_deleg() {
     let mut bus = Bus::new(64 * 1024);
     let mut cpu = Cpu::new();
     setup_pmp_allow_all(&mut cpu);
     cpu.reset(DRAM_BASE);
     cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
 
+    // fwft_set(feature_id=0 MISALIGNED_EXC_DELEG, value=1)
     cpu.regs[17] = 0x46574654; // FWFT
-    cpu.regs[16] = 0;
+    cpu.regs[16] = 0; // fid=0 (fwft_set)
+    cpu.regs[10] = 0; // feature_id=0 (MISALIGNED_EXC_DELEG)
+    cpu.regs[11] = 1; // value=1 (enable)
+
+    let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
+    bus.load_binary(&bytes, 0);
+
+    cpu.step(&mut bus);
+
+    assert_eq!(
+        cpu.regs[10] as i64, 0,
+        "FWFT set MISALIGNED_EXC_DELEG should succeed"
+    );
+    assert!(
+        bus.fwft_misaligned_deleg,
+        "MISALIGNED_EXC_DELEG should be enabled"
+    );
+
+    // fwft_get(feature_id=0)
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+    cpu.regs[17] = 0x46574654;
+    cpu.regs[16] = 1; // fid=1 (fwft_get)
+    cpu.regs[10] = 0; // feature_id=0
+
+    cpu.step(&mut bus);
+
+    assert_eq!(cpu.regs[10] as i64, 0, "FWFT get should succeed");
+    assert_eq!(cpu.regs[11], 1, "MISALIGNED_EXC_DELEG should return 1");
+}
+
+#[test]
+fn test_sbi_fwft_unsupported_feature() {
+    let mut bus = Bus::new(64 * 1024);
+    let mut cpu = Cpu::new();
+    setup_pmp_allow_all(&mut cpu);
+    cpu.reset(DRAM_BASE);
+    cpu.mode = microvm::cpu::PrivilegeMode::Supervisor;
+
+    // fwft_set with unsupported feature_id=99
+    cpu.regs[17] = 0x46574654;
+    cpu.regs[16] = 0; // fwft_set
+    cpu.regs[10] = 99; // unsupported feature
 
     let bytes: Vec<u8> = 0x00000073u32.to_le_bytes().to_vec();
     bus.load_binary(&bytes, 0);
@@ -2145,7 +2368,7 @@ fn test_sbi_fwft_returns_not_supported() {
 
     assert_eq!(
         cpu.regs[10] as i64, -2,
-        "FWFT should return SBI_ERR_NOT_SUPPORTED"
+        "FWFT unsupported feature should return SBI_ERR_NOT_SUPPORTED"
     );
 }
 
