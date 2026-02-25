@@ -4,8 +4,9 @@ pub mod rom;
 use crate::devices::{
     clint::Clint, plic::Plic, rtc::GoldfishRtc, syscon::Syscon, uart::Uart, virtio_9p::Virtio9p,
     virtio_balloon::VirtioBalloon, virtio_blk::VirtioBlk, virtio_console::VirtioConsole,
-    virtio_gpu::VirtioGpu, virtio_input::VirtioInput, virtio_net::VirtioNet, virtio_rng::VirtioRng,
-    virtio_sound::VirtioSound, virtio_vsock::VirtioVsock,
+    virtio_crypto::VirtioCrypto, virtio_gpu::VirtioGpu, virtio_input::VirtioInput,
+    virtio_net::VirtioNet, virtio_rng::VirtioRng, virtio_sound::VirtioSound,
+    virtio_vsock::VirtioVsock,
 };
 
 /// SBI HSM hart start request: (target_hart, start_addr, opaque)
@@ -47,6 +48,8 @@ pub const VIRTIO8_BASE: u64 = 0x1000_B000; // VirtIO vsock
 pub const VIRTIO8_SIZE: u64 = 0x1000;
 pub const VIRTIO9_BASE: u64 = 0x1000_C000; // VirtIO sound
 pub const VIRTIO9_SIZE: u64 = 0x1000;
+pub const VIRTIO10_BASE: u64 = 0x1000_D000; // VirtIO crypto
+pub const VIRTIO10_SIZE: u64 = 0x1000;
 pub const RTC_BASE: u64 = 0x1000_5000; // Goldfish RTC
 pub const RTC_SIZE: u64 = 0x1000;
 pub const SYSCON_BASE: u64 = 0x1000_6000; // Syscon (poweroff/reboot)
@@ -73,6 +76,7 @@ pub struct Bus {
     pub virtio_gpu: VirtioGpu,
     pub virtio_sound: VirtioSound,
     pub virtio_vsock: VirtioVsock,
+    pub virtio_crypto: VirtioCrypto,
     pub rtc: GoldfishRtc,
     pub syscon: Syscon,
     /// Pending hart start requests from SBI HSM
@@ -116,6 +120,7 @@ impl Bus {
             virtio_gpu: VirtioGpu::new(),
             virtio_sound: VirtioSound::new(),
             virtio_vsock: VirtioVsock::new(),
+            virtio_crypto: VirtioCrypto::new(),
             rtc: GoldfishRtc::new(),
             syscon: Syscon::new(),
             hart_start_queue: Vec::new(),
@@ -135,7 +140,7 @@ impl Bus {
     /// Route a physical address to the correct MMIO device or RAM.
     /// Returns (device_id, offset) where device_id:
     ///   0=RAM, 1=UART, 2=VirtIO blk, 3=CLINT, 4=PLIC,
-    ///   5=VirtIO console, 6=VirtIO RNG, 7=VirtIO Net, 8=RTC, 9=Syscon, 10=VirtIO 9P, 11=VirtIO Input, 12=VirtIO Balloon, 13=VirtIO GPU, 14=VirtIO vsock, 15=VirtIO sound, 0xFF=unmapped
+    ///   5=VirtIO console, 6=VirtIO RNG, 7=VirtIO Net, 8=RTC, 9=Syscon, 10=VirtIO 9P, 11=VirtIO Input, 12=VirtIO Balloon, 13=VirtIO GPU, 14=VirtIO vsock, 15=VirtIO sound, 16=VirtIO crypto, 0xFF=unmapped
     #[inline(always)]
     fn route(&self, addr: u64) -> (u8, u64) {
         if addr >= DRAM_BASE {
@@ -177,6 +182,9 @@ impl Bus {
         if (VIRTIO9_BASE..VIRTIO9_BASE + VIRTIO9_SIZE).contains(&addr) {
             return (15, addr - VIRTIO9_BASE);
         }
+        if (VIRTIO10_BASE..VIRTIO10_BASE + VIRTIO10_SIZE).contains(&addr) {
+            return (16, addr - VIRTIO10_BASE);
+        }
         if (RTC_BASE..RTC_BASE + RTC_SIZE).contains(&addr) {
             return (8, addr - RTC_BASE);
         }
@@ -210,6 +218,7 @@ impl Bus {
             (13, off) => self.virtio_gpu.read(off) as u8,
             (14, off) => self.virtio_vsock.read(off) as u8,
             (15, off) => self.virtio_sound.read(off) as u8,
+            (16, off) => self.virtio_crypto.read(off) as u8,
             _ => {
                 log::trace!("Bus: unmapped read8 at {:#010x}", addr);
                 0
@@ -284,6 +293,7 @@ impl Bus {
             (13, off) => self.virtio_gpu.read(off),
             (14, off) => self.virtio_vsock.read(off),
             (15, off) => self.virtio_sound.read(off),
+            (16, off) => self.virtio_crypto.read(off),
             _ => {
                 log::trace!("Bus: unmapped read32 at {:#010x}", addr);
                 0
@@ -321,6 +331,7 @@ impl Bus {
             (13, off) => self.virtio_gpu.write(off, val as u64),
             (14, off) => self.virtio_vsock.write(off, val as u64),
             (15, off) => self.virtio_sound.write(off, val as u64),
+            (16, off) => self.virtio_crypto.write(off, val as u64),
             _ => {
                 log::trace!("Bus: unmapped write8 at {:#010x} val={:#04x}", addr, val);
             }
@@ -358,6 +369,7 @@ impl Bus {
             (13, off) => self.virtio_gpu.write(off, val as u64),
             (14, off) => self.virtio_vsock.write(off, val as u64),
             (15, off) => self.virtio_sound.write(off, val as u64),
+            (16, off) => self.virtio_crypto.write(off, val as u64),
             _ => {
                 log::trace!("Bus: unmapped write32 at {:#010x} val={:#010x}", addr, val);
             }

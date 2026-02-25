@@ -259,6 +259,9 @@ impl Vm {
             if self.bus.virtio_vsock.has_interrupt() {
                 self.bus.plic.set_pending(18);
             }
+            if self.bus.virtio_crypto.has_interrupt() {
+                self.bus.plic.set_pending(20);
+            }
             self.bus.rtc.tick();
             if self.bus.rtc.has_interrupt() {
                 self.bus.plic.set_pending(13);
@@ -614,6 +617,11 @@ impl Vm {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_vsock.process_queues(ram, dram_base);
+                }
+                if self.bus.virtio_crypto.needs_processing() {
+                    let dram_base = DRAM_BASE;
+                    let ram = self.bus.ram.as_mut_slice();
+                    self.bus.virtio_crypto.process_queues(ram, dram_base);
                 }
             }
         }
