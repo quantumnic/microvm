@@ -445,7 +445,9 @@ impl Vm {
                         target.csrs.write(csr::MCOUNTEREN, 7);
                         target.csrs.write(csr::SCOUNTEREN, 7);
                         // Enable Sstc + Svadu
-                        target.csrs.write(csr::MENVCFG, (1u64 << 63) | (1u64 << 61));
+                        target
+                            .csrs
+                            .write(csr::MENVCFG, (1u64 << 63) | (1u64 << 61) | 0xD0);
                         // mtvec: point to boot ROM trap handler (MRET at DRAM_BASE+0x100)
                         target
                             .csrs
@@ -660,6 +662,17 @@ impl Vm {
             elapsed.as_secs_f64(),
             mips
         );
+        // TLB stats (hart 0)
+        let cpu0 = &self.cpus[0];
+        let total_tlb = cpu0.mmu.tlb_hits + cpu0.mmu.tlb_misses;
+        if total_tlb > 0 {
+            log::debug!(
+                "TLB: {} hits, {} misses, {:.1}% hit rate",
+                cpu0.mmu.tlb_hits,
+                cpu0.mmu.tlb_misses,
+                cpu0.mmu.tlb_hits as f64 / total_tlb as f64 * 100.0
+            );
+        }
     }
 }
 

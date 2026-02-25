@@ -63,7 +63,7 @@ enum Commands {
         initrd: bool,
 
         /// Kernel command line
-        #[arg(long, default_value = "console=ttyS0")]
+        #[arg(long, default_value = "console=ttyS0 earlycon=sbi")]
         cmdline: String,
     },
 
@@ -94,7 +94,7 @@ enum Commands {
         cpus: u32,
 
         /// Kernel command line
-        #[arg(long, default_value = "console=ttyS0")]
+        #[arg(long, default_value = "console=ttyS0 earlycon=sbi")]
         cmdline: String,
 
         /// Load address for raw binary (hex, default: 0x80200000)

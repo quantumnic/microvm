@@ -56,14 +56,20 @@ impl BootRom {
         // The trap handler is placed right after mret; we'll point mtvec at a wfi+j loop
         // For now, we'll set mtvec after all code is emitted (see below)
 
-        // ===== Enable Sstc + Svadu in menvcfg =====
+        // ===== Enable Sstc + Svadu + Zicboz/Zicbom in menvcfg =====
         // MENVCFG.STCE (bit 63) = Sstc timer compare
         // MENVCFG.ADUE (bit 61) = hardware A/D bit updates (Svadu)
-        // Value: (1 << 63) | (1 << 61) = 0xA000000000000000
-        // Build: t0 = 0b101 << 61
+        // MENVCFG.CBZE (bit 6)  = cache block zero enable (Zicboz)
+        // MENVCFG.CBCFE (bit 7) = cache block clean/flush enable (Zicbom)
+        // MENVCFG.CBIE (bits 5:4) = 01 = cache block invalidate enable (Zicbom)
+        // High bits: (1 << 63) | (1 << 61) = 0xA000000000000000
+        // Low bits: CBCFE(7) | CBZE(6) | CBIE=01(4) = 0xD0
+        // Build high bits: t0 = 0b101 << 61
         code.push(0x00500293); // addi t0, zero, 5  (t0 = 5 = 0b101)
         let shamt61 = 61u32;
         code.push((shamt61 << 20) | (5 << 15) | (1 << 12) | (5 << 7) | 0x13); // slli t0, t0, 61
+                                                                              // OR in low bits: t0 |= 0xD0 (CBCFE | CBZE | CBIE=01)
+        code.push(0x0D02E293); // ori t0, t0, 0xD0
         code.push(0x30A29073); // csrw menvcfg(0x30A), t0
 
         // ===== Set up mstatus for S-mode entry =====
@@ -200,5 +206,21 @@ mod tests {
             .collect();
         assert!(instrs.contains(&0x3B029073), "Should contain csrw pmpaddr0");
         assert!(instrs.contains(&0x3A029073), "Should contain csrw pmpcfg0");
+    }
+
+    #[test]
+    fn test_boot_rom_enables_cbo() {
+        let code = BootRom::generate(0x80200000, 0x87FF0000);
+        let instrs: Vec<u32> = code
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // Should contain ori t0, t0, 0xD0 (enable CBZE, CBCFE, CBIE in menvcfg)
+        assert!(
+            instrs.contains(&0x0D02E293),
+            "Should contain ori t0,t0,0xD0 for CBO enable"
+        );
+        // Should contain csrw menvcfg
+        assert!(instrs.contains(&0x30A29073), "Should contain csrw menvcfg");
     }
 }
