@@ -10,6 +10,7 @@ pub mod virtio_console;
 pub mod virtio_crypto;
 pub mod virtio_gpu;
 pub mod virtio_input;
+pub mod virtio_iommu;
 pub mod virtio_net;
 pub mod virtio_rng;
 #[allow(dead_code)]

@@ -259,8 +259,14 @@ impl Vm {
             if self.bus.virtio_vsock.has_interrupt() {
                 self.bus.plic.set_pending(18);
             }
+            if self.bus.virtio_sound.has_interrupt() {
+                self.bus.plic.set_pending(19);
+            }
             if self.bus.virtio_crypto.has_interrupt() {
                 self.bus.plic.set_pending(20);
+            }
+            if self.bus.virtio_iommu.has_interrupt() {
+                self.bus.plic.set_pending(21);
             }
             self.bus.rtc.tick();
             if self.bus.rtc.has_interrupt() {
@@ -622,6 +628,10 @@ impl Vm {
                     let dram_base = DRAM_BASE;
                     let ram = self.bus.ram.as_mut_slice();
                     self.bus.virtio_crypto.process_queues(ram, dram_base);
+                }
+                {
+                    let ram = self.bus.ram.as_mut_slice();
+                    self.bus.virtio_iommu.process_requests(ram);
                 }
             }
         }
