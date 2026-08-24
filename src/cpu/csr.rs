@@ -911,3 +911,244 @@ impl CsrFile {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- ImsicFile unit tests ----------
+
+    #[test]
+    fn test_imsic_default_state() {
+        let mut f = ImsicFile::new();
+        assert_eq!(f.eidelivery, 0);
+        assert_eq!(f.eithreshold, 0);
+        assert!(f.eip.iter().all(|&w| w == 0));
+        assert!(f.eie.iter().all(|&w| w == 0));
+        assert_eq!(f.top_pending(), 0);
+        assert_eq!(f.claim_top(), 0);
+    }
+
+    #[test]
+    fn test_imsic_eidelivery_masked_to_bit0() {
+        let mut f = ImsicFile::new();
+        f.write_indirect(IMSIC_EIDELIVERY, 0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(f.eidelivery, 1);
+        f.write_indirect(IMSIC_EIDELIVERY, 0);
+        assert_eq!(f.eidelivery, 0);
+    }
+
+    #[test]
+    fn test_imsic_indirect_roundtrip() {
+        let mut f = ImsicFile::new();
+        f.write_indirect(IMSIC_EITHRESHOLD, 7);
+        assert_eq!(f.read_indirect(IMSIC_EITHRESHOLD), 7);
+
+        f.write_indirect(IMSIC_EIP0, 1 << 5);
+        assert_eq!(f.read_indirect(IMSIC_EIP0), 1 << 5);
+        assert_eq!(f.eip[0], 1 << 5);
+
+        let last = IMSIC_BITMAP_WORDS - 1;
+        f.write_indirect(IMSIC_EIE0 + 2 * last as u64, u64::MAX);
+        // Word 0 masks reserved identity 0; higher words take all bits
+        let expected = if last == 0 { u64::MAX - 1 } else { u64::MAX };
+        assert_eq!(f.read_indirect(IMSIC_EIE0 + 2 * last as u64), expected);
+        assert_eq!(f.eie[last], expected);
+    }
+
+    #[test]
+    fn test_imsic_odd_selects_ignored() {
+        let mut f = ImsicFile::new();
+        // Odd addresses within EIP/EIE ranges do not exist per IMSIC spec
+        f.write_indirect(IMSIC_EIP0 + 1, u64::MAX);
+        f.write_indirect(IMSIC_EIE0 + 3, u64::MAX);
+        assert_eq!(f.read_indirect(IMSIC_EIP0 + 1), 0);
+        assert_eq!(f.read_indirect(IMSIC_EIE0 + 3), 0);
+        assert_eq!(f.eip[0], 0);
+        assert_eq!(f.eie[0], 0);
+    }
+
+    #[test]
+    fn test_imsic_unknown_select_ignored() {
+        let mut f = ImsicFile::new();
+        f.write_indirect(0x10, u64::MAX); // below EIDELIVERY
+        f.write_indirect(0x74, u64::MAX); // gap between EITHRESHOLD and EIP0
+        f.write_indirect(IMSIC_EIP0 + 2 * IMSIC_BITMAP_WORDS as u64, u64::MAX); // past range
+        assert_eq!(f.read_indirect(0x10), 0);
+        assert_eq!(f.read_indirect(0x74), 0);
+        assert!(f.eip.iter().all(|&w| w == 0));
+    }
+
+    #[test]
+    fn test_imsic_identity0_reserved_via_indirect_write() {
+        let mut f = ImsicFile::new();
+        // Interrupt identity 0 is reserved: bit 0 of eip0/eie0 must stay clear
+        f.write_indirect(IMSIC_EIP0, u64::MAX);
+        f.write_indirect(IMSIC_EIE0, u64::MAX);
+        assert_eq!(f.eip[0] & 1, 0);
+        assert_eq!(f.eie[0] & 1, 0);
+        assert_ne!(f.eip[0] & !1, 0);
+        assert_ne!(f.eie[0] & !1, 0);
+        // Identity 0 must never be reported as top pending
+        f.write_indirect(IMSIC_EIDELIVERY, 1);
+        assert_eq!(f.top_pending(), 1);
+    }
+
+    #[test]
+    fn test_imsic_set_pending_bounds() {
+        let mut f = ImsicFile::new();
+        f.set_pending(0); // reserved
+        assert_eq!(f.eip[0], 0);
+        f.set_pending(IMSIC_NUM_IDS as u32); // out of range
+        f.set_pending(u32::MAX);
+        assert!(f.eip.iter().all(|&w| w == 0));
+        f.set_pending((IMSIC_NUM_IDS - 1) as u32); // max valid ID
+        assert_ne!(f.eip[0] & (1 << (IMSIC_NUM_IDS - 1)), 0);
+    }
+
+    #[test]
+    fn test_imsic_top_pending_requires_eidelivery() {
+        let mut f = ImsicFile::new();
+        f.set_pending(4);
+        f.eie[0] = u64::MAX;
+        // Delivery disabled: nothing reported even though pending+enabled
+        assert_eq!(f.top_pending(), 0);
+        f.write_indirect(IMSIC_EIDELIVERY, 1);
+        assert_eq!(f.top_pending(), 4);
+    }
+
+    #[test]
+    fn test_imsic_top_pending_lowest_id_wins() {
+        let mut f = ImsicFile::new();
+        f.write_indirect(IMSIC_EIDELIVERY, 1);
+        for id in [9u32, 5, 3] {
+            f.set_pending(id);
+        }
+        f.eie[0] = u64::MAX;
+        assert_eq!(f.top_pending(), 3);
+        // Disabling the lowest shifts to next-lowest enabled identity
+        f.eie[0] &= !(1 << 3);
+        assert_eq!(f.top_pending(), 5);
+    }
+
+    #[test]
+    fn test_imsic_eithreshold_gating() {
+        let mut f = ImsicFile::new();
+        f.write_indirect(IMSIC_EIDELIVERY, 1);
+        f.set_pending(3);
+        f.set_pending(5);
+        f.eie[0] = u64::MAX;
+
+        // threshold = 4: only identities < 4 are deliverable
+        f.write_indirect(IMSIC_EITHRESHOLD, 4);
+        assert_eq!(f.top_pending(), 3);
+
+        // threshold = 3: identity 3 no longer < threshold, none left under it
+        f.write_indirect(IMSIC_EITHRESHOLD, 3);
+        assert_eq!(f.top_pending(), 0);
+
+        // threshold = 0 means "no threshold" (all identities pass)
+        f.write_indirect(IMSIC_EITHRESHOLD, 0);
+        assert_eq!(f.top_pending(), 3);
+    }
+
+    #[test]
+    fn test_imsic_claim_top_clears_pending() {
+        let mut f = ImsicFile::new();
+        f.write_indirect(IMSIC_EIDELIVERY, 1);
+        for id in [7u32, 2] {
+            f.set_pending(id);
+        }
+        f.eie[0] = u64::MAX;
+
+        assert_eq!(f.claim_top(), 2);
+        assert_eq!(f.eip[0] & (1 << 2), 0); // pending bit cleared by claim
+        assert_ne!(f.eip[0] & (1 << 7), 0); // others untouched
+
+        assert_eq!(f.claim_top(), 7);
+        assert_eq!(f.claim_top(), 0); // empty claim returns 0
+    }
+
+    // ---------- CsrFile AIA CSR path tests ----------
+
+    /// Program the M-mode interrupt file through miselect/mireg exactly as
+    /// a guest would via csrrw/csrrs on the indirect CSRs.
+    fn enable_m_identity(csrs: &mut CsrFile, id: u32) {
+        csrs.write(MISELECT, IMSIC_EIDELIVERY);
+        csrs.write(MIREG, 1);
+        csrs.write(MISELECT, IMSIC_EIP0);
+        csrs.write(MIREG, 1u64 << id);
+        csrs.write(MISELECT, IMSIC_EIE0);
+        csrs.write(MIREG, 1u64 << id);
+    }
+
+    #[test]
+    fn test_aia_miselect_mireg_route_to_m_file() {
+        let mut csrs = CsrFile::new();
+        enable_m_identity(&mut csrs, 6);
+
+        // Values landed in the M-mode file...
+        assert_eq!(csrs.imsic_m.eidelivery, 1);
+        assert_eq!(csrs.imsic_m.eip[0], 1 << 6);
+        assert_eq!(csrs.imsic_m.eie[0], 1 << 6);
+        // ...and read back through mireg with miselect still pointing at eie0
+        assert_eq!(csrs.read(MIREG), 1 << 6);
+        // ...while the S-mode file stays untouched
+        assert_eq!(csrs.imsic_s.eidelivery, 0);
+        assert_eq!(csrs.imsic_s.eip[0], 0);
+    }
+
+    #[test]
+    fn test_aia_sireg_routes_to_s_file_independently() {
+        let mut csrs = CsrFile::new();
+        csrs.write(SISELECT, IMSIC_EIDELIVERY);
+        csrs.write(SIREG, 1);
+        csrs.write(SISELECT, IMSIC_EIP0);
+        csrs.write(SIREG, 1 << 11);
+
+        assert_eq!(csrs.imsic_s.eidelivery, 1);
+        assert_eq!(csrs.imsic_s.eip[0], 1 << 11);
+        assert_eq!(csrs.imsic_m.eidelivery, 0);
+        assert_eq!(csrs.imsic_m.eip[0], 0);
+    }
+
+    #[test]
+    fn test_aia_mtopei_read_then_write_claims() {
+        let mut csrs = CsrFile::new();
+        // eireg writes replace the whole word (IMSIC registers are memory-mapped
+        // words, not bit-set registers): arm both identities in single writes
+        csrs.write(MISELECT, IMSIC_EIDELIVERY);
+        csrs.write(MIREG, 1);
+        csrs.write(MISELECT, IMSIC_EIE0);
+        csrs.write(MIREG, (1 << 4) | (1 << 9));
+        csrs.write(MISELECT, IMSIC_EIP0);
+        csrs.write(MIREG, (1 << 4) | (1 << 9));
+
+        // Read of mtopei reports top pending identity without clearing it
+        let expected = ((4u64) << 16) | 4;
+        assert_eq!(csrs.read(MTOPEI), expected);
+        assert_eq!(csrs.imsic_m.eip[0] & (1 << 4), 1 << 4);
+
+        // Write to mtopei claims (clears pending) but returns nothing itself
+        csrs.write(MTOPEI, u64::MAX);
+        assert_eq!(csrs.imsic_m.eip[0] & (1 << 4), 0);
+        assert_eq!(csrs.read(MTOPEI), ((9u64) << 16) | 9);
+
+        csrs.write(MTOPEI, 0);
+        assert_eq!(csrs.read(MTOPEI), 0);
+    }
+
+    #[test]
+    fn test_aia_mtopi_format_and_readonly() {
+        let mut csrs = CsrFile::new();
+        enable_m_identity(&mut csrs, 5);
+
+        // mtopi encodes identity << 16 | priority (identity number in direct mode)
+        assert_eq!(csrs.read(MTOPI), ((5u64) << 16) | 1);
+
+        // mtopi is read-only: writes are ignored and state unchanged
+        csrs.write(MTOPI, 0xDEAD_BEEF);
+        assert_eq!(csrs.read(MTOPI), ((5u64) << 16) | 1);
+        assert_eq!(csrs.imsic_m.eip[0], 1 << 5);
+    }
+}
