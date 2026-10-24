@@ -2,10 +2,10 @@
 name = "microvm"
 version = "0.85.0"
 edition = "2021"
-authors = ["Nicola Spieser <redbasecap-buiss@users.noreply.github.com>"]
+authors = ["Nicola Spieser <quantumnic@users.noreply.github.com>"]
 description = "Lightweight RISC-V system emulator — Boot Linux in one command"
 license = "MIT"
-repository = "https://github.com/redbasecap-buiss/microvm"
+repository = "https://github.com/quantumnic/microvm"
 keywords = ["risc-v", "emulator", "linux", "kernel", "virtual-machine"]
 categories = ["emulators", "development-tools"]
 

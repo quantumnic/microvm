@@ -1,6 +1,6 @@
 # 🖥️ MyOS — Build Your First OS
 
-A minimal RISC-V kernel in under 500 lines of C. Boots on [microvm](https://github.com/redbasecap-buiss/microvm).
+A minimal RISC-V kernel in under 500 lines of C. Boots on [microvm](https://github.com/quantumnic/microvm).
 
 ## What It Does
 
@@ -86,4 +86,4 @@ make run
 
 - [Tutorials](../../docs/tutorials/) — Step-by-step guides
 - [Rust Kernel](../rust-kernel/) — Same thing in Rust
-- [microvm](https://github.com/redbasecap-buiss/microvm) — The emulator
+- [microvm](https://github.com/quantumnic/microvm) — The emulator

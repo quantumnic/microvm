@@ -1,6 +1,6 @@
 # 🦀 RustOS — RISC-V Kernel in Rust
 
-A minimal `#![no_std]` RISC-V kernel that boots on [microvm](https://github.com/redbasecap-buiss/microvm).
+A minimal `#![no_std]` RISC-V kernel that boots on [microvm](https://github.com/quantumnic/microvm).
 
 ## Features
 

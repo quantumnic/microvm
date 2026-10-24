@@ -15,7 +15,7 @@
 
 Boot your own kernel in one command. No QEMU flags, no complexity.
 
-[![CI](https://github.com/redbasecap-buiss/microvm/actions/workflows/ci.yml/badge.svg)](https://github.com/redbasecap-buiss/microvm/actions/workflows/ci.yml)
+[![CI](https://github.com/quantumnic/microvm/actions/workflows/ci.yml/badge.svg)](https://github.com/quantumnic/microvm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![ISA](https://img.shields.io/badge/RISC--V-RV64GC-green.svg)](https://riscv.org/)
@@ -27,10 +27,10 @@ Boot your own kernel in one command. No QEMU flags, no complexity.
 
 ```bash
 # 1. Install microvm
-cargo install --git https://github.com/redbasecap-buiss/microvm
+cargo install --git https://github.com/quantumnic/microvm
 
 # 2. Clone the starter kit
-git clone https://github.com/redbasecap-buiss/microvm-starter-kit my-os
+git clone https://github.com/quantumnic/microvm-starter-kit my-os
 cd my-os/minimal-kernel
 
 # 3. Build & boot your kernel
@@ -100,7 +100,7 @@ A `#![no_std]` kernel with:
 - Timer interrupts
 - Inline assembly for CSR access
 
-> 💡 The starter kit is also available as a standalone repo: [microvm-starter-kit](https://github.com/redbasecap-buiss/microvm-starter-kit)
+> 💡 The starter kit is also available as a standalone repo: [microvm-starter-kit](https://github.com/quantumnic/microvm-starter-kit)
 
 ---
 
@@ -180,10 +180,10 @@ x86 has 40 years of backwards compatibility baggage. ARM requires licenses. RISC
 
 ```bash
 # From GitHub
-cargo install --git https://github.com/redbasecap-buiss/microvm
+cargo install --git https://github.com/quantumnic/microvm
 
 # From source
-git clone https://github.com/redbasecap-buiss/microvm
+git clone https://github.com/quantumnic/microvm
 cd microvm
 cargo build --release
 ```
