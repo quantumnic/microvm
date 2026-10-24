@@ -19,7 +19,6 @@ Boot your own kernel in one command. No QEMU flags, no complexity.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![ISA](https://img.shields.io/badge/RISC--V-RV64GC-green.svg)](https://riscv.org/)
-[![crates.io](https://img.shields.io/badge/crates.io-v0.1.0-blue.svg)](https://crates.io/crates/microvm)
 
 ---
 
@@ -123,7 +122,7 @@ x86 has 40 years of backwards compatibility baggage. ARM requires licenses. RISC
 
 | | **microvm** | **QEMU** | **TinyEMU** |
 |---|---|---|---|
-| **Setup** | `cargo install microvm` | Package manager + flags | Build from source |
+| **Setup** | `cargo install --git https://github.com/quantumnic/microvm` | Package manager + flags | Build from source |
 | **Boot command** | `microvm run -k bzImage` | `qemu-system-riscv64 -machine virt ...` (20+ flags) | Config file + CLI |
 | **Binary size** | ~2 MB | ~50 MB | ~1 MB |
 | **Architecture** | Pure Rust, safe | C, decades of code | C |
@@ -197,8 +196,8 @@ microvm run --kernel my-kernel.bin --load-addr 0x80000000
 # Boot Linux with a disk
 microvm run --kernel Image --disk rootfs.img --memory 256
 
-# Run the built-in example
-microvm run --example minimal-kernel
+# Run the bundled example kernel
+cd starter-kit/minimal-kernel && make && microvm run --kernel kernel.bin --load-addr 0x80000000
 ```
 
 ---

@@ -6,6 +6,8 @@
 static task_t tasks[MAX_TASKS];
 static int num_tasks = 0;
 static int current_task = -1;
+static void (*task_entry[MAX_TASKS])(void);
+static context_t boot_ctx;  // context of kernel_main, saved on first switch
 
 // Defined in assembly — switches callee-saved registers
 extern void context_switch(context_t *old, context_t *new);
@@ -53,6 +55,12 @@ static void task_exit(void) {
     while (1) asm volatile("wfi");
 }
 
+// First code a new task runs: call its entry, then exit cleanly when it returns.
+static void task_trampoline(void) {
+    task_entry[current_task]();
+    task_exit();
+}
+
 void sched_init(void) {
     num_tasks = 0;
     current_task = -1;
@@ -72,14 +80,10 @@ void task_create(void (*entry)(void), const char *name) {
     uint64_t stack_top = (uint64_t)&t->stack[STACK_SIZE];
     stack_top &= ~0xFUL;  // 16-byte align
 
+    task_entry[num_tasks] = entry;
     t->ctx.sp = stack_top;
-    t->ctx.ra = (uint64_t)entry;
+    t->ctx.ra = (uint64_t)task_trampoline;
     t->ctx.s0 = 0;
-
-    // Push task_exit as return address on stack
-    stack_top -= 8;
-    *(uint64_t *)stack_top = (uint64_t)task_exit;
-    t->ctx.sp = stack_top;
 
     uart_printf("[sched] created task %d: '%s'\n", t->pid, name);
     num_tasks++;
@@ -102,7 +106,7 @@ void schedule(void) {
             if (prev >= 0 && prev != idx)
                 context_switch(&tasks[prev].ctx, &tasks[idx].ctx);
             else if (prev < 0)
-                context_switch(&tasks[0].ctx, &tasks[idx].ctx); // Bootstrap
+                context_switch(&boot_ctx, &tasks[idx].ctx); // Bootstrap
             return;
         }
     }

@@ -141,12 +141,22 @@ impl Vm {
 
         log::info!("DTB at {:#x} ({} bytes)", dtb_addr, dtb_data.len());
 
-        // Generate boot ROM and load at DRAM_BASE
-        let boot_code = BootRom::generate(kernel_entry, dtb_addr);
-        self.bus.load_binary(&boot_code, 0);
+        if loaded.load_base == DRAM_BASE {
+            // Bare-metal M-mode kernel linked at DRAM_BASE (e.g. the starter-kit
+            // kernels, `--load-addr 0x80000000`). The SBI boot ROM would
+            // overwrite it, so jump straight into the kernel in M-mode instead.
+            log::info!("Kernel at DRAM base: booting bare-metal in M-mode (no SBI boot ROM)");
+            self.cpus[0].reset(kernel_entry);
+            self.cpus[0].regs[10] = 0; // a0 = hartid
+            self.cpus[0].regs[11] = dtb_addr; // a1 = DTB
+        } else {
+            // Generate boot ROM and load at DRAM_BASE
+            let boot_code = BootRom::generate(kernel_entry, dtb_addr);
+            self.bus.load_binary(&boot_code, 0);
 
-        // Reset hart 0 — start at DRAM_BASE (boot ROM)
-        self.cpus[0].reset(DRAM_BASE);
+            // Reset hart 0 — start at DRAM_BASE (boot ROM)
+            self.cpus[0].reset(DRAM_BASE);
+        }
         self.cpus[0].hart_state = crate::cpu::HartState::Started;
 
         // Secondary harts stay stopped (will be started via SBI HSM hart_start)
